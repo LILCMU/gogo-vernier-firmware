@@ -1,0 +1,9 @@
+CompileFlags:
+  Add: [
+    -isysroot=/Users/momeppkt/.platformio/packages/toolchain-riscv32-esp/riscv32-esp-elf,
+  ]
+  Remove: [
+    -fno-tree-switch-conversion,
+    -fstrict-volatile-bitfields,
+    -mdisable-hardware-atomics,
+  ]

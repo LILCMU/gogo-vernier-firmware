@@ -1,0 +1,7 @@
+.pio
+.clang_complete
+.gcc-flags.json
+.ccls
+.cache/clangd/index
+dist
+compile_commands.json

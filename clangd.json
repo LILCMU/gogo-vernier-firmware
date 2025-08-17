@@ -1,0 +1,8 @@
+{
+    "cmd": [
+        "/Users/momeppkt/Developer/toolchains/esp-clang/bin/clangd",
+        "--offset-encoding=utf-16",
+        "--background-index",
+        "--query-driver=/Users/momeppkt/.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-*"
+    ]
+}
