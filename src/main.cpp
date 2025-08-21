@@ -17,57 +17,57 @@ Steps to Follow:
 */
 
 #include <Arduino.h>
+#include <HardwareSerial.h>
 
-// #include <HardwareSerial.h>
-// HardwareSerial gogoSerial(0);
+HardwareSerial gogoSerial(0);
 // #undef Serial
 // #define Serial gogoSerial
 
+#include "vernier-adapter.h"
+#include "uart-adapter.h"
 
-// #define DEBUG
-
-#include "GDXLib.h"
-GDXLib GDX;
-
-// byte sensor = 1;                                   // select the device's sensor to read. In most Go Direct devices, sensor 1 is the default
-// const constexpr char *device = "GDX-TMP 0F10H632"; // put your Go Direct name and serial number here, between the quotes
-// const constexpr char *device = "GDX-TMP 0F5002FT"; // put your Go Direct name and serial number here, between the quotes
-const constexpr char *device = "proximity"; // INFO: scan the nearest device: stronger than -60
-byte sensor = 255;                          // INFO: 255 is selected default sensor
-
-String sensor_name = "";
-String sensor_unit = "";
+VernierAdapter vernier;
+UartAdapter uart(gogoSerial);
 
 void setup()
 {
     Serial.begin(115200);
     Serial.setDebugOutput(true);
+
+    gogoSerial.begin(115200);
     delay(1000);
 
-    Serial.println("Starting GDXLib..");
-    if (!GDX.open((char *)device))
-    {
-        Serial.println("GDX.open() failed. Disconnect/Reconnect USB");
-        while (true)
-            ; // if open() fails, put the Arduino into a do-nothing loop
-    }
-    Serial.print("Successfully found: ");
-    Serial.println(GDX.getDeviceName());
-    Serial.println();
-
-    GDX.enableSensor(sensor);
-
-    // print headers using the enabled sensor's name and sensor units
-    sensor_name = GDX.getSensorName(sensor);
-    sensor_unit = GDX.getUnits(sensor);
-    Serial.printf("%s %s\n", sensor_name.c_str(), sensor_unit.c_str());
-
-    GDX.start(200); // sample period in milliseconds
+    // Serial.println("Starting GDXLib..");
+    // if (!GDX.open((char *)device))
+    // {
+    //     Serial.println("GDX.open() failed. Disconnect/Reconnect USB");
+    //     while (true)
+    //         ; // if open() fails, put the Arduino into a do-nothing loop
+    // }
+    // log_i("Successfully found: %s", GDX.getDeviceName().c_str());
+    // // log_i("device: %s", GDX.deviceName()); // BUG: not working
+    // log_i("order: %s", GDX.orderCode());
+    // log_i("serial: %s", GDX.serialNumber());
+    // log_i("battery: %d", GDX.batteryPercent());
+    // log_i("charge state: %d", GDX.chargeState());
+    // log_i("rssi: %d", GDX.RSSI());
+    //
+    // GDX.enableSensor(sensor);
+    // log_i("channel name: %s", GDX.channelName());
+    // log_i("channel units: %s", GDX.channelUnits());
+    // log_i("channel number: %d", GDX.channelNumber());
+    //
+    // // print headers using the enabled sensor's name and sensor units
+    // sensor_name = GDX.getSensorName(sensor);
+    // sensor_unit = GDX.getUnits(sensor);
+    // Serial.printf("%s %s\n", sensor_name.c_str(), sensor_unit.c_str());
+    //
+    // GDX.start(200); // sample period in milliseconds
 }
 
 void loop()
 {
-    GDX.read();
-    float sensorValue = GDX.getMeasurement(sensor);
-    Serial.println(sensorValue);
+    // GDX.read();
+    // float sensorValue = GDX.getMeasurement(sensor);
+    // Serial.println(sensorValue);
 }
