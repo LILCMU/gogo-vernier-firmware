@@ -11,27 +11,31 @@ public:
     bool connect();
     void disconnect();
 
-    void startReading(uint16_t period_ms = 200);
     void setSamplingRate(uint16_t period_ms);
+    void startReading(uint16_t period_ms = 0);
+    void stopReading();
     void poll();
+
+    bool enableAvailableChannels(bool force = false);
+    void getDeviceInfo(bool force = false);
+    void clearDeviceInfo();
 
     bool isConnected() const { return _connected; }
     bool isStreaming() const { return _streaming; }
-    uint16_t samplePeriod() const { return _period_ms; }
+    uint16_t samplingPeriod() const { return _period_ms; }
+    uint32_t availableChannels() { return _GDX.getAvailableChannels(); }
 
-    String deviceName() { return _GDX.getDeviceName(); }
-    const char *orderCode() { return _GDX.orderCode(); }
-    const char *serialNumber() { return _GDX.serialNumber(); }
-    int batteryPercent() { return _GDX.batteryPercent(); }
-    int chargeState() { return _GDX.chargeState(); }
-    int rssi() { return _GDX.RSSI(); }
+    const char *deviceName() { return _device_name.c_str(); }
+    const char *orderCode() { return _device_order.c_str(); }
+    const char *serialNumber() { return _device_serial.c_str(); }
+    int batteryPercent() { return _device_battery; }
+    int chargeState() { return _device_charge_state; }
+    int rssi() { return _device_rssi; }
 
-    const String &sensorName() const { return _sensor_name; }
-    const String &sensorUnit() const { return _sensor_unit; }
+    const char *sensorName(const byte selectedSensor = 255) { return _GDX.getSensorName(selectedSensor); }
+    const char *sensorUnit(const byte selectedSensor = 255) { return _GDX.getUnits(selectedSensor); }
     float defaultMeasurement() { return _GDX.getMeasurement(_sensor_default); }
-
-    uint8_t availableField() const { return 1; }
-    void getDeviceInfo();
+    float readMeasurement(const byte selectedSensor = 255) { return _GDX.getMeasurement(selectedSensor); }
 
 private:
     GDXLib _GDX;
@@ -39,10 +43,17 @@ private:
     bool _connected = false;
     bool _streaming = false;
 
-    const char *_open_device = "proximity"; // scan nearest device
+    const char *_open_device = "proximity";
+    unsigned long _period_start_time = 0;
     uint16_t _period_ms = 200;
+    uint16_t _read_timeout = 5000;
+
+    String _device_name;
+    String _device_order;
+    String _device_serial;
+    uint8_t _device_battery;
+    uint8_t _device_charge_state;
+    int _device_rssi;
 
     const byte _sensor_default = 255;
-    String _sensor_name;
-    String _sensor_unit;
 };
