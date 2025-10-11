@@ -37,7 +37,7 @@ def export_firmware_name(env):
         elif each_defined[0] == 'FIRMWARE_BETA_VERSION':
             version_string += '-beta'
 
-    return "gogo-firmware-" + version_string
+    return "vernier-firmware-" + version_string
 
 def esp32_create_combined_bin(source, target, env):
     #print("Generating combined binary for serial flashing")
