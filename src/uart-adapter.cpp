@@ -25,7 +25,7 @@ void UartAdapter::sendStatus(bool status, uint8_t core_state)
     send();
 }
 
-void UartAdapter::sendDeviceInfo(const String &device_name, const char *order, const char *serial)
+void UartAdapter::sendDeviceInfo(const char *device_name, const char *order, const char *serial)
 {
     _doc["t"] = T_DEVINFO;
     _doc["seq"] = _seq++;
@@ -45,17 +45,18 @@ void UartAdapter::sendDeviceStats(int battery, int charge_state, int rssi)
     send();
 }
 
-void UartAdapter::sendDeviceFields(uint8_t available_field, const String &name, const String &unit)
+void UartAdapter::sendDeviceFields(uint8_t field_count, const char *const names[], const char *const units[])
 {
     _doc["t"] = T_FIELDS;
-    _doc["seq"] = _seq++;
-    _doc["field_count"] = available_field;
+    _doc["field_count"] = field_count;
 
-    JsonArray fields = _doc["fields"].to<JsonArray>();
-    JsonObject f0 = fields.add<JsonObject>();
-    f0["name"] = name;
-    f0["unit"] = unit;
-
+    JsonArray arr = _doc["fields"].to<JsonArray>();
+    for (uint8_t i = 0; i < field_count; ++i)
+    {
+        JsonObject f = arr.add<JsonObject>();
+        f["name"] = names[i] ? names[i] : "";
+        f["unit"] = units[i] ? units[i] : "";
+    }
     send();
 }
 
@@ -71,10 +72,34 @@ void UartAdapter::sendSensorValues(const float *values, size_t count)
     send();
 }
 
+void UartAdapter::sendSensorValuesTs(const float *values, size_t count, uint32_t ts_ms)
+{
+    _doc["t"] = T_SENS_VALUES;
+    _doc["seq"] = _seq++;
+    _doc["ts"] = ts_ms;
+
+    JsonArray arr = _doc["sensors"].to<JsonArray>();
+    for (size_t i = 0; i < count; ++i)
+        arr.add(values[i]);
+
+    send();
+}
+
 void UartAdapter::sendDefaultSensorValue(float value)
 {
     _doc["t"] = T_DEF_VALUE;
     _doc["seq"] = _seq++;
     _doc["sensor"] = value;
+    send();
+}
+
+void UartAdapter::sendAck(uint32_t req_seq, bool ok, const char *msg)
+{
+    _doc["t"] = T_ACK;
+    _doc["seq"] = _seq++;
+    _doc["req"] = req_seq;
+    _doc["ok"] = ok;
+    if (msg && *msg)
+        _doc["msg"] = msg;
     send();
 }

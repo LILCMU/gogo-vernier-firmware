@@ -2,8 +2,12 @@
 
 static byte gblReadBuffer[128];
 
-VernierAdapter::VernierAdapter()
-    : _GDX() {}
+VernierAdapter::VernierAdapter() : _GDX()
+{
+    _enabled_mask = 0;
+    _channel_count = 0;
+    _sample_ready = false;
+}
 
 bool VernierAdapter::connect()
 {
@@ -23,7 +27,7 @@ bool VernierAdapter::connect()
     if (connected)
     {
         this->getDeviceInfo(connected);
-        this->enableAvailableChannels(connected);
+        this->_enableAvailableChannels(connected);
     }
     _connected = connected;
 
@@ -48,6 +52,8 @@ void VernierAdapter::setSamplingRate(uint16_t period_ms)
 {
     _period_ms = period_ms;
 
+    log_i("Set sampling period to %u ms", _period_ms);
+
     if (_streaming)
     {
         _GDX.stop();
@@ -62,6 +68,8 @@ void VernierAdapter::startReading(uint16_t period_ms)
 
     if (period_ms)
         _period_ms = period_ms;
+
+    log_i("Start reading at %u ms period", _period_ms);
 
     _GDX.start(_period_ms);
     _streaming = true;
@@ -81,36 +89,30 @@ void VernierAdapter::poll()
     if (!_connected || !_streaming)
         return;
 
-    if ((millis() - _period_start_time) > _period_ms)
+    if ((millis() - _period_start_time) < _period_ms)
+        return;
+    log_i("diff: %u", millis() - _period_start_time);
+
+    // Attempt read (library-specific low-level call or generic)
+    if (_GDX.GDX_ReadMeasurement(gblReadBuffer, _read_timeout) == 0)
     {
+        // Second try (as before)
         if (_GDX.GDX_ReadMeasurement(gblReadBuffer, _read_timeout) == 0)
-            _GDX.GDX_ReadMeasurement(gblReadBuffer, _read_timeout);
-
-        _period_start_time = millis();
-    }
-}
-
-bool VernierAdapter::enableAvailableChannels(bool force)
-{
-    if (!_connected && !force)
-        return false;
-
-    uint32_t availableMask = _GDX.getAvailableChannels();
-
-    if (!availableMask)
-        return false;
-
-    for (uint8_t i = 0; i < 32; i++)
-    {
-        if (availableMask & (1 << i))
         {
-            _GDX.enableSensor(i);
-            log_i("enable channel: %d", i);
-            log_i("%s -> %s\n", _GDX.getSensorName(i), _GDX.getUnits(i));
+            return; // failed
         }
     }
 
-    return true;
+    // Collect all enabled channel values
+    for (uint8_t i = 0; i < 32; ++i)
+    {
+        if (_enabled_mask & (1u << i))
+        {
+            _last_values[i] = _GDX.getMeasurement(i);
+        }
+    }
+    _sample_ready = true;
+    _period_start_time = millis();
 }
 
 void VernierAdapter::getDeviceInfo(bool force)
@@ -141,4 +143,32 @@ void VernierAdapter::clearDeviceInfo()
     _device_battery = 0;
     _device_charge_state = 0;
     _device_rssi = 0;
+}
+
+bool VernierAdapter::_enableAvailableChannels(bool force)
+{
+    if (!_connected && !force)
+        return false;
+
+    uint32_t availableMask = _GDX.getAvailableChannels();
+
+    if (!availableMask)
+        return false;
+
+    _enabled_mask = 0;
+    _channel_count = 0;
+
+    for (uint8_t i = 0; i < 32; i++)
+    {
+        if (availableMask & (1 << i))
+        {
+            _GDX.enableSensor(i);
+            _enabled_mask |= (1 << i);
+            _channel_count++;
+
+            log_i("enable channel: %u (%s %s)", i, _GDX.getSensorName(i), _GDX.getUnits(i));
+        }
+    }
+
+    return _channel_count > 0;
 }
