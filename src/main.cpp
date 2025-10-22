@@ -22,47 +22,10 @@ UartAdapter uart(gogoSerial);
 TaskHandle_t uartProcessTask, vernierProcessTask;
 SemaphoreHandle_t nvsMutex;
 
-static bool startAutoConnect = true;
+static bool startAutoConnect = false;
+static bool foundSavedDevice = false;
 unsigned long startPressTime = 0;
 ButtonEvent prevButtonEvent = BUTTON_RELEASE;
-
-auto buttonHandler = []
-{
-    if (digitalRead(BOOT_BUTTON_PIN) == LOW)
-    {
-        if (prevButtonEvent == BUTTON_PRESS)
-        {
-            if ((millis() - startPressTime) > BUTTON_LONG_PRESS_THRESHOLD)
-            {
-                prevButtonEvent = BUTTON_LONG_PRESS;
-
-                // INFO: long press event
-                log_i("disconnect the device");
-                vernier.disconnect();
-            }
-        }
-        else if (prevButtonEvent == BUTTON_RELEASE)
-        {
-            prevButtonEvent = BUTTON_PRESS;
-            startPressTime = millis();
-
-            // INFO: press event
-            log_i("start connecting nearby device ...");
-
-            if (!vernier.connect(true))
-            {
-                log_i("GDX.open() failed. Disconnect/Reconnect USB");
-            }
-        }
-    }
-    else
-    {
-        if (prevButtonEvent != BUTTON_RELEASE)
-        {
-            prevButtonEvent = BUTTON_RELEASE;
-        }
-    }
-};
 
 static bool connectAndReport(uint32_t req_seq = 0xFFFFFFFFu)
 {
@@ -109,6 +72,55 @@ static bool connectAndReport(uint32_t req_seq = 0xFFFFFFFFu)
 
     return ok;
 }
+
+auto autoConnectDevice = []
+{
+    if (startAutoConnect)
+    {
+        startAutoConnect = false;
+
+        log_i("Auto-connecting to saved device ...");
+        connectAndReport(); // no request sequence
+    }
+};
+
+auto buttonHandler = []
+{
+    if (digitalRead(BOOT_BUTTON_PIN) == LOW)
+    {
+        if (prevButtonEvent == BUTTON_PRESS)
+        {
+            if ((millis() - startPressTime) > BUTTON_LONG_PRESS_THRESHOLD)
+            {
+                prevButtonEvent = BUTTON_LONG_PRESS;
+
+                // INFO: long press event
+                log_i("disconnect the device");
+                vernier.disconnect();
+            }
+        }
+        else if (prevButtonEvent == BUTTON_RELEASE)
+        {
+            prevButtonEvent = BUTTON_PRESS;
+            startPressTime = millis();
+
+            // INFO: press event
+            log_i("start connecting nearby device ...");
+
+            if (!vernier.connect(true))
+            {
+                log_i("GDX.open() failed. Disconnect/Reconnect USB");
+            }
+        }
+    }
+    else
+    {
+        if (prevButtonEvent != BUTTON_RELEASE)
+        {
+            prevButtonEvent = BUTTON_RELEASE;
+        }
+    }
+};
 
 void vernierHandler(void *parameter)
 {
@@ -210,12 +222,9 @@ void uartHandler(void *parameter)
             uart.sendAck(req, true, "rate set");
 
             // INFO: start auto-connect after gogo set sampling rate at boot
-            if (startAutoConnect)
-            {
-                delay(1000);
-                connectAndReport(); // no req -> no ack
-                startAutoConnect = false;
-            }
+            if (foundSavedDevice)
+                startAutoConnect = true;
+
             break;
         }
         default:
@@ -256,8 +265,13 @@ void setup()
         preferences.begin(NVS_NAMESPACE_SETTING, false);
         preferences.putString(NVS_KEY_DEVICE_NAME, VERNIER_DEFAULT_DEVICE_NAME); // default to proximity scan
     }
-    String deviceName;
-    vernier.setOpenDevice(preferences.getString(NVS_KEY_DEVICE_NAME, VERNIER_DEFAULT_DEVICE_NAME).c_str());
+    String deviceName = preferences.getString(NVS_KEY_DEVICE_NAME, VERNIER_DEFAULT_DEVICE_NAME);
+    if (deviceName != VERNIER_DEFAULT_DEVICE_NAME)
+    {
+        log_i("Loaded saved device name from NVS: %s", deviceName.c_str());
+        vernier.setOpenDevice(deviceName.c_str());
+        foundSavedDevice = true;
+    }
 
     preferences.end();
     xSemaphoreGive(nvsMutex);
@@ -281,6 +295,8 @@ void setup()
 
 void loop()
 {
+    autoConnectDevice();
+
     buttonHandler();
 
 #if CHECK_LOGGING_FLAG(ENABLE_LOGGING_DEBUG)

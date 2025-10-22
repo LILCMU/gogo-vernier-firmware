@@ -25,6 +25,16 @@ bool VernierAdapter::connect(bool forceConnect)
     bool connected = false;
     if (forceConnect)
     {
+        // abort any ongoing scan in the library so we can force a new connection
+        _GDX.abortScan();
+
+        unsigned long waitStart = millis();
+        const unsigned long waitTimeout = 3000;
+        while (_GDX.isScanning() && (millis() - waitStart) < waitTimeout)
+        {
+            delay(10);
+        }
+
         log_d("Force connect enabled: scanning for device ...");
         connected = _GDX.open((char *)VERNIER_DEFAULT_DEVICE_NAME);
     }

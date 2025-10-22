@@ -72,7 +72,7 @@ private:
     bool _connected = false;
     bool _streaming = false;
 
-    String _open_device;
+    String _open_device = VERNIER_DEFAULT_DEVICE_NAME;
     unsigned long _period_start_time = 0;
     uint16_t _period_ms = 1000;
     uint16_t _read_timeout = 5000;
