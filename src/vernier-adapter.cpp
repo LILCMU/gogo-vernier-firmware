@@ -9,7 +9,7 @@ VernierAdapter::VernierAdapter() : _GDX()
     _sample_ready = false;
 }
 
-bool VernierAdapter::connect()
+bool VernierAdapter::connect(bool forceConnect)
 {
     if (_streaming)
     {
@@ -22,7 +22,17 @@ bool VernierAdapter::connect()
         _connected = false;
     }
 
-    bool connected = _GDX.open((char *)_open_device);
+    bool connected = false;
+    if (forceConnect)
+    {
+        log_d("Force connect enabled: scanning for device ...");
+        connected = _GDX.open((char *)VERNIER_DEFAULT_DEVICE_NAME);
+    }
+    else
+    {
+        log_d("Use saved device: %s", _open_device.c_str());
+        connected = _GDX.open((char *)_open_device.c_str());
+    }
 
     if (connected)
     {
@@ -91,16 +101,12 @@ void VernierAdapter::poll()
 
     if ((millis() - _period_start_time) < _period_ms)
         return;
-    log_i("diff: %u", millis() - _period_start_time);
 
     // Attempt read (library-specific low-level call or generic)
     if (_GDX.GDX_ReadMeasurement(gblReadBuffer, _read_timeout) == 0)
     {
-        // Second try (as before)
         if (_GDX.GDX_ReadMeasurement(gblReadBuffer, _read_timeout) == 0)
-        {
-            return; // failed
-        }
+            return;
     }
 
     // Collect all enabled channel values

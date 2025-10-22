@@ -8,3 +8,8 @@ enum ButtonEvent {
     BUTTON_PRESS,
     BUTTON_LONG_PRESS,
 };
+
+// NOTE: preference nvs keys
+const constexpr char *NVS_NAMESPACE_SETTING = "vennierSetting";
+const constexpr char *NVS_KEY_DEVICE_NAME = "deviceName";
+

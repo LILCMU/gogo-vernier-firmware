@@ -3,13 +3,16 @@
 #include <Arduino.h>
 #include <GDXLib.h>
 
+const constexpr char *VERNIER_DEFAULT_DEVICE_NAME = "proximity";
+
 class VernierAdapter
 {
 public:
     VernierAdapter();
 
-    bool connect();
+    bool connect(bool forceConnect = false);
     void disconnect();
+    void setOpenDevice(const char *device_name) { _open_device = device_name; }
 
     void setSamplingRate(uint16_t period_ms);
     void startReading(uint16_t period_ms = 0);
@@ -69,7 +72,7 @@ private:
     bool _connected = false;
     bool _streaming = false;
 
-    const char *_open_device = "proximity";
+    String _open_device;
     unsigned long _period_start_time = 0;
     uint16_t _period_ms = 1000;
     uint16_t _read_timeout = 5000;
