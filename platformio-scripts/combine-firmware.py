@@ -43,7 +43,7 @@ def export_firmware_name(env):
         if each_defined[0] == 'FIRMWARE_DEBUG_FLAG':
             debug_string = "-" + str(each_defined[1])
 
-    return "gogo-co-mcu-firmware-" + version_string + feature_string + debug_string
+    return "gogo-co-firmware-" + version_string + feature_string + debug_string
 
 def esp32_create_combined_bin(source, target, env):
     #print("Generating combined binary for serial flashing")
