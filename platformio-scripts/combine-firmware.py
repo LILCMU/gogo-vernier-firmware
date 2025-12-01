@@ -28,22 +28,16 @@ def esptool_call(cmd):
 
 
 def export_firmware_name(env):
-    version_string = 'v'
     feature_string = ''
     debug_string = ''
     for each_defined in env['CPPDEFINES']:
-        if each_defined[0] == 'FIRMWARE_MAJOR_VERSION' or each_defined[0] == 'FIRMWARE_MINOR_VERSION':
-            version_string += str(each_defined[1]) + "."
-        elif each_defined[0] == 'FIRMWARE_PATCH_VERSION':
-            version_string += str(each_defined[1])
-
         if each_defined[0] == 'FIRMWARE_FEATURE_FLAG':
-            feature_string = "-" + str(each_defined[1])
+            feature_string = str(each_defined[1])
 
         if each_defined[0] == 'FIRMWARE_DEBUG_FLAG':
             debug_string = "-" + str(each_defined[1])
 
-    return "gogo-co-firmware-" + version_string + feature_string + debug_string
+    return "gogo-co-firmware-" + feature_string + debug_string
 
 def esp32_create_combined_bin(source, target, env):
     #print("Generating combined binary for serial flashing")

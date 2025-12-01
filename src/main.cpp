@@ -254,8 +254,6 @@ void setup()
 
     pinMode(BOOT_BUTTON_PIN, INPUT);
 
-    log_i("gogo vernier firmware: %d.%d.%d", FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION, FIRMWARE_PATCH_VERSION);
-
     // INFO: get device local setting/info from nvs
     xSemaphoreTake(nvsMutex, portMAX_DELAY);
     if (!preferences.begin(NVS_NAMESPACE_SETTING, true)) // NOTE: read-only
