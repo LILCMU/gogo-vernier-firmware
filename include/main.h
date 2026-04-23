@@ -10,6 +10,6 @@ enum ButtonEvent {
 };
 
 // NOTE: preference nvs keys
-const constexpr char *NVS_NAMESPACE_SETTING = "vennierSetting";
-const constexpr char *NVS_KEY_DEVICE_NAME = "deviceName";
+const constexpr char *NVS_NAMESPACE_SETTING = "vernierSetting";
+const constexpr char *NVS_KEY_DEVICE_NAME   = "deviceName";
 
