@@ -148,10 +148,46 @@ void vernierHandler(void *parameter)
                 }
             }
 
+            // DEVSTATS push — change-based, decoupled from sample cadence.
+            // Battery/charge/RSSI are cached on connect in VernierAdapter and
+            // only refresh when getDeviceInfo() is called, so we do that here
+            // on a fixed wall-clock interval and push to the host only when
+            // something actually changed (RSSI needs a small threshold since
+            // it naturally jitters by 1 dBm on a quiet link).
+            {
+                static int lastPushedBatt   = -999;
+                static int lastPushedCharge = -999;
+                static int lastPushedRssi   = -999;
+                static uint32_t lastRefreshMs = 0;
+                const uint32_t DEVSTATS_REFRESH_MS  = 10000;
+                const int      RSSI_CHANGE_THRESHOLD = 3;
+
+                uint32_t now = millis();
+                if (now - lastRefreshMs >= DEVSTATS_REFRESH_MS)
+                {
+                    vernier.getDeviceInfo(true);
+                    lastRefreshMs = now;
+
+                    int batt   = vernier.batteryPercent();
+                    int charge = vernier.chargeState();
+                    int rssi   = vernier.rssi();
+                    bool changed = (batt != lastPushedBatt)
+                                || (charge != lastPushedCharge)
+                                || (abs(rssi - lastPushedRssi) >= RSSI_CHANGE_THRESHOLD);
+                    if (changed)
+                    {
+                        uart.sendDeviceStats(batt, charge, rssi);
+                        lastPushedBatt   = batt;
+                        lastPushedCharge = charge;
+                        lastPushedRssi   = rssi;
+                    }
+                }
+            }
+
+            // DEVFIELDS re-emit every 50 samples — helps the host recover
+            // its field cache if it rebooted mid-session.
             if (samplesSinceLastStats >= 50)
             {
-                uart.sendDeviceStats(vernier.batteryPercent(), vernier.chargeState(), vernier.rssi());
-
                 uint32_t mask = vernier.enabledChannelMask();
                 const uint8_t maxCh = 32;
                 const char *names[maxCh];
