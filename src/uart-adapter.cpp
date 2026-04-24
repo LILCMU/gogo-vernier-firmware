@@ -85,14 +85,6 @@ void UartAdapter::sendSensorValuesTs(const float *values, size_t count, uint32_t
     send();
 }
 
-void UartAdapter::sendDefaultSensorValue(float value)
-{
-    _doc["t"] = T_DEF_VALUE;
-    _doc["seq"] = _seq++;
-    _doc["sensor"] = value;
-    send();
-}
-
 void UartAdapter::sendAck(uint32_t req_seq, bool ok, const char *msg)
 {
     _doc["t"] = T_ACK;
