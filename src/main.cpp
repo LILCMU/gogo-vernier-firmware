@@ -35,6 +35,7 @@ static bool connectAndReport(uint32_t req_seq = 0xFFFFFFFFu)
         vernier.getDeviceInfo();
         vernier.startReading(vernier.samplingPeriod());
 
+        uart.sendHello();
         uart.sendStatus(true, 1);
         uart.sendDeviceInfo(vernier.deviceName(), vernier.orderCode(), vernier.serialNumber());
         uart.sendDeviceStats(vernier.batteryPercent(), vernier.chargeState(), vernier.rssi(), vernier.droppedSamples());

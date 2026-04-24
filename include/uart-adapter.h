@@ -4,11 +4,20 @@
 #include <ArduinoJson.h>
 
 // Length-prefixed MsgPack framing: [uint16_be length][MsgPack payload]
+//
+// Protocol version — bump on any breaking change to message layout
+// (field removal, type change, message-type reuse). Host compares this
+// against its own compiled-in constant on every T_HELLO and warns on
+// mismatch. Non-breaking additions (new optional keys, new message
+// types) do NOT require a bump.
+constexpr uint8_t VERNIER_PROTOCOL_VERSION = 1;
+
 class UartAdapter
 {
 public:
     explicit UartAdapter(Print &out);
 
+    void sendHello();
     void sendStatus(bool status, uint8_t core_state);
     void sendDeviceInfo(const char *device_name, const char *order, const char *serial);
     void sendDeviceStats(int battery, int charge_state, int rssi, uint32_t dropped);
@@ -31,6 +40,7 @@ private:
         T_FIELDS      = 4,
         T_SENS_VALUES = 5,
         T_ACK         = 7,
+        T_HELLO       = 8,
     };
 
     void send(); // serialize MsgPack with 2-byte BE length prefix

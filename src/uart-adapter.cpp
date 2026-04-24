@@ -35,6 +35,14 @@ void UartAdapter::sendDeviceInfo(const char *device_name, const char *order, con
     send();
 }
 
+void UartAdapter::sendHello()
+{
+    _doc["t"] = T_HELLO;
+    _doc["seq"] = _seq++;
+    _doc["proto_version"] = VERNIER_PROTOCOL_VERSION;
+    send();
+}
+
 void UartAdapter::sendDeviceStats(int battery, int charge_state, int rssi, uint32_t dropped)
 {
     _doc["t"] = T_DEVSTATS;
