@@ -124,16 +124,32 @@ auto buttonHandler = []
 
 void vernierHandler(void *parameter)
 {
-    const TickType_t xWaitTime = pdMS_TO_TICKS(1);
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-
     static float sampleBuffer[32];
     size_t sampleCount = 0;
     uint32_t samplesSinceLastStats = 0;
 
     for (;;)
     {
-        vTaskDelayUntil(&xLastWakeTime, xWaitTime);
+        // Adaptive tick — scales with the configured sample period so we
+        // don't spin at 1 kHz when the user asked for a 120 s sample rate.
+        // Quarter-period gives plenty of headroom for poll() to catch a
+        // sample just after it becomes ready; capped at 500 ms so disconnect
+        // detection stays snappy. When idle (no connection yet) we yield
+        // for 250 ms — button handling lives in a separate task.
+        TickType_t waitTicks;
+        if (vernier.isConnected() && vernier.isStreaming())
+        {
+            uint32_t p = vernier.samplingPeriod();
+            uint32_t slack = p / 4;
+            if (slack < 1)   slack = 1;
+            if (slack > 500) slack = 500;
+            waitTicks = pdMS_TO_TICKS(slack);
+        }
+        else
+        {
+            waitTicks = pdMS_TO_TICKS(250);
+        }
+        vTaskDelay(waitTicks);
 
         if (vernier.isConnected() && vernier.isStreaming())
         {
