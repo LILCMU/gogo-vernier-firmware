@@ -46,6 +46,7 @@ bool VernierAdapter::connect(bool forceConnect)
 
     if (connected)
     {
+        _dropped_samples = 0; // fresh session starts clean
         this->getDeviceInfo(connected);
         this->_enableAvailableChannels(connected);
     }
@@ -118,6 +119,11 @@ void VernierAdapter::poll()
         if (_GDX.GDX_ReadMeasurement(gblReadBuffer, _read_timeout) == 0)
             return;
     }
+
+    // Latest-wins: if the previous sample wasn't consumed yet, count it
+    // as dropped before the overwrite so drops surface in T_DEVSTATS.
+    if (_sample_ready)
+        _dropped_samples++;
 
     // Collect all enabled channel values
     for (uint8_t i = 0; i < 32; ++i)

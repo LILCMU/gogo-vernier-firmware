@@ -11,7 +11,7 @@ public:
 
     void sendStatus(bool status, uint8_t core_state);
     void sendDeviceInfo(const char *device_name, const char *order, const char *serial);
-    void sendDeviceStats(int battery, int charge_state, int rssi);
+    void sendDeviceStats(int battery, int charge_state, int rssi, uint32_t dropped);
 
     void sendDeviceFields(uint8_t field_count, const char *const names[], const char *const units[]);
 

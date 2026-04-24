@@ -37,7 +37,7 @@ static bool connectAndReport(uint32_t req_seq = 0xFFFFFFFFu)
 
         uart.sendStatus(true, 1);
         uart.sendDeviceInfo(vernier.deviceName(), vernier.orderCode(), vernier.serialNumber());
-        uart.sendDeviceStats(vernier.batteryPercent(), vernier.chargeState(), vernier.rssi());
+        uart.sendDeviceStats(vernier.batteryPercent(), vernier.chargeState(), vernier.rssi(), vernier.droppedSamples());
 
         uint32_t mask = vernier.enabledChannelMask();
         const uint8_t maxCh = 32;
@@ -171,10 +171,11 @@ void vernierHandler(void *parameter)
             // something actually changed (RSSI needs a small threshold since
             // it naturally jitters by 1 dBm on a quiet link).
             {
-                static int lastPushedBatt   = -999;
-                static int lastPushedCharge = -999;
-                static int lastPushedRssi   = -999;
-                static uint32_t lastRefreshMs = 0;
+                static int lastPushedBatt    = -999;
+                static int lastPushedCharge  = -999;
+                static int lastPushedRssi    = -999;
+                static uint32_t lastPushedDrop = 0;
+                static uint32_t lastRefreshMs  = 0;
                 const uint32_t DEVSTATS_REFRESH_MS  = 10000;
                 const int      RSSI_CHANGE_THRESHOLD = 3;
 
@@ -184,18 +185,21 @@ void vernierHandler(void *parameter)
                     vernier.getDeviceInfo(true);
                     lastRefreshMs = now;
 
-                    int batt   = vernier.batteryPercent();
-                    int charge = vernier.chargeState();
-                    int rssi   = vernier.rssi();
+                    int batt     = vernier.batteryPercent();
+                    int charge   = vernier.chargeState();
+                    int rssi     = vernier.rssi();
+                    uint32_t drop = vernier.droppedSamples();
                     bool changed = (batt != lastPushedBatt)
                                 || (charge != lastPushedCharge)
-                                || (abs(rssi - lastPushedRssi) >= RSSI_CHANGE_THRESHOLD);
+                                || (abs(rssi - lastPushedRssi) >= RSSI_CHANGE_THRESHOLD)
+                                || (drop != lastPushedDrop);
                     if (changed)
                     {
-                        uart.sendDeviceStats(batt, charge, rssi);
+                        uart.sendDeviceStats(batt, charge, rssi, drop);
                         lastPushedBatt   = batt;
                         lastPushedCharge = charge;
                         lastPushedRssi   = rssi;
+                        lastPushedDrop   = drop;
                     }
                 }
             }

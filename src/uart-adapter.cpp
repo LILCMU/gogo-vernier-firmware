@@ -35,13 +35,14 @@ void UartAdapter::sendDeviceInfo(const char *device_name, const char *order, con
     send();
 }
 
-void UartAdapter::sendDeviceStats(int battery, int charge_state, int rssi)
+void UartAdapter::sendDeviceStats(int battery, int charge_state, int rssi, uint32_t dropped)
 {
     _doc["t"] = T_DEVSTATS;
     _doc["seq"] = _seq++;
     _doc["battery"] = battery;
     _doc["charge_state"] = charge_state;
     _doc["rssi"] = rssi;
+    _doc["dropped"] = dropped;
     send();
 }
 

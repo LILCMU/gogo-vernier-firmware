@@ -27,6 +27,10 @@ public:
     bool isStreaming() const { return _streaming; }
     uint16_t samplingPeriod() const { return _period_ms; }
 
+    // Dropped-sample counter — bumped each time poll() overwrites an
+    // unconsumed sample (latest-wins policy). Monotonic since connect.
+    uint32_t droppedSamples() const { return _dropped_samples; }
+
     // Channels
     uint32_t enabledChannelMask() const { return _enabled_mask; }
     uint8_t channelCount() const { return _channel_count; }
@@ -92,4 +96,7 @@ private:
     uint8_t _channel_count = 0;
     bool _sample_ready = false;
     float _last_values[32] = {0.0f};
+    // Count of samples overwritten before the host consumed them.
+    // Reset to 0 in connect() so each session starts clean.
+    uint32_t _dropped_samples = 0;
 };
