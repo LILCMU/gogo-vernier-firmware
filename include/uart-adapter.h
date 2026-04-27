@@ -12,6 +12,14 @@
 // types) do NOT require a bump.
 constexpr uint8_t VERNIER_PROTOCOL_VERSION = 1;
 
+// Co-MCU firmware identity values reported in T_HELLO / CMD_HELLO so the
+// host can auto-detect which firmware is running. Mirror these constants
+// across all three co-MCU firmwares (gogo-firmware host, this repo, and
+// the GoGoBoard-Arduino library) so the host parses them uniformly.
+constexpr uint8_t GOGOBOARD_FIRMWARE_ID_ARDUINO = 1;
+constexpr uint8_t GOGOBOARD_FIRMWARE_ID_VERNIER = 2;
+constexpr uint8_t GOGOBOARD_FIRMWARE_ID_TASMOTA = 3;
+
 class UartAdapter
 {
 public:
