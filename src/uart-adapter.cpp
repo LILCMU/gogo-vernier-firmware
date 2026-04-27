@@ -1,5 +1,4 @@
 #include "uart-adapter.h"
-#include "main.h" // VERNIER_FW_VERSION_*
 
 UartAdapter::UartAdapter(Print &out)
     : _out(out) {}
@@ -42,9 +41,9 @@ void UartAdapter::sendHello()
     _doc["seq"] = _seq++;
     _doc["proto_version"] = VERNIER_PROTOCOL_VERSION;
     _doc["firmware_id"]   = GOGOBOARD_FIRMWARE_ID_VERNIER;
-    _doc["version_major"] = VERNIER_FW_VERSION_MAJOR;
-    _doc["version_minor"] = VERNIER_FW_VERSION_MINOR;
-    _doc["version_patch"] = VERNIER_FW_VERSION_PATCH;
+    _doc["version_major"] = FIRMWARE_MAJOR_VERSION;
+    _doc["version_minor"] = FIRMWARE_MINOR_VERSION;
+    _doc["version_patch"] = FIRMWARE_PATCH_VERSION;
     send();
 }
 

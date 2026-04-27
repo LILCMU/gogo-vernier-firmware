@@ -9,11 +9,9 @@ enum ButtonEvent {
     BUTTON_LONG_PRESS,
 };
 
-// Firmware version reported in T_HELLO. Keep in sync with the latest
-// release tag (see git tag --sort=-v:refname).
-#define VERNIER_FW_VERSION_MAJOR 1
-#define VERNIER_FW_VERSION_MINOR 2
-#define VERNIER_FW_VERSION_PATCH 0
+// Firmware version reported in T_HELLO comes from -D FIRMWARE_*_VERSION
+// build flags in platformio.ini (matches the gogo-firmware pattern).
+// Keep in sync with the latest release tag.
 
 // NOTE: preference nvs keys
 const constexpr char *NVS_NAMESPACE_SETTING = "vernierSetting";
