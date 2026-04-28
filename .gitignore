@@ -5,3 +5,4 @@
 .cache/clangd/index
 dist
 compile_commands.json
+.claude/tmp/

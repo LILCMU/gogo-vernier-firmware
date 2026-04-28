@@ -1,0 +1,3 @@
+[submodule "GoGoVernier"]
+	path = lib/GoGoVernier
+	url = https://github.com/MomePP/GoGoVernier.git
