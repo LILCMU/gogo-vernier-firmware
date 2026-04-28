@@ -111,13 +111,13 @@ private:
             _pos += n;
             if (_pos < _len)
                 return true; // partial payload read, continue later
-            // Full frame
-            {
-                DeserializationError err = deserializeMsgPack(_doc, _buf, _len);
-                if (!err && _cb)
-                    _cb(_doc.as<JsonVariantConst>(), _user);
-                _doc.clear();
-            }
+            // Full frame. Clear the doc BEFORE deserializing so a previous
+            // frame's leftover keys don't leak in if deserializeMsgPack
+            // fails — ArduinoJson 7's contract is "clear before reuse".
+            _doc.clear();
+            DeserializationError err = deserializeMsgPack(_doc, _buf, _len);
+            if (!err && _cb)
+                _cb(_doc.as<JsonVariantConst>(), _user);
             reset();
             _frameComplete = true;
             return true;
@@ -128,10 +128,19 @@ private:
             int avail = _in.available();
             if (avail <= 0)
                 return false;
-            size_t chunk = (size_t)avail < _skip ? (size_t)avail : _skip;
-            while (chunk--)
-                (void)_in.read();
-            _skip -= (size_t)avail < _skip ? (size_t)avail : _skip; // adjust correctly
+            // Drain into a scratch buffer using readBytes() so we get back
+            // the actual bytes consumed — Stream::read() returns -1 if the
+            // FIFO drained between available() and the read, and the old
+            // byte-by-byte loop would silently skip non-existent bytes,
+            // de-syncing the next length parse.
+            uint8_t scratch[64];
+            size_t want = (size_t)avail < _skip ? (size_t)avail : _skip;
+            if (want > sizeof(scratch))
+                want = sizeof(scratch);
+            size_t got = _in.readBytes(reinterpret_cast<char *>(scratch), want);
+            if (got == 0)
+                return false; // FIFO drained; come back when more arrives
+            _skip -= got;
             if (_skip == 0)
             {
                 reset();

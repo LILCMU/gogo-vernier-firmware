@@ -33,7 +33,12 @@ static bool connectAndReport(uint32_t req_seq = 0xFFFFFFFFu)
     if (ok)
     {
         vernier.getDeviceInfo();
-        vernier.startReading(vernier.samplingPeriod());
+        // If a previous connect (auto-connect on boot) already started
+        // streaming, calling startReading() again restarts the GATT
+        // subscription and resets the dropped-sample counter mid-experiment.
+        // Only kick off the stream when the link isn't already producing.
+        if (!vernier.isStreaming())
+            vernier.startReading(vernier.samplingPeriod());
 
         uart.sendHello();
         uart.sendStatus(true, 1);
@@ -272,9 +277,18 @@ void uartHandler(void *parameter)
         }
         case C_SET_PERIOD:
         {
-            uint16_t period = root["period_ms"] | vernier.samplingPeriod();
-            if (period == 0)
-                period = 1000;
+            // Accept the host's value in u32 first so a 90s/120s setting
+            // (mentioned as a use case in CLAUDE.md's adaptive-tick comment)
+            // doesn't get silently mod-2^16-truncated at the JSON cast.
+            uint32_t period32 = root["period_ms"] | (uint32_t)vernier.samplingPeriod();
+            if (period32 == 0)
+                period32 = 1000;
+            if (period32 > 0xFFFFu)
+            {
+                uart.sendAck(req, false, "period exceeds 16-bit range");
+                break;
+            }
+            uint16_t period = static_cast<uint16_t>(period32);
             vernier.setSamplingRate(period);
             uart.sendAck(req, true, "rate set");
 
@@ -334,7 +348,11 @@ void setup()
     xTaskCreate(
         uartHandler,
         "UartTask",
-        4096,
+        // 6 KB to absorb the call depth of vernier.connect(), which dives
+        // through GoGoVernier::open → NimBLEScan + NimBLEClient discovery
+        // and can come close to 4 KB on its own. Until connect is offloaded
+        // to a worker (TODO: pendingConnect flag pattern), keep the headroom.
+        6144,
         NULL,
         1,
         &uartProcessTask);

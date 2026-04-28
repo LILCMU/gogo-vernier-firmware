@@ -61,6 +61,7 @@ void UartAdapter::sendDeviceStats(int battery, int charge_state, int rssi, uint3
 void UartAdapter::sendDeviceFields(uint8_t field_count, const char *const names[], const char *const units[])
 {
     _doc["t"] = T_FIELDS;
+    _doc["seq"] = _seq++;
     _doc["field_count"] = field_count;
 
     JsonArray arr = _doc["fields"].to<JsonArray>();
