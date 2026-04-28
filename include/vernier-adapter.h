@@ -1,14 +1,18 @@
 #pragma once
 
 #include <Arduino.h>
-#include <GDXLib.h>
+
+#include "GoGoVernier.h"
 
 const constexpr char *VERNIER_DEFAULT_DEVICE_NAME = "proximity";
 
+// Thin facade over gogo_vernier::GoGoVernier that preserves the call-site
+// shape main.cpp already uses. Owns one device session today; the multi-
+// device upgrade lives in Phase 4 (see .claude/plans/gdxlib-rewrite.md).
 class VernierAdapter
 {
 public:
-    VernierAdapter();
+    VernierAdapter() = default;
 
     bool connect(bool forceConnect = false);
     void disconnect();
@@ -17,86 +21,58 @@ public:
     void setSamplingRate(uint16_t period_ms);
     void startReading(uint16_t period_ms = 0);
     void stopReading();
-    void poll();
+    void poll(); // no-op today; reserved for future host-side housekeeping
 
     void getDeviceInfo(bool force = false);
     void clearDeviceInfo();
 
-    // Sampling / status
-    bool isConnected() const { return _connected; }
-    bool isStreaming() const { return _streaming; }
+    bool isConnected() const { return _gv.isConnected(); }
+    bool isStreaming() const { return _gv.isStreaming(); }
     uint16_t samplingPeriod() const { return _period_ms; }
 
-    // Dropped-sample counter — bumped each time poll() overwrites an
-    // unconsumed sample (latest-wins policy). Monotonic since connect.
-    uint32_t droppedSamples() const { return _dropped_samples; }
+    // Bumped by GoGoVernier internally each time a notification overwrites
+    // an unconsumed sample (latest-wins). Reset to 0 in connect().
+    uint32_t droppedSamples() const;
 
-    // Channels
-    uint32_t enabledChannelMask() const { return _enabled_mask; }
-    uint8_t channelCount() const { return _channel_count; }
+    uint32_t enabledChannelMask() const { return _gv.enabledChannelMask(); }
+    uint8_t channelCount() const;
 
-    // Device cached info
-    const char *deviceName() { return _device_name.c_str(); }
-    const char *orderCode() { return _device_order.c_str(); }
-    const char *serialNumber() { return _device_serial.c_str(); }
-    int batteryPercent() { return _device_battery; }
-    int chargeState() { return _device_charge_state; }
-    int rssi() { return _device_rssi; }
+    const char *deviceName()   { return _gv.deviceInfo().name; }
+    const char *orderCode()    { return _gv.deviceInfo().order_code; }
+    const char *serialNumber() { return _gv.deviceInfo().serial; }
+    int batteryPercent()       { return _gv.status().battery_percent; }
+    int chargeState()          { return static_cast<int>(_gv.status().charger_state); }
+    int rssi()                 { return _gv.status().rssi; }
 
-    // Per-channel quick access
-    const char *sensorName(const byte selectedSensor = 255) { return _GDX.getSensorName(selectedSensor); }
-    const char *sensorUnit(const byte selectedSensor = 255) { return _GDX.getUnits(selectedSensor); }
-    float defaultMeasurement() { return _GDX.getMeasurement(_sensor_default); }
-    float readMeasurement(const byte selectedSensor = 255) { return _GDX.getMeasurement(selectedSensor); }
+    const char *sensorName(byte selectedSensor = 255)
+    {
+        const auto *c = _gv.channel(selectedSensor < 32 ? selectedSensor : 0);
+        return c ? c->description : "";
+    }
+    const char *sensorUnit(byte selectedSensor = 255)
+    {
+        const auto *c = _gv.channel(selectedSensor < 32 ? selectedSensor : 0);
+        return c ? c->units : "";
+    }
+    float defaultMeasurement() { return _gv.measurement(0); }
+    float readMeasurement(byte selectedSensor = 255)
+    {
+        return _gv.measurement(selectedSensor < 32 ? selectedSensor : 0);
+    }
 
-    // Sample buffer interface
-    bool sampleReady() const { return _sample_ready; }
+    // Sample buffer interface — delegates to GoGoVernier.
+    bool sampleReady() const { return _gv.sampleReady(); }
     bool copySample(float *out, size_t &count)
     {
-        if (!_sample_ready)
-            return false;
-        count = _channel_count;
-        uint8_t idx = 0;
-        for (uint8_t i = 0; i < 32; ++i)
-        {
-            if (_enabled_mask & (1u << i))
-            {
-                out[idx++] = _last_values[i];
-            }
-        }
-        _sample_ready = false;
-        return true;
+        uint8_t n = 0;
+        bool ok = const_cast<gogo_vernier::GoGoVernier &>(_gv).copySample(out, n);
+        count = n;
+        return ok;
     }
 
 private:
-    GDXLib _GDX;
-
-    bool _enableAvailableChannels(bool force = false);
-
-    bool _connected = false;
-    bool _streaming = false;
+    gogo_vernier::GoGoVernier _gv;
 
     String _open_device = VERNIER_DEFAULT_DEVICE_NAME;
-    unsigned long _period_start_time = 0;
     uint16_t _period_ms = 1000;
-    uint16_t _read_timeout = 5000;
-
-    // Cached device info
-    String _device_name;
-    String _device_order;
-    String _device_serial;
-    uint8_t _device_battery = 0;
-    uint8_t _device_charge_state = 0;
-    int _device_rssi = 0;
-
-    const byte _sensor_default = 255;
-
-    // Channel/sample state
-    uint32_t _enabled_mask = 0;
-    uint8_t _channel_count = 0;
-    bool _sample_ready = false;
-    float _last_values[32] = {0.0f};
-    // Count of samples overwritten before the host consumed them.
-    // Reset to 0 in connect() so each session starts clean.
-    uint32_t _dropped_samples = 0;
 };
