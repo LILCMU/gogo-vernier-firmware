@@ -93,12 +93,15 @@ Measurement-frame TLVs (notify char payload tags, verbatim):
 | `MEASUREMENT_TYPE_PERIOD` | `0x0e` |
 | `RESPONSE_MEASUREMENT` | `0x20` |
 
-Frame layout:
-- byte 0: header magic
-- byte 1: total length
-- byte 2: rolling counter (decremented per send, wraps 0xFF)
-- byte 3-4: command-specific
-- byte N-1: 1's-complement checksum (`_GDX_calculate_checksum`)
+Frame layout (see `.claude/specs/d2pio-protocol.md` for the canonical version):
+- byte 0: header magic `0x58` on request, response op (e.g. `0x20`) on reply
+- byte 1: total length, inclusive of header through last payload byte
+- byte 2: rolling counter (decremented per send, wraps `0xFF` after `0x00`)
+- byte 3: checksum — 8-bit sum of every byte except byte 3 itself
+  (`_GDX_calculate_checksum`). Not a 1's complement.
+- byte 4: command id on request, echoed cmd id or measurement sub-type on
+  response
+- bytes 5..N-1: command-specific payload
 
 `SET_MEASUREMENT_PERIOD` payload = period in **microseconds**, little-endian
 (matches existing GDXLib).

@@ -30,23 +30,34 @@ on the command char → read response frames from the notify queue.
 
 ## Frame layout
 
-Every command and every response is a single byte stream of the same shape:
+Every command and every response is a single byte stream of the same shape.
+**Asymmetry note:** byte 0 is the literal magic `0x58` on the request path
+(host → device) and the **response op** (e.g. `0x20` for measurement frames)
+on the reply path. The other header bytes share offsets between request and
+response.
 
 ```
-+--------+----------+-------+------+----------+----------+
-| 0x58   | length   | rcnt  | op   | payload  | checksum |
-+--------+----------+-------+------+----------+----------+
-  byte 0    byte 1   byte 2  byte3   bytes 4..N-2  byte N-1
+request (host → device):
++--------+----------+-------+----------+--------+----------+
+| 0x58   | length   | rcnt  | checksum | cmd_id | payload  |
++--------+----------+-------+----------+--------+----------+
+  byte 0    byte 1   byte 2   byte 3    byte 4   bytes 5..N-1
+
+response (device → host):
++--------+----------+-------+----------+----------------+----------+
+|  op    | length   | rcnt  | checksum | cmd_id|meas_ty | payload  |
++--------+----------+-------+----------+----------------+----------+
+  byte 0    byte 1   byte 2   byte 3        byte 4       bytes 5..N-1
 ```
 
 | Byte | Field | Notes |
 |---|---|---|
-| 0 | header | constant `0x58` |
-| 1 | length | total bytes in this frame, header through checksum, inclusive |
+| 0 | header / response op | requests: constant `0x58`. Responses: `0x20` for `RESPONSE_MEASUREMENT`, otherwise tied to the command being acknowledged. |
+| 1 | length | total bytes in this frame, header through last payload byte, inclusive |
 | 2 | rolling counter | starts at `0xFF`, decrements on every host write, wraps to `0xFF` after `0x00`. Device echoes the same value in the corresponding response. |
-| 3 | op | command id (host → device) or response op (device → host) |
-| 4..N-2 | payload | command-specific |
-| N-1 | checksum | 1's-complement of the sum of bytes 0..N-2 |
+| 3 | checksum | see below |
+| 4 | command id (request) / sub-type (response) | request: one of the `CMD_*` opcodes. Response: the original `cmd_id` echoed back, or for `RESPONSE_MEASUREMENT` the measurement-type tag (`MEAS_*`). |
+| 5..N-1 | payload | command-specific |
 
 A response can span multiple BLE notification packets if `length` exceeds
 the negotiated MTU minus the ATT header. Re-assemble by counting bytes
@@ -54,15 +65,34 @@ until `length` is satisfied. godirect-py reference: `Device._GDX_read_blocking`.
 
 ### Checksum
 
+Plain 8-bit sum of every frame byte EXCEPT the checksum byte itself
+(byte 3). Not a 1's complement — earlier drafts of this doc were wrong
+about that.
+
+Reference: `Device._GDX_calculate_checksum` in godirect-py:
+
+```python
+def _GDX_calculate_checksum(self, buff):
+    length = int(buff[1])
+    checksum = -1 * int(buff[3])     # cancels the placeholder
+    for i in range(0, length):
+        checksum += int(buff[i])
+        checksum = checksum & 0xFF
+    return checksum
+```
+
+Equivalent C:
+
 ```c
-uint8_t checksum(const uint8_t* buf, uint8_t len_inclusive) {
-    uint16_t s = 0;
-    for (uint8_t i = 0; i + 1 < len_inclusive; ++i) s += buf[i];
-    return (uint8_t)(~s & 0xFF);
+uint8_t checksum(const uint8_t* buf, uint8_t total_len) {
+    int s = -(int)buf[3];
+    for (uint8_t i = 0; i < total_len; ++i) s += buf[i];
+    return (uint8_t)(s & 0xFF);
 }
 ```
 
-Reference: `Device._GDX_calculate_checksum`. GDXLib's
+The `-buf[3]` cancellation makes the function safe to call before OR
+after the placeholder slot is populated. GDXLib's
 `D2PIO_CalculateChecksum` is identical modulo style.
 
 ## Command opcodes
