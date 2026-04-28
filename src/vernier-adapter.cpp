@@ -2,8 +2,20 @@
 
 bool VernierAdapter::connect(bool forceConnect)
 {
+    // If a session is already open (e.g. auto-connect on boot finished
+    // before the host-MCU C_CONNECT arrived), treat the second request as
+    // idempotent. Tearing the link down only to reopen it loses the
+    // connection — and on NimBLE the BLEClient::disconnect path is async,
+    // so a back-to-back close()+open() races against the controller and
+    // returns BLE_HS_EALREADY (status=2) on the second connect.
+    if (_gv.isConnected())
+    {
+        log_i("VernierAdapter::connect: already connected, returning success");
+        getDeviceInfo(true);
+        return true;
+    }
+
     if (_gv.isStreaming()) _gv.stop();
-    if (_gv.isConnected()) _gv.close();
 
     const char *target = forceConnect ? VERNIER_DEFAULT_DEVICE_NAME
                                       : _open_device.c_str();
