@@ -27,6 +27,11 @@ public:
     void clearDeviceInfo();
 
     bool isConnected() const { return _gv.isConnected(); }
+    // True only after open() finished the full D2PIO handshake. Use this
+    // — not isConnected() — anywhere a caller needs to know "the device
+    // is ready to start streaming". isConnected() flips at BLE link-up,
+    // before the channel mask is populated.
+    bool isReady() const { return _gv.isReady(); }
     bool isStreaming() const { return _gv.isStreaming(); }
     uint16_t samplingPeriod() const { return _period_ms; }
 
