@@ -266,40 +266,51 @@ following issues, all now fixed:
 - ✅ See `.claude/knowledges/d2pio-debug-findings.md` for the detailed
   postmortem.
 
-### Phase 3 — async sample path + Phase-2 polish [next]
-- [ ] `onSample(std::function<void(const Sample&)>)` callback so
+### Phase 3 — async sample path + Phase-2 polish ✅ DONE (mostly)
+- ✅ `onSample(std::function<void(const Sample&)>)` callback so
   `vernierHandler` doesn't have to poll `sampleReady()` at high rate.
-- [ ] Internal ring buffer for polling consumers; backwards compatible
-  with the existing copySample() shape.
-- [ ] Honour `mutual_exclusion_mask` in `enableSensor()` /
-  `enableDefaults()` — reject or auto-disable conflicts and surface
-  which mask bit collided.
-- [ ] Decode `MEAS_INT32` / `MEAS_APERIODIC_INT32` (photogate
-  state, radiation counter use cases) and the `MEAS_START_TIME` /
-  `MEAS_DROPPED` / `MEAS_PERIOD` housekeeping TLVs into per-channel
-  metadata that the host UART can surface.
-- [ ] Wire `_dropped_samples` increment when `MEAS_DROPPED` arrives,
-  in addition to the current "previous sample wasn't drained" path.
-- [ ] Add `_ready` flag set at end of `open()` success; export
-  `isReady()`. `VernierAdapter::connect`'s idempotent guard switches
-  from `isConnected()` to `isReady()` so a concurrent caller falls
-  through and waits on session_mutex instead of erroneously
-  reporting success mid-handshake. (Currently session_mutex
-  absorbs the bug; this makes the contract explicit.)
+  Fires synchronously from the NimBLE notify task; layout matches
+  `copySample()` so the host wire protocol consumes the same shape
+  regardless of which path filled it. **Not yet wired into
+  `vernier-adapter.cpp` / `vernierHandler`** — push consumer to
+  land in Phase 4 alongside multi-device integration.
+- ❌ Internal ring buffer for polling consumers — deferred. Current
+  single-slot `sample_ready` is fine at 1 Hz; revisit if Phase 4
+  multi-device aggregate rate makes drops common.
+- ✅ `mutual_exclusion_mask` honoured in `enableSensor()` (rejects
+  conflicting requests) and in `open()`'s default-enable (walks
+  bits in ascending order, skips conflicts deterministically). Not
+  exercised on real GDX-3MG / GDX-ACC yet — needs hardware.
+- ✅ `MEAS_DROPPED` (0x0d) decoded; device-reported drop count adds
+  to `_impl->dropped` alongside the local "previous sample not
+  drained" path.
+- ❌ `MEAS_INT32` / `MEAS_APERIODIC_INT32` / `MEAS_START_TIME` /
+  `MEAS_PERIOD` — deferred. No current device exercises INT32
+  (photogate, radiation counter use cases not in scope yet).
+  START_TIME / PERIOD are housekeeping; silently ignored is fine.
+- ✅ `_ready` flag set at end of `open()` success; `isReady()`
+  exported. `VernierAdapter::connect`'s idempotent guard switched
+  from `isConnected()` to `isReady()`. Contract now explicit;
+  session_mutex no longer the only guard against the
+  start-during-handshake race.
 
-### Phase 4 — vernier-firmware integration + multi-device [planned]
-- [ ] Replace `g_active_impl` global pointer in `NimBleXport.cpp`
-  with per-instance subscribe lambda. h2zero's
-  `NimBLERemoteCharacteristic::subscribe(true, lambda, response=true)`
-  closes over the Impl pointer via capture, eliminating cross-instance
-  routing. Without this, a second `GoGoVernier` instance steals the
-  first's notifications.
-- [ ] Fix the dtor UAF risk: `~NimBleXport` deletes `_impl` while the
-  notify trampoline may still hold a pointer. Switch to per-instance
-  capture (above) drops the global; per-instance lambda's lifetime
-  is tied to NimBLE's subscription, not to the trampoline.
+### Phase 4 — vernier-firmware integration + multi-device [next]
+- ✅ Replaced `g_active_impl` global pointer in `NimBleXport.cpp`
+  with per-instance subscribe lambda capturing `Impl*`. h2zero's
+  `NimBLERemoteCharacteristic::subscribe(true, std::function)`
+  closes over the pointer via capture; cross-instance routing
+  eliminated.
+- ✅ dtor UAF surface reduced: `NimBLEDevice::deleteClient`
+  inside `disconnect()` clears the subscription before
+  `~NimBleXport` deletes `_impl`, so a notify dispatched from the
+  host task after teardown begins runs the lambda but no-ops on
+  the nulled `on_notify`.
 - [ ] Drop `g_ble_mutex` during the 500 ms async-disconnect wait so
   multi-device throughput isn't pathological.
+- [ ] Wire `onSample(cb)` into `vernier-adapter` so `vernierHandler`
+  becomes notification-driven instead of polling `sampleReady()`
+  every tick. Required before multi-device because polling N
+  instances scales badly.
 - [ ] Extend `vernier-adapter.cpp` to a slot table
   (`VernierAdapter[CONFIG_NIMBLE_MAX_CONNECTIONS]`), keyed by device id.
 - [ ] Extend host wire protocol (`include/uart-adapter.h`) with `dev`
@@ -308,6 +319,8 @@ following issues, all now fixed:
   `T_DEV_LIST` so the host can enumerate occupied slots.
 - [ ] Smoke test on real GoGo + 1× GDX-LC + 1× GDX-TMP simultaneously,
   then 3× simultaneously (NimBLE default max).
+- [ ] Verify `mutual_exclusion_mask` enforce branch on real GDX-3MG
+  or GDX-ACC (Phase 3 added the code path; never exercised).
 
 ### Phase 5 — tests, CI
 - Host-side fake GATT server: extend `godirect-py` to act as the device side

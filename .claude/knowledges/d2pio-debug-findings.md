@@ -6,44 +6,60 @@ should read this before tweaking BLE / log / Serial config.
 
 ## Session-end snapshot — pick up here
 
-Last session ended with **Phase 2 fully working end-to-end on real
-GDX-LC**: clean handshake (INIT → DEVICE_INFO → AVAILABLE_MASK → 5×
-SENSOR_INFO → SET_PERIOD → START_MEASUREMENTS), all five channels
-named (Light, UV, 615/525/465 nm), live samples flowing at 1 Hz, no
-duplicate writes, no failed commands.
+Phase 3 starters landed + Phase 4 prep (per-instance lambda) done.
+Smoke confirmed on GDX-LC: handshake clean, 5 channels (mask=0xE6 →
+Light, UV, 615/525/465 nm), samples flow at 1 Hz, idempotent
+`start()` while-streaming guard fires, no notify regression after
+dropping `g_active_impl`.
 
 State on disk (latest commits):
 
-- Submodule `lib/GoGoVernier` HEAD: `afcb584` — session_mutex serialises
-  open/close/start/stop; pending_cmd stamped under req_mutex; cmd_id-only
-  ACK matching; `start()` refuses pre-handshake or no-ops if already
-  streaming.
-- Parent `vernier-firmware` branch `develop` HEAD: `ceac306` — submodule
-  bump + Serial TX buffer 4 KB + monitor_speed=115200 + USE_ESP_IDF_LOG
-  on + ANSI colors off + `.claude/knowledges/d2pio-debug-findings.md`
-  (this file) + plan in `.claude/plans/gdxlib-rewrite.md`.
+- Submodule `lib/GoGoVernier` HEAD: `af2126b` — per-instance subscribe
+  lambda replaces global trampoline. Previous: `642ad86` adds isReady
+  / Sample / onSample / mut-ex enforce / MEAS_DROPPED.
+- Parent `vernier-firmware` branch `develop` HEAD: `abe6f80`
+  (submodule bump for B). Previous: `2b0e02a` flipped
+  `VernierAdapter::connect` idempotent guard from `isConnected()` to
+  `isReady()` and bumped submodule to A.
 
 Pinned platform: `pioarduino/...stable...` (NimBLE-Arduino backend, no
 55.03.34 pin needed any more — the 55.03.34 workaround was for the old
 ArduinoBLE stack).
 
+Local-only: both submodule + parent are ahead of origin. Push order
+matters — submodule first, then parent, otherwise origin parent
+points at unreachable submodule SHA.
+
+Not yet hardware-verified (code paths landed but not exercised in
+real-world conditions):
+
+- Mut-ex enforce in `enableSensor()` and `open()` default — needs
+  GDX-3MG or GDX-ACC. GDX-LC has no conflicts so default-enable
+  produced full mask (no `ch* skipped` lines).
+- `MEAS_DROPPED` decode — needs sustained period overrun. GDX-LC
+  at 1 Hz never drops.
+- `isReady()` second-connect path — needs two host C_CONNECT
+  commands after handshake completes. The boot-time race was
+  absorbed by session_mutex in this trace.
+
 To resume in the next session:
 
-1. Read `.claude/plans/gdxlib-rewrite.md` Phase 3 / Phase 4 sections —
-   they list the deferred follow-ups in order.
-2. Highest-leverage next item is the `_ready` flag in
-   `lib/GoGoVernier/src/GoGoVernier.cpp` so `VernierAdapter::connect`
-   can switch its idempotent guard from `isConnected()` to `isReady()`.
-   Today the session_mutex absorbs the bug; making the contract explicit
-   is cheap and removes a foot-gun.
-3. Phase 4 multi-device requires replacing `g_active_impl` in
-   `lib/GoGoVernier/src/transport/NimBleXport.cpp` with a per-instance
-   subscribe lambda (the global is the only thing blocking real
-   multi-conn). See "Multi-device readiness (Phase 4 prep)" section
-   below.
-4. Don't re-derive any of the protocol details from godirect-py;
-   they're all here. Re-read this file's "Protocol" section if any
-   wire-level question surfaces.
+1. Read `.claude/plans/gdxlib-rewrite.md` Phase 4 section — items
+   listed in execution order.
+2. First Phase 4 item: wire `onSample(cb)` into `vernier-adapter` /
+   `vernierHandler` (currently still polling `sampleReady()` every
+   tick). Required before multi-device because polling N instances
+   scales badly. Push path is already plumbed in GoGoVernier; just
+   needs an adapter consumer.
+3. Then: drop `g_ble_mutex` during the 500 ms async-disconnect wait
+   in `NimBleXport::disconnect`. Pathological for multi-device
+   throughput as-is.
+4. Then: slot table in `vernier-adapter` + per-frame `dev` byte in
+   the host UART protocol. Requires coordinating with the GoGo MCU
+   side.
+5. Don't re-derive protocol details from godirect-py; they're all
+   here. Re-read this file's "Protocol" section if any wire-level
+   question surfaces.
 
 ## Protocol
 
@@ -257,19 +273,66 @@ EALREADY tolerance) was the GDX-LC connect-failure root cause, and
 h2zero exposes `exchangeMTU` as an opt-in flag that handles EALREADY
 gracefully.
 
+## Known race windows (intentionally not fixed)
+
+These came up during the Phase-3 review. Not introduced by Phase 3 —
+inherited from the Phase-1 single-slot polling design — and the
+real-world impact is small enough at current sample rates that
+fixing them isn't worth the lock contention on the notify task.
+Document so a future debugger doesn't chase them as "new bugs":
+
+- **Cross-channel snapshot tear in `copySample()`.** Notify task
+  writes `channels[i].value` for each enabled channel, then sets
+  `sample_ready=true`. If notify N+1 fires while the consumer is
+  mid-`copySample`, the consumer sees a mix of frame N and frame
+  N+1 values. RV32 atomic 32-bit loads guarantee no torn floats
+  per channel; only the cross-channel snapshot is unsynchronised.
+  The `sample_ready` flag itself doesn't help — the race is
+  between "ready=true was set" and the iteration over channels.
+  At 1 Hz the window is microseconds and indistinguishable from
+  the device's own intra-frame jitter; revisit if Phase-4
+  multi-device aggregate sample rates close the gap.
+
+- **`enabled` mask read during `decodeMeasurement`.** When the
+  push-mode `onSample` callback fires, `enabled` is read to build
+  the dense `Sample` layout. `enableSensor()` /
+  `disableSensor()` from a caller task can write it concurrently.
+  The contract is that callers don't toggle channels during
+  streaming (only between `stop()` and `start()`), but it isn't
+  enforced. Add an assertion if a future bug points here.
+
+- **`_impl->dropped` increment.** Single-writer (notify task) +
+  aligned u32 read from caller via `droppedSamples()`. Not
+  actually a race on RV32 — atomic load + atomic increment from
+  the only writer. Reviewer flagged it as one; documented here
+  so the same flag doesn't reappear next review.
+
 ## Multi-device readiness (Phase 4 prep)
 
-Currently single-instance only:
-- `g_active_impl` global pointer in `NimBleXport.cpp` is a single-conn
-  routing slot for the notify trampoline. Multi-device requires a
-  `conn_handle → Impl*` map.
-- `~NimBleXport` deletes `_impl` while the trampoline may still hold
-  a pointer — UAF risk if a notify is in flight at destruction. Fix
-  in Phase 4 by switching to per-instance subscribe lambdas instead
-  of the global trampoline.
+Done:
+- ✅ `g_active_impl` removed. `NimBleXport::subscribe` passes
+  h2zero a `std::function` lambda capturing `Impl*` directly.
+  Per-instance routing — two GoGoVernier instances no longer
+  steal each other's notifications. Lambda indirects through
+  `Impl::on_notify` so `unsubscribe()` nulling it makes the
+  callback no-op cleanly during teardown.
+- ✅ dtor UAF surface reduced. `NimBLEDevice::deleteClient` inside
+  `disconnect()` clears the subscription before `~NimBleXport`
+  deletes `_impl`. A late notify dispatched from the host task
+  hits a nulled `on_notify` and returns.
+
+Still single-instance because of:
 - `disconnect()` holds `g_ble_mutex` for up to 500 ms during the
-  async-disconnect wait. Multi-device throughput suffers; drop the
-  mutex during the wait and retake before `deleteClient`.
+  async-disconnect wait. Multi-device throughput would suffer;
+  drop the mutex during the wait and retake before `deleteClient`.
+- `vernier-adapter` is a single global, not a slot table. Needs
+  `VernierAdapter[CONFIG_NIMBLE_MAX_CONNECTIONS]` keyed by a
+  device id.
+- Host UART protocol (`include/uart-adapter.h`) has no per-device
+  field. Frames need a `dev` (u8) byte on `T_DEVINFO` /
+  `T_DEVSTATS` / `T_FIELDS` / `T_SENS_VALUES`. Add `T_DEV_LIST`
+  for the host to enumerate occupied slots. `T_HELLO` stays
+  device-agnostic.
 
 ## Reference implementations cross-checked
 
