@@ -206,49 +206,108 @@ loopback.
 
 ## Phase plan
 
-### Phase 0 — bootstrap, no behaviour change
-- Fork `MomePP/GDXLib` to new repo (or rename branch) `gogo-vernier`.
-- Add `.claude/specs/d2pio-protocol.md` distilled from `godirect-py` opcodes
-  + `MomePP/GDXLib` framing. godirect-py is the reference for any disagreement.
-- Smoke test: connect → battery% → disconnect.
-- Old `GDXLib` typedef preserved so `vernier-firmware` builds unchanged.
+### Phase 0 — bootstrap, no behaviour change ✅ DONE
+- ✅ Submodule scaffold at `lib/GoGoVernier` (origin `MomePP/GoGoVernier`).
+- ✅ `.claude/specs/d2pio-protocol.md` distilled from godirect-py + GDXLib.
+- ✅ `D2PIOProtocol.h` with opcodes, UUIDs, checksum function.
+- ✅ Public API surface in `GoGoVernier.h` matching `vernier-adapter.cpp`'s
+  call-site shape; old GDXLib path retained until Phase 1 swap.
+- ✅ BSD-3 license + NOTICES.md + library.json.
 
-### Phase 1 — backend swap to NimBLE
-- Add `NimBLEXport` against `h2zero/NimBLE-Arduino`.
-- Build with arduino-esp32 stable (3.3.7 / IDF 5.5.4 / NimBLE host).
-- Phase-0 smoke test still passes.
-- Drop `#include "ArduinoBLE.h"` from public header.
+### Phase 1 — backend swap to NimBLE ✅ DONE
+- ✅ `lib/GoGoVernier/src/transport/{BleTransport.h, NimBleXport.{h,cpp}}`
+  against `h2zero/NimBLE-Arduino` 2.5.0.
+- ✅ ArduinoBLE / GDXLib dropped from `lib_deps`. Platform back on stable
+  (pioarduino/platform-espressif32 release).
+- ✅ Drop `#include "ArduinoBLE.h"` from public header.
+- ✅ Auto-MTU race solved: `setMTU(247)` after `init`, `exchangeMTU=true`
+  on connect, poll `getMTU()` until ≥ 28 before any handshake write.
+  Without this the 25-byte CMD_INIT silently truncates to 20 bytes via
+  h2zero's long-write fallback (cmd char is WRITE_NO_RSP only).
+- ✅ Recursive `_session_mutex` serialises whole open/close/start/stop;
+  `_req_mutex` serialises individual sendRequest. Both required after
+  observing a concurrent C_CONNECT-from-host racing the boot
+  auto-connect's handshake loop.
 
-### Phase 2 — kill globals, full 32-channel support
-- Move `g_d2pioCommand`, `g_d2pioResponse`, `g_*EnabledSensor`, `g_measurement1..7`
-  onto `D2PIOSession` instance state.
-- Replace 7-way `if/else` in `getMeasurement()` with `_channels[32]` array of
-  the per-sensor record from godirect-py's `Sensor` (description, id, units,
-  measurement type, ranges, periods, mutual_exclusion_mask, enabled, value).
-- `GDX_ReadMeasurement` decodes live frame straight into `_channels[]` —
-  switch on `MEASUREMENT_TYPE_*` tag to handle real32 / int32 / aperiodic /
-  dropped / period sub-frames as godirect-py's `_GDX_handle_measurement` does.
-- Honour `mutual_exclusion_mask` in `enableSensor()` — reject or auto-disable
-  the conflict and report which mask bit conflicted.
+### Phase 2 — kill globals, full 32-channel support ✅ DONE (mostly)
+- ✅ All Phase-1 state on instance (Impl struct), no TU-static beyond
+  the single notify-trampoline back-pointer (`g_active_impl`) which is
+  Phase-4's blocker.
+- ✅ `_channels[32]` array filled from `CMD_GET_SENSOR_INFO` per set bit
+  in `availableChannelMask`.
+- ✅ `decodeMeasurement` handles `MEAS_NORMAL_REAL32`, `MEAS_WIDE_REAL32`,
+  `MEAS_SINGLE_CHANNEL_REAL32`, `MEAS_APERIODIC_REAL32`. `INT32`,
+  `START_TIME`, `DROPPED`, `PERIOD` tags are no-ops for now (logged).
+- ❌ `mutual_exclusion_mask` is decoded into `ChannelInfo` but NOT
+  enforced in `enableSensor()`. Default behaviour today is to enable
+  every bit in `availableChannelMask`; on devices with conflicting
+  pairs (GDX-3MG, GDX-ACC ranges) this sends a START_MEASUREMENTS
+  with conflicting bits set. Currently no observed crash but device
+  behaviour undefined per spec. Move to Phase 3+ deliverable.
 
-### Phase 3 — async sample path
-- `onSample(std::function<void(const Sample&)>)` callback.
-- Internal ring buffer for `vernierHandler`-style polling consumers.
-- `GDX_ReadMeasurement` becomes thin wrapper preserving Phase-0 callers.
+### Phase 2.5 — production hardening ✅ DONE (this session)
+Added on top of Phase 2 after first hardware testing surfaced the
+following issues, all now fixed:
+- ✅ ATT MTU race vs. `writeValue` long-write fallback (see Phase 1).
+- ✅ `sendRequest` rcnt/cmd validation initially too strict (device does
+  not echo rcnt). Match by `data[4] == pending_cmd` only — godirect-py
+  + GDXLib both skip rcnt validation.
+- ✅ `pending_*` stamping moved INTO `sendRequest` under `req_mutex`
+  (was in `encode()` outside it; concurrent encoders clobbered each
+  other's pending state).
+- ✅ `start()` refuses if `available == 0` AND short-circuits if
+  `streaming == true` (prevents duplicate SET_PERIOD + START_MEAS
+  writes from successive `connectAndReport` rounds).
+- ✅ Recursive session_mutex (see Phase 1).
+- ✅ CMD_GET_DEVICE_INFO timeout extended 3 s → 8 s; observed slow on
+  GDX-LC and possibly other devices.
+- ✅ USB-CDC TX buffer bumped to 4 KB so the BLE init log storm doesn't
+  truncate mid-line. ANSI color codes disabled.
+- ✅ See `.claude/knowledges/d2pio-debug-findings.md` for the detailed
+  postmortem.
 
-### Phase 4 — vernier-firmware integration
-- Update `vernier-adapter.cpp` to consume new API. Replace single
-  `VernierAdapter` global with a slot table (`VernierAdapter[3]`) keyed by
-  device id; `connectAndReport` accepts a slot index; UART msgs gain a
-  `dev` field.
-- Extend host wire protocol (`include/uart-adapter.h`) with `dev` (u8) on
-  every per-device frame: `T_DEVINFO`, `T_DEVSTATS`, `T_FIELDS`,
-  `T_SENS_VALUES`, `T_HELLO` stays device-agnostic. Add `T_DEV_LIST` so the
-  host can enumerate occupied slots.
-- Drop `MomePP/ArduinoBLE` from `lib_deps`.
-- Unpin platform → back to `pioarduino/...stable...`.
-- Smoke test on real GoGo + 1× GDX-LC + 1× GDX-TMP simultaneously, then
-  push to 3× simultaneously (NimBLE max).
+### Phase 3 — async sample path + Phase-2 polish [next]
+- [ ] `onSample(std::function<void(const Sample&)>)` callback so
+  `vernierHandler` doesn't have to poll `sampleReady()` at high rate.
+- [ ] Internal ring buffer for polling consumers; backwards compatible
+  with the existing copySample() shape.
+- [ ] Honour `mutual_exclusion_mask` in `enableSensor()` /
+  `enableDefaults()` — reject or auto-disable conflicts and surface
+  which mask bit collided.
+- [ ] Decode `MEAS_INT32` / `MEAS_APERIODIC_INT32` (photogate
+  state, radiation counter use cases) and the `MEAS_START_TIME` /
+  `MEAS_DROPPED` / `MEAS_PERIOD` housekeeping TLVs into per-channel
+  metadata that the host UART can surface.
+- [ ] Wire `_dropped_samples` increment when `MEAS_DROPPED` arrives,
+  in addition to the current "previous sample wasn't drained" path.
+- [ ] Add `_ready` flag set at end of `open()` success; export
+  `isReady()`. `VernierAdapter::connect`'s idempotent guard switches
+  from `isConnected()` to `isReady()` so a concurrent caller falls
+  through and waits on session_mutex instead of erroneously
+  reporting success mid-handshake. (Currently session_mutex
+  absorbs the bug; this makes the contract explicit.)
+
+### Phase 4 — vernier-firmware integration + multi-device [planned]
+- [ ] Replace `g_active_impl` global pointer in `NimBleXport.cpp`
+  with per-instance subscribe lambda. h2zero's
+  `NimBLERemoteCharacteristic::subscribe(true, lambda, response=true)`
+  closes over the Impl pointer via capture, eliminating cross-instance
+  routing. Without this, a second `GoGoVernier` instance steals the
+  first's notifications.
+- [ ] Fix the dtor UAF risk: `~NimBleXport` deletes `_impl` while the
+  notify trampoline may still hold a pointer. Switch to per-instance
+  capture (above) drops the global; per-instance lambda's lifetime
+  is tied to NimBLE's subscription, not to the trampoline.
+- [ ] Drop `g_ble_mutex` during the 500 ms async-disconnect wait so
+  multi-device throughput isn't pathological.
+- [ ] Extend `vernier-adapter.cpp` to a slot table
+  (`VernierAdapter[CONFIG_NIMBLE_MAX_CONNECTIONS]`), keyed by device id.
+- [ ] Extend host wire protocol (`include/uart-adapter.h`) with `dev`
+  (u8) on every per-device frame: `T_DEVINFO`, `T_DEVSTATS`,
+  `T_FIELDS`, `T_SENS_VALUES`. `T_HELLO` stays device-agnostic. Add
+  `T_DEV_LIST` so the host can enumerate occupied slots.
+- [ ] Smoke test on real GoGo + 1× GDX-LC + 1× GDX-TMP simultaneously,
+  then 3× simultaneously (NimBLE default max).
 
 ### Phase 5 — tests, CI
 - Host-side fake GATT server: extend `godirect-py` to act as the device side

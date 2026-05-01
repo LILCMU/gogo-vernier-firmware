@@ -4,6 +4,47 @@ Captured during the Phase 1 / Phase 2 GoGoVernier debug saga. Each entry
 is a non-obvious fact that cost real time to discover. Future maintainers
 should read this before tweaking BLE / log / Serial config.
 
+## Session-end snapshot — pick up here
+
+Last session ended with **Phase 2 fully working end-to-end on real
+GDX-LC**: clean handshake (INIT → DEVICE_INFO → AVAILABLE_MASK → 5×
+SENSOR_INFO → SET_PERIOD → START_MEASUREMENTS), all five channels
+named (Light, UV, 615/525/465 nm), live samples flowing at 1 Hz, no
+duplicate writes, no failed commands.
+
+State on disk (latest commits):
+
+- Submodule `lib/GoGoVernier` HEAD: `afcb584` — session_mutex serialises
+  open/close/start/stop; pending_cmd stamped under req_mutex; cmd_id-only
+  ACK matching; `start()` refuses pre-handshake or no-ops if already
+  streaming.
+- Parent `vernier-firmware` branch `develop` HEAD: `ceac306` — submodule
+  bump + Serial TX buffer 4 KB + monitor_speed=115200 + USE_ESP_IDF_LOG
+  on + ANSI colors off + `.claude/knowledges/d2pio-debug-findings.md`
+  (this file) + plan in `.claude/plans/gdxlib-rewrite.md`.
+
+Pinned platform: `pioarduino/...stable...` (NimBLE-Arduino backend, no
+55.03.34 pin needed any more — the 55.03.34 workaround was for the old
+ArduinoBLE stack).
+
+To resume in the next session:
+
+1. Read `.claude/plans/gdxlib-rewrite.md` Phase 3 / Phase 4 sections —
+   they list the deferred follow-ups in order.
+2. Highest-leverage next item is the `_ready` flag in
+   `lib/GoGoVernier/src/GoGoVernier.cpp` so `VernierAdapter::connect`
+   can switch its idempotent guard from `isConnected()` to `isReady()`.
+   Today the session_mutex absorbs the bug; making the contract explicit
+   is cheap and removes a foot-gun.
+3. Phase 4 multi-device requires replacing `g_active_impl` in
+   `lib/GoGoVernier/src/transport/NimBleXport.cpp` with a per-instance
+   subscribe lambda (the global is the only thing blocking real
+   multi-conn). See "Multi-device readiness (Phase 4 prep)" section
+   below.
+4. Don't re-derive any of the protocol details from godirect-py;
+   they're all here. Re-read this file's "Protocol" section if any
+   wire-level question surfaces.
+
 ## Protocol
 
 ### Request and response frames are NOT symmetric
