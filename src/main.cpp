@@ -318,9 +318,27 @@ void setup()
 {
     nvsMutex = xSemaphoreCreateMutex();
 
-    Serial.begin(115200);
+    // Serial = USB-CDC (ARDUINO_USB_CDC_ON_BOOT=1). The baud argument is
+    // a no-op on HWCDC/USBCDC — they ignore it (verified in
+    // arduino-esp32 cores/esp32/USBCDC.cpp / HWCDC.cpp; `baud` is
+    // declared but never read). Throughput is governed by USB-FS bulk
+    // transfers and the on-chip TX ring buffer; the only knob that
+    // matters is setTxBufferSize, applied BEFORE begin(). Default is
+    // 256 bytes which overruns during the BLE bring-up phase and chops
+    // log lines mid-character. 4 KB gives enough slack for the
+    // NimBLEDevice / NimBLEScan / NimBLEClient init storm without
+    // dropping bytes.
+    Serial.setTxBufferSize(4096);
+    Serial.setRxBufferSize(256);
+    Serial.begin(115200);            // baud value retained for convention only
     Serial.setDebugOutput(true);
 
+    // gogoSerial = HardwareSerial(0) → real UART0 to the host MCU. Baud
+    // here IS honoured. Keep at 115200 — the host firmware speaks the
+    // same rate (see CLAUDE.md: "uartHandler ... gogoSerial ...
+    // 115200").
+    gogoSerial.setTxBufferSize(1024);
+    gogoSerial.setRxBufferSize(1024);
     gogoSerial.begin(115200);
 
     pinMode(BOOT_BUTTON_PIN, INPUT);
