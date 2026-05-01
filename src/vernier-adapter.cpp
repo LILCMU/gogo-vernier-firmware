@@ -8,9 +8,17 @@ bool VernierAdapter::connect(bool forceConnect)
     // connection — and on NimBLE the BLEClient::disconnect path is async,
     // so a back-to-back close()+open() races against the controller and
     // returns BLE_HS_EALREADY (status=2) on the second connect.
-    if (_gv.isConnected())
+    //
+    // Use isReady() not isConnected(): isConnected() flips true the moment
+    // the BLE link comes up, well before the D2PIO handshake fills the
+    // available channel mask. If we returned success there, a follow-up
+    // startReading() can race ahead of the in-flight handshake and send
+    // CMD_START_MEASUREMENTS with mask=0. isReady() blocks here until the
+    // handshake is genuinely complete (or fails) on whichever task got
+    // the session_mutex first.
+    if (_gv.isReady())
     {
-        log_i("VernierAdapter::connect: already connected, returning success");
+        log_i("VernierAdapter::connect: already ready, returning success");
         getDeviceInfo(true);
         return true;
     }
