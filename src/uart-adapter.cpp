@@ -1,23 +1,50 @@
 #include "uart-adapter.h"
 
+namespace {
+// Length-prefix is uint16_t big-endian. Cap on payload size + size of
+// the prefix itself so callers can read either constant by name.
+constexpr size_t  MAX_FRAME_PAYLOAD = 0xFFFF;
+constexpr uint8_t FRAME_PREFIX_SIZE = 2;
+}  // namespace
+
 UartAdapter::UartAdapter(Print &out)
-    : _out(out) {}
+    : _out(out)
+{
+    _send_mutex = xSemaphoreCreateMutex();
+}
+
+UartAdapter::~UartAdapter()
+{
+    if (_send_mutex) vSemaphoreDelete(_send_mutex);
+}
+
+namespace {
+struct SendLock {
+    SemaphoreHandle_t m;
+    SendLock(SemaphoreHandle_t mu) : m(mu) { if (m) xSemaphoreTake(m, portMAX_DELAY); }
+    ~SendLock()                            { if (m) xSemaphoreGive(m); }
+};
+}  // namespace
 
 void UartAdapter::send()
 {
     const size_t len = measureMsgPack(_doc);
-    if (len > 0xFFFF)
+    if (len > MAX_FRAME_PAYLOAD)
+    {
+        log_e("UART send skip — payload too large len=%u", (unsigned)len);
         return; // guard: too large for 16-bit framing
+    }
 
-    uint8_t hdr[2] = {static_cast<uint8_t>((len >> 8) & 0xFF),
-                      static_cast<uint8_t>(len & 0xFF)};
-    _out.write(hdr, 2);
+    uint8_t hdr[FRAME_PREFIX_SIZE] = {static_cast<uint8_t>((len >> 8) & 0xFF),
+                                      static_cast<uint8_t>(len & 0xFF)};
+    _out.write(hdr, FRAME_PREFIX_SIZE);
     serializeMsgPack(_doc, _out);
     _doc.clear();
 }
 
 void UartAdapter::sendStatus(bool status, uint8_t core_state)
 {
+    SendLock _lk(_send_mutex);
     _doc["t"] = T_STATUS;
     _doc["seq"] = _seq++;
     _doc["status"] = status;
@@ -27,6 +54,7 @@ void UartAdapter::sendStatus(bool status, uint8_t core_state)
 
 void UartAdapter::sendDeviceInfo(const char *device_name, const char *order, const char *serial)
 {
+    SendLock _lk(_send_mutex);
     _doc["t"] = T_DEVINFO;
     _doc["seq"] = _seq++;
     _doc["device_name"] = device_name;
@@ -37,6 +65,7 @@ void UartAdapter::sendDeviceInfo(const char *device_name, const char *order, con
 
 void UartAdapter::sendHello()
 {
+    SendLock _lk(_send_mutex);
     _doc["t"] = T_HELLO;
     _doc["seq"] = _seq++;
     _doc["proto_version"] = VERNIER_PROTOCOL_VERSION;
@@ -49,6 +78,7 @@ void UartAdapter::sendHello()
 
 void UartAdapter::sendDeviceStats(int battery, int charge_state, int rssi, uint32_t dropped)
 {
+    SendLock _lk(_send_mutex);
     _doc["t"] = T_DEVSTATS;
     _doc["seq"] = _seq++;
     _doc["battery"] = battery;
@@ -60,6 +90,7 @@ void UartAdapter::sendDeviceStats(int battery, int charge_state, int rssi, uint3
 
 void UartAdapter::sendDeviceFields(uint8_t field_count, const char *const names[], const char *const units[])
 {
+    SendLock _lk(_send_mutex);
     _doc["t"] = T_FIELDS;
     _doc["seq"] = _seq++;
     _doc["field_count"] = field_count;
@@ -76,6 +107,7 @@ void UartAdapter::sendDeviceFields(uint8_t field_count, const char *const names[
 
 void UartAdapter::sendSensorValues(const float *values, size_t count)
 {
+    SendLock _lk(_send_mutex);
     _doc["t"] = T_SENS_VALUES;
     _doc["seq"] = _seq++;
 
@@ -88,6 +120,7 @@ void UartAdapter::sendSensorValues(const float *values, size_t count)
 
 void UartAdapter::sendSensorValuesTs(const float *values, size_t count, uint32_t ts_ms)
 {
+    SendLock _lk(_send_mutex);
     _doc["t"] = T_SENS_VALUES;
     _doc["seq"] = _seq++;
     _doc["ts"] = ts_ms;
@@ -101,6 +134,7 @@ void UartAdapter::sendSensorValuesTs(const float *values, size_t count, uint32_t
 
 void UartAdapter::sendAck(uint32_t req_seq, bool ok, const char *msg)
 {
+    SendLock _lk(_send_mutex);
     _doc["t"] = T_ACK;
     _doc["seq"] = _seq++;
     _doc["req"] = req_seq;

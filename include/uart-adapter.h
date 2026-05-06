@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // Length-prefixed MsgPack framing: [uint16_be length][MsgPack payload]
 //
@@ -24,6 +26,7 @@ class UartAdapter
 {
 public:
     explicit UartAdapter(Print &out);
+    ~UartAdapter();
 
     void sendHello();
     void sendStatus(bool status, uint8_t core_state);
@@ -56,4 +59,12 @@ private:
     Print &_out;
     JsonDocument _doc;
     uint32_t _seq = 0;
+    // _doc is shared mutable state; every public sendXxx() builds the
+    // doc then calls send() which measures + serializes. With three
+    // FreeRTOS tasks (uartHandler, vernierHandler, main loop)
+    // simultaneously calling sendXxx on this instance, the doc would
+    // be clobbered mid-build by another task — observed in field-test
+    // logs as len/body mismatches and host-side parser desync. Mutex
+    // serialises the entire build+send critical section per call.
+    SemaphoreHandle_t _send_mutex = nullptr;
 };
