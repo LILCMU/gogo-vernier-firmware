@@ -52,11 +52,12 @@ void UartAdapter::sendStatus(bool status, uint8_t core_state)
     send();
 }
 
-void UartAdapter::sendDeviceInfo(const char *device_name, const char *order, const char *serial)
+void UartAdapter::sendDeviceInfo(const char *device_name, const char *order, const char *serial, uint8_t dev)
 {
     SendLock _lk(_send_mutex);
     _doc["t"] = T_DEVINFO;
     _doc["seq"] = _seq++;
+    _doc["dev"] = dev;
     _doc["device_name"] = device_name;
     _doc["order"] = order;
     _doc["serial"] = serial;
@@ -73,14 +74,16 @@ void UartAdapter::sendHello()
     _doc["version_major"] = FIRMWARE_MAJOR_VERSION;
     _doc["version_minor"] = FIRMWARE_MINOR_VERSION;
     _doc["version_patch"] = FIRMWARE_PATCH_VERSION;
+    _doc["max_slots"]     = VERNIER_MAX_SLOTS;
     send();
 }
 
-void UartAdapter::sendDeviceStats(int battery, int charge_state, int rssi, uint32_t dropped)
+void UartAdapter::sendDeviceStats(int battery, int charge_state, int rssi, uint32_t dropped, uint8_t dev)
 {
     SendLock _lk(_send_mutex);
     _doc["t"] = T_DEVSTATS;
     _doc["seq"] = _seq++;
+    _doc["dev"] = dev;
     _doc["battery"] = battery;
     _doc["charge_state"] = charge_state;
     _doc["rssi"] = rssi;
@@ -88,11 +91,12 @@ void UartAdapter::sendDeviceStats(int battery, int charge_state, int rssi, uint3
     send();
 }
 
-void UartAdapter::sendDeviceFields(uint8_t field_count, const char *const names[], const char *const units[])
+void UartAdapter::sendDeviceFields(uint8_t field_count, const char *const names[], const char *const units[], uint8_t dev)
 {
     SendLock _lk(_send_mutex);
     _doc["t"] = T_FIELDS;
     _doc["seq"] = _seq++;
+    _doc["dev"] = dev;
     _doc["field_count"] = field_count;
 
     JsonArray arr = _doc["fields"].to<JsonArray>();
@@ -105,11 +109,12 @@ void UartAdapter::sendDeviceFields(uint8_t field_count, const char *const names[
     send();
 }
 
-void UartAdapter::sendSensorValues(const float *values, size_t count)
+void UartAdapter::sendSensorValues(const float *values, size_t count, uint8_t dev)
 {
     SendLock _lk(_send_mutex);
     _doc["t"] = T_SENS_VALUES;
     _doc["seq"] = _seq++;
+    _doc["dev"] = dev;
 
     JsonArray arr = _doc["sensors"].to<JsonArray>();
     for (size_t i = 0; i < count; ++i)
@@ -118,11 +123,12 @@ void UartAdapter::sendSensorValues(const float *values, size_t count)
     send();
 }
 
-void UartAdapter::sendSensorValuesTs(const float *values, size_t count, uint32_t ts_ms)
+void UartAdapter::sendSensorValuesTs(const float *values, size_t count, uint32_t ts_ms, uint8_t dev)
 {
     SendLock _lk(_send_mutex);
     _doc["t"] = T_SENS_VALUES;
     _doc["seq"] = _seq++;
+    _doc["dev"] = dev;
     _doc["ts"] = ts_ms;
 
     JsonArray arr = _doc["sensors"].to<JsonArray>();

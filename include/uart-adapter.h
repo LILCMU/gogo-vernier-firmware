@@ -12,7 +12,20 @@
 // against its own compiled-in constant on every T_HELLO and warns on
 // mismatch. Non-breaking additions (new optional keys, new message
 // types) do NOT require a bump.
-constexpr uint8_t VERNIER_PROTOCOL_VERSION = 1;
+//
+// v2 (Phase 4 step 2): per-device frames (T_DEVINFO, T_DEVSTATS,
+// T_FIELDS, T_SENS_VALUES) gain optional `dev` (u8) field naming
+// the slot the frame belongs to. Absent → treat as 0 (back-compat
+// with v1 firmware on either side). T_HELLO gains `max_slots`
+// reporting compile-time slot capacity. New T_DEV_LIST (msg 9)
+// enumerates occupied slots. See .claude/plans/multi-device-design.md.
+constexpr uint8_t VERNIER_PROTOCOL_VERSION = 2;
+
+// Compile-time cap on concurrent BLE peers per vernier MCU. Bounded
+// by CONFIG_NIMBLE_MAX_CONNECTIONS in the bundled NimBLE host (default
+// 3 on arduino-esp32 3.3.x). Reported in T_HELLO so the host can
+// size its slot-tracking table to match.
+constexpr uint8_t VERNIER_MAX_SLOTS = 3;
 
 // Co-MCU firmware identity values reported in T_HELLO / CMD_HELLO so the
 // host can auto-detect which firmware is running. Mirror these constants
@@ -30,13 +43,17 @@ public:
 
     void sendHello();
     void sendStatus(bool status, uint8_t core_state);
-    void sendDeviceInfo(const char *device_name, const char *order, const char *serial);
-    void sendDeviceStats(int battery, int charge_state, int rssi, uint32_t dropped);
+    // Per-device sends: `dev` is the slot id the frame describes.
+    // Defaults to 0 — single-device callers omit the arg, behaviour
+    // unchanged. Multi-device callers (Phase 4 step 3+) pass the
+    // slot id explicitly.
+    void sendDeviceInfo(const char *device_name, const char *order, const char *serial, uint8_t dev = 0);
+    void sendDeviceStats(int battery, int charge_state, int rssi, uint32_t dropped, uint8_t dev = 0);
 
-    void sendDeviceFields(uint8_t field_count, const char *const names[], const char *const units[]);
+    void sendDeviceFields(uint8_t field_count, const char *const names[], const char *const units[], uint8_t dev = 0);
 
-    void sendSensorValues(const float *values, size_t count);
-    void sendSensorValuesTs(const float *values, size_t count, uint32_t ts_ms);
+    void sendSensorValues(const float *values, size_t count, uint8_t dev = 0);
+    void sendSensorValuesTs(const float *values, size_t count, uint32_t ts_ms, uint8_t dev = 0);
 
     void sendAck(uint32_t req_seq, bool ok, const char *msg = nullptr);
 
@@ -52,6 +69,7 @@ private:
         T_SENS_VALUES = 5,
         T_ACK         = 7,
         T_HELLO       = 8,
+        T_DEV_LIST    = 9,  // v2: slot enumeration; emit method lands in Phase 4 step 3
     };
 
     void send(); // serialize MsgPack with 2-byte BE length prefix
