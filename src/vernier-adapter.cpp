@@ -1,5 +1,25 @@
 #include "vernier-adapter.h"
 
+#include <string.h>
+
+VernierAdapter::VernierAdapter()
+{
+    // VERNIER_SAMPLE_QUEUE_DEPTH (=2) lets the NimBLE notify task push
+    // frame N+1 while the consumer task is still dispatching frame N.
+    // At 1 Hz this is wildly overprovisioned; at 50 ms (Vernier's
+    // typical floor) it gives one slot of slack before xQueueSend
+    // returns errQUEUE_FULL. sizeof(gogo_vernier::Sample) ≈ 140 B, so
+    // the queue costs ≈ 280 B of static RAM — fine on an ESP32-C3 with
+    // ~300 KB free DRAM.
+    _sample_queue = xQueueCreate(VERNIER_SAMPLE_QUEUE_DEPTH,
+                                 sizeof(gogo_vernier::Sample));
+}
+
+VernierAdapter::~VernierAdapter()
+{
+    if (_sample_queue) vQueueDelete(_sample_queue);
+}
+
 bool VernierAdapter::connect(bool forceConnect)
 {
     // If a session is already open (e.g. auto-connect on boot finished
@@ -34,23 +54,48 @@ bool VernierAdapter::connect(bool forceConnect)
     bool ok = _gv.open(target);
     if (ok)
     {
-        // Enable every channel the device exposes. Phase 1 stub returns 0
-        // for availableChannelMask, so this is a no-op until the real
-        // protocol layer lands; the loop is in place so the day it does
-        // start returning a mask we behave correctly.
+        // Enable every channel the device exposes. GoGoVernier::open()
+        // already does mut-ex-aware default-enable, but redo it here
+        // so a future change in the lib's default policy doesn't
+        // silently propagate. enableSensor() is idempotent for
+        // already-enabled bits.
         uint32_t mask = _gv.availableChannelMask();
-        for (uint8_t i = 0; i < 32; ++i)
+        for (uint8_t i = 0; i < gogo_vernier::MAX_CHANNELS; ++i)
         {
             if (mask & (1u << i)) _gv.enableSensor(i);
         }
+
+        // Reset push-side drop counter and drain any stale samples
+        // left in the queue from a previous session.
+        _push_dropped = 0;
+        if (_sample_queue) xQueueReset(_sample_queue);
+
+        // Wire the push path. Lambda runs on the NimBLE notify task —
+        // must be non-blocking. xQueueSend with timeout=0 drops on
+        // full and bumps the counter; the host MCU sees the count
+        // via the next DEVSTATS push.
+        QueueHandle_t q = _sample_queue;
+        uint32_t* drop_counter = &_push_dropped;
+        _gv.onSample([q, drop_counter](const gogo_vernier::Sample& s) {
+            if (!q) return;
+            if (xQueueSend(q, &s, 0) != pdTRUE) {
+                ++(*drop_counter);
+            }
+        });
     }
     return ok;
 }
 
 void VernierAdapter::disconnect()
 {
+    // Clear the push consumer FIRST so the NimBLE notify task stops
+    // pushing into a queue we're about to drain. The lambda copy
+    // we installed in connect() captures the queue handle by value,
+    // so resetting it via {} in GoGoVernier safely drops the cb.
+    _gv.onSample({});
     if (_gv.isStreaming()) _gv.stop();
     if (_gv.isConnected()) _gv.close();
+    if (_sample_queue) xQueueReset(_sample_queue);
     clearDeviceInfo();
 }
 
@@ -101,5 +146,21 @@ void VernierAdapter::clearDeviceInfo()
     // Cached device info lives inside GoGoVernier and is reset on open()/close().
 }
 
-uint32_t VernierAdapter::droppedSamples() const  { return _gv.droppedSamples(); }
+uint32_t VernierAdapter::droppedSamples() const  { return _gv.droppedSamples() + _push_dropped; }
 uint8_t  VernierAdapter::channelCount() const    { return _gv.channelCount(); }
+
+bool VernierAdapter::waitForSample(float *out, size_t &count, uint32_t timeout_ms)
+{
+    count = 0;
+    if (!_sample_queue) return false;
+
+    gogo_vernier::Sample s;
+    if (xQueueReceive(_sample_queue, &s, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return false;
+    }
+    if (out && s.count > 0) {
+        memcpy(out, s.values, s.count * sizeof(float));
+    }
+    count = s.count;
+    return true;
+}

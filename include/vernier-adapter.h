@@ -1,10 +1,21 @@
 #pragma once
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 #include "GoGoVernier.h"
 
 const constexpr char *VERNIER_DEFAULT_DEVICE_NAME = "proximity";
+
+// Default sampling period (ms) until the host overrides via C_SET_PERIOD.
+// 1 Hz is the slowest cadence the host UI updates at, so this is the
+// "no surprises" landing value on a fresh boot.
+constexpr uint16_t VERNIER_DEFAULT_PERIOD_MS = 1000;
+
+// Push-mode sample queue depth — see VernierAdapter() ctor for sizing
+// rationale.
+constexpr UBaseType_t VERNIER_SAMPLE_QUEUE_DEPTH = 2;
 
 // Thin facade over gogo_vernier::GoGoVernier that preserves the call-site
 // shape main.cpp already uses. Owns one device session today; the multi-
@@ -12,7 +23,8 @@ const constexpr char *VERNIER_DEFAULT_DEVICE_NAME = "proximity";
 class VernierAdapter
 {
 public:
-    VernierAdapter() = default;
+    VernierAdapter();
+    ~VernierAdapter();
 
     bool connect(bool forceConnect = false);
     void disconnect();
@@ -35,8 +47,10 @@ public:
     bool isStreaming() const { return _gv.isStreaming(); }
     uint16_t samplingPeriod() const { return _period_ms; }
 
-    // Bumped by GoGoVernier internally each time a notification overwrites
-    // an unconsumed sample (latest-wins). Reset to 0 in connect().
+    // Total dropped sample count: GoGoVernier's internal "previous
+    // sample wasn't drained" + device-reported MEAS_DROPPED frames
+    // + this adapter's queue-full drops on the push path. Reset to
+    // 0 in connect().
     uint32_t droppedSamples() const;
 
     uint32_t enabledChannelMask() const { return _gv.enabledChannelMask(); }
@@ -65,7 +79,11 @@ public:
         return _gv.measurement(selectedSensor < 32 ? selectedSensor : 0);
     }
 
-    // Sample buffer interface — delegates to GoGoVernier.
+    // Sample buffer interface — delegates to GoGoVernier. Polling
+    // path is retained for the legacy `sampleReady()` /
+    // `copySample()` shape; new callers should prefer
+    // `waitForSample()` which blocks on the push-mode queue and
+    // doesn't burn CPU on adaptive ticks.
     bool sampleReady() const { return _gv.sampleReady(); }
     bool copySample(float *out, size_t &count)
     {
@@ -75,9 +93,24 @@ public:
         return ok;
     }
 
+    // Block up to `timeout_ms` waiting for the next sample. On hit,
+    // copies up to `count` floats into `out`, sets `count` to the
+    // number copied, returns true. On timeout: count=0, returns
+    // false. Backed by a depth-2 FreeRTOS queue fed from the
+    // GoGoVernier::onSample callback running on the NimBLE notify
+    // task. Queue overflow (consumer slower than producer) bumps
+    // _push_dropped, exposed via droppedSamples().
+    bool waitForSample(float *out, size_t &count, uint32_t timeout_ms);
+
 private:
     gogo_vernier::GoGoVernier _gv;
 
     String _open_device = VERNIER_DEFAULT_DEVICE_NAME;
-    uint16_t _period_ms = 1000;
+    uint16_t _period_ms = VERNIER_DEFAULT_PERIOD_MS;
+
+    // Push-mode plumbing. Created in the ctor (process-lifetime),
+    // drained by waitForSample(), filled by an onSample lambda
+    // installed on connect() success and cleared on disconnect().
+    QueueHandle_t _sample_queue = nullptr;
+    uint32_t      _push_dropped = 0;  // queue-full drops
 };
