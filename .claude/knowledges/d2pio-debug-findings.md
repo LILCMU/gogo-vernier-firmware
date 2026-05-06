@@ -6,21 +6,70 @@ should read this before tweaking BLE / log / Serial config.
 
 ## Session-end snapshot — pick up here
 
-Phase 3 starters landed + Phase 4 prep (per-instance lambda) done.
-Smoke confirmed on GDX-LC: handshake clean, 5 channels (mask=0xE6 →
-Light, UV, 615/525/465 nm), samples flow at 1 Hz, idempotent
-`start()` while-streaming guard fires, no notify regression after
-dropping `g_active_impl`.
+Phase 3 + Phase 3.5 (wire-corruption hardening) + Phase 4 step 1
+all working end-to-end. GoGo display flips to live values on
+connect, disconnect button works, vernier reset auto-recovered
+within ~5 sec by host liveness watchdog.
 
-State on disk (latest commits):
+Key wins from the corruption-debug saga (full detail below in
+"UART corruption saga"):
+- Per-task UartAdapter mutex closes a shared-`_doc` race that was
+  silent in polling mode but produced length/body mismatches as
+  soon as push mode started concurrent sends.
+- `fclose(stdout)` + custom `esp_log_set_vprintf` silence
+  ESP-IDF / NimBLE-host raw printf bleed onto UART0 = our
+  `gogoSerial`. NimBLE init log strings were the wire garbage.
+- Host-side: drain RX at boot (kills ESP32-C3 ROM bootloader
+  noise), reset receiver state on implausible length (instead
+  of `SKIP_PAYLOAD` for thousands of fake bytes), liveness
+  watchdog in `GoGoVernier::poll()` for self-healing against
+  silent peer death.
 
-- Submodule `lib/GoGoVernier` HEAD: `af2126b` — per-instance subscribe
-  lambda replaces global trampoline. Previous: `642ad86` adds isReady
-  / Sample / onSample / mut-ex enforce / MEAS_DROPPED.
-- Parent `vernier-firmware` branch `develop` HEAD: `abe6f80`
-  (submodule bump for B). Previous: `2b0e02a` flipped
-  `VernierAdapter::connect` idempotent guard from `isConnected()` to
-  `isReady()` and bumped submodule to A.
+State on disk (uncommitted at cleanup time):
+
+**Submodule `lib/GoGoVernier`** (5 files):
+- `src/GoGoVernier.cpp` — Phase 4 step 1: `decodeMeasurement`
+  skips `sample_ready=true` when `on_sample` is bound. Plus
+  k* → SCREAMING_SNAKE rename + new constants extraction.
+- `src/{GoGoVernier.h, D2PIOProtocol.h, transport/BleTransport.h,
+  transport/NimBleXport.cpp}` — k* → SCREAMING_SNAKE renames
+  (no logic change) + extracted MTU/scan/disconnect timing
+  constants in NimBleXport.
+
+**Parent `vernier-firmware`** (mine):
+- `include/uart-adapter.h` — `_send_mutex` member + dtor.
+- `src/uart-adapter.cpp` — mutex-protected sendXxx, namespace
+  constants for frame layout, SendLock RAII.
+- `include/vernier-adapter.h` — push queue plumbing
+  (`_sample_queue`, `_push_dropped`), `waitForSample`,
+  `isReady()`, queue-depth + period constants.
+- `src/vernier-adapter.cpp` — ctor creates queue, connect()
+  installs onSample lambda + resets push counter, disconnect()
+  clears cb then resets queue, waitForSample impl.
+- `src/main.cpp` — Phase 4 vernierHandler rewrite (block on
+  `waitForSample`), `serial_log_vprintf` custom hook,
+  `esp_log_set_vprintf` install, `fclose(stdout/stderr)`,
+  magic-number cleanup constants block.
+
+**Host `gogo-firmware`** (mine):
+- `include/peripherals/gogo-vernier.h` — `_lastFrameMs` member.
+- `include/utils/framed-msgpack-receiver.h` — `_len > _bufSize`
+  → `reset()` (was `SKIP_PAYLOAD` for N bytes); rate-limited
+  desync warn.
+- `src/peripherals/gogo-vernier.cpp` — `poll()` drains 8 frames
+  per call + liveness watchdog; `_handleFrame` updates
+  `_lastFrameMs`; T_HELLO calls `_resetConnectionState()`;
+  T_ACK match relaxed for C_DISCONNECT.
+- `src/gogo-firmware.cpp` — `extSerial` RX drained at boot
+  (50 ms after begin) to discard ESP32-C3 ROM bootloader noise.
+
+Untouched in user's working tree (don't commit as part of this
+session): `.gitignore`, `CLAUDE.md`, `platformio.ini`,
+`include/display/gogo-display.h`, `src/display/gogo-display.cpp`.
+
+Latest committed parent-branch HEAD before this session's batch:
+`d126a45` (docs Phase 3 snapshot + race-window note). Submodule
+pointer in that commit: `c85a1b7`.
 
 Pinned platform: `pioarduino/...stable...` (NimBLE-Arduino backend, no
 55.03.34 pin needed any more — the 55.03.34 workaround was for the old
@@ -46,14 +95,12 @@ To resume in the next session:
 
 1. Read `.claude/plans/gdxlib-rewrite.md` Phase 4 section — items
    listed in execution order.
-2. First Phase 4 item: wire `onSample(cb)` into `vernier-adapter` /
-   `vernierHandler` (currently still polling `sampleReady()` every
-   tick). Required before multi-device because polling N instances
-   scales badly. Push path is already plumbed in GoGoVernier; just
-   needs an adapter consumer.
-3. Then: drop `g_ble_mutex` during the 500 ms async-disconnect wait
-   in `NimBleXport::disconnect`. Pathological for multi-device
-   throughput as-is.
+2. Phase 4 step 1 (notification-driven sample path) is the
+   uncommitted change above; smoke + commit before moving on.
+3. Next Phase 4 item: drop `g_ble_mutex` during the 500 ms
+   async-disconnect wait in `NimBleXport::disconnect`. Pathological
+   for multi-device throughput as-is — three instances each holding
+   the mutex up to 500 ms during teardown serialises all of them.
 4. Then: slot table in `vernier-adapter` + per-frame `dev` byte in
    the host UART protocol. Requires coordinating with the GoGo MCU
    side.
@@ -272,6 +319,127 @@ arduino-esp32 bundled `BLE` library: the bundled BLE auto-MTU bug
 EALREADY tolerance) was the GDX-LC connect-failure root cause, and
 h2zero exposes `exchangeMTU` as an opt-in flag that handles EALREADY
 gracefully.
+
+## UART corruption saga (Phase-3.5, this codebase ↔ host MCU wire)
+
+After Phase-3 push-mode landed, the GoGo host display refused to
+flip to "connected" even though vernier was streaming samples
+correctly. Took several rounds to peel back; recording the layers
+so future debug doesn't repeat the dance.
+
+### Layer 1 — UartAdapter `_doc` race
+
+Vernier's `UartAdapter` had ONE `JsonDocument _doc` member. Three
+FreeRTOS tasks called its public `sendXxx()` methods without
+synchronisation: `uartHandler` (sendAck on host commands), main
+`loop()` task (`connectAndReport`'s 5-frame burst on connect),
+`vernierHandler` task (sendSensorValuesTs on every BLE notify).
+
+Race window: between `measureMsgPack(_doc)` and
+`serializeMsgPack(_doc, _out)` inside `send()`, another task could
+mutate `_doc`. Field-test logs showed:
+```
+TX t=4 seq=6 len=123 (hdr=2 body=149)   ← _doc clobbered
+TX t=5 seq=7 len=149 (hdr=2 body=18)
+```
+Wire bytes had a 2-byte length-prefix saying N, then a payload of
+M ≠ N. Host parser read N bytes, got misaligned, treated next
+frames as garbage.
+
+Fix: per-instance `SemaphoreHandle_t _send_mutex` (created in
+ctor). Every public `sendXxx()` takes it for the entire
+build+measure+serialize critical section. Exposed via a stack-
+allocated `SendLock` RAII guard.
+
+### Layer 2 — ESP-IDF stdio bleed onto UART0
+
+After fixing the race, host STILL got nothing past T_ACK during
+NimBLE init. Captured raw bytes on host RX showed they were
+**Arduino HAL log strings** ("D NimBLEDevice: Starting NimBLE-
+Arduino 2.5.0", "(3624) ARDUINO:", etc.) — vernier's own debug log
+output appearing on the protocol wire.
+
+Cause: `ARDUINO_USB_CDC_ON_BOOT=1` + `Serial.setDebugOutput(true)`
+only redirects `esp_log` (path 1). It does NOT touch stdio. The
+bundled IDF NimBLE host stack (separate from h2zero's Arduino
+wrapper) uses `MODLOG_DFLT` which expands to raw `printf`. `printf`
+writes to `stdout` whose default fd is UART0 = same hardware as
+our `gogoSerial`.
+
+Two log paths confirmed:
+1. arduino-esp32 `log_*()` with `USE_ESP_IDF_LOG` → `esp_log` →
+   `setDebugOutput`-installed vprintf → USB-CDC ✓
+2. raw `printf` / `puts` / `fwrite` from IDF / NimBLE-host →
+   stdio → UART0 ✗
+
+Fix: `fclose(stdout); fclose(stderr);` early in `setup()` to kill
+path 2. `esp_log_set_vprintf(serial_log_vprintf)` installed
+explicitly to guarantee path 1 keeps writing via `Serial.write()`
+directly (bypassing stdio entirely) so closing stdout doesn't
+break visible logs.
+
+### Layer 3 — host-side wire-noise handling
+
+Even with vernier writing only valid frames, the ESP32-C3 ROM
+bootloader writes diagnostic strings to UART0 at the very start
+of every boot, BEFORE our app's `setup()` runs and BEFORE we
+close stdout. Those bytes pre-fill the host's `extSerial` RX
+buffer. `FramedMsgPackReceiver` reads two bytes, gets bogus
+length like `0x4420 = 17440`, enters `SKIP_PAYLOAD` to drain
+17440 bytes that don't actually exist — every legitimate frame
+arriving in the next ~3 minutes (at 100 B/s) gets eaten in the
+skip and lost.
+
+Two host-side fixes:
+1. After `extSerial.begin()`, `delay(50)` then drain RX buffer.
+   Discards the boot noise window. Logs `Vernier: drained N
+   boot-noise bytes` if any.
+2. In `FramedMsgPackReceiver::processStep` READ_LEN1, when
+   `_len > _bufSize`: `reset()` to READ_LEN0 instead of entering
+   `SKIP_PAYLOAD`. Resyncs in 1 byte instead of N. Throttled
+   warning logs every 500 ms with a reset-count.
+
+### Layer 4 — host self-heal against silent peer death
+
+Vernier reset (reflash, brownout, crash) leaves host's
+`_connState` stuck at `CONN_CONNECTED`. The disconnect button
+sends C_DISCONNECT but if the bytes/T_ACK don't make it through
+the wire-state confusion of vernier reboot, host UI stays stuck
+forever waiting for an ACK that never comes. Three host fixes:
+
+1. **Liveness watchdog** in `GoGoVernier::poll()`: if
+   `_connState == CONN_CONNECTED` and `millis() - _lastFrameMs >
+   max(period × 3, 5s, capped at 30s)`, force
+   `_resetConnectionState()`. Display flips to "Disconnected"
+   automatically without user action.
+2. **T_HELLO state reset**: `T_HELLO` handler now calls
+   `_resetConnectionState()` (was: only `_resetSeqStats`). Peer
+   reboot announces itself; host re-enters IDLE. The handshake's
+   immediately-following `T_STATUS=true` re-sets to CONNECTED for
+   normal connect flow. Brief IDLE→CONNECTED flicker is fine.
+3. **T_ACK match relaxed** for C_DISCONNECT: was `_lastAckReq ==
+   _lastCmdSeqSent && _lastCmdCodeSent == C_DISCONNECT && ok`.
+   Now `_lastCmdCodeSent == C_DISCONNECT && ok` only. Late ACKs
+   after multi-press now flip state. Safe because host UI
+   serialises connect/disconnect — only one outstanding command
+   at a time.
+
+### Lessons
+
+- **Stdio is not idle**. Any C library on ESP-IDF can `printf` and
+  hit UART0. If UART0 is not free for the application, close
+  stdio at startup.
+- **Shared mutable state across tasks needs a mutex**. The
+  UartAdapter race had been silent for the entire pre-Phase-3
+  history because polling-mode timing made overlap rare. Push-
+  mode changed the timing and the bug surfaced immediately.
+- **Don't trust a length-prefix on a noisy wire without sync
+  bytes**. Either add a sync preamble (heavy protocol change) or
+  recover fast on implausible lengths (light: reset state, retry
+  next byte).
+- **Build defensive timeouts at every layer that depends on a
+  remote signal**. Anything that can stall the peer can stall
+  the host, and the host should self-heal.
 
 ## Known race windows (intentionally not fixed)
 

@@ -294,25 +294,79 @@ following issues, all now fixed:
   session_mutex no longer the only guard against the
   start-during-handshake race.
 
-### Phase 4 — vernier-firmware integration + multi-device [next]
+### Phase 3.5 — wire-corruption hardening (this session) ✅ DONE
+
+The Phase-3-step-1 push wiring exposed three latent bugs in the
+host↔co-MCU UART path that had been masked by the slower polling
+loop. All three blocked the host display from ever flipping to
+"connected" once we stopped tearing down/reconnecting between
+sample frames. Documented in detail in
+`.claude/knowledges/d2pio-debug-findings.md`.
+
+- ✅ `UartAdapter` shared-`_doc` race fixed with a per-adapter
+  `_send_mutex`. Three concurrent senders (`uartHandler` task,
+  `vernierHandler` task, main `loop()` running `connectAndReport`)
+  were stomping on the JsonDocument between `measureMsgPack()` and
+  `serializeMsgPack()`, producing length/body mismatches on the
+  wire. Host parser then desynced and stopped processing frames.
+- ✅ ESP-IDF stdio bleed onto UART0 silenced. NimBLE-host's
+  underlying C library calls raw `printf` whose default fd is
+  UART0 — same hardware peripheral as `gogoSerial`. Bytes
+  interleaved with our msgpack frames. Fixed by installing a
+  custom `esp_log_set_vprintf` that writes via `Serial.write()`
+  directly (bypassing stdio) and `fclose(stdout/stderr)` to kill
+  the bleed path entirely. Arduino HAL log_*() calls keep working
+  on USB-CDC.
+- ✅ Boot-time wire noise on host side handled. ESP32-C3 ROM
+  bootloader writes diagnostic strings to UART0 at boot before
+  our app silences it; those bytes pre-fill the host's RX buffer
+  and look like a length-prefixed frame to FramedMsgPackReceiver.
+  Host now drains the RX buffer at boot AFTER `extSerial.begin()`
+  to discard pre-app noise. Receiver's `_len > _bufSize` path also
+  changed from "skip N bytes" (which stuck the parser for
+  ~3 minutes on a bogus 17K length) to "reset state and re-sync
+  on next byte".
+- ✅ Host self-heal: liveness watchdog in `GoGoVernier::poll()`
+  forces `_resetConnectionState()` if no frame arrives within
+  `max(period × 3, 5s, 30s cap)`. T_HELLO now always triggers a
+  state reset (peer reboot signal). T_ACK match for C_DISCONNECT
+  relaxed from "exact seq match" to "cmd-code match" so late or
+  multi-press ACKs flip the UI cleanly.
+
+### Phase 4 — vernier-firmware integration + multi-device [in progress]
 - ✅ Replaced `g_active_impl` global pointer in `NimBleXport.cpp`
   with per-instance subscribe lambda capturing `Impl*`. h2zero's
   `NimBLERemoteCharacteristic::subscribe(true, std::function)`
   closes over the pointer via capture; cross-instance routing
   eliminated.
-- ✅ dtor UAF surface reduced: `NimBLEDevice::deleteClient`
-  inside `disconnect()` clears the subscription before
-  `~NimBleXport` deletes `_impl`, so a notify dispatched from the
-  host task after teardown begins runs the lambda but no-ops on
-  the nulled `on_notify`.
+- ✅ dtor UAF surface reduced: `disconnect()` calls `unsubscribe()`
+  as its first teardown step (writes CCCD with response —
+  synchronously stops the peer from sending more notifications and
+  drains h2zero's dispatch queue). After that `deleteClient`
+  destroys the lambda before `~NimBleXport` deletes `_impl`, so
+  the captured pointer can't outlive its target.
+- ✅ `g_ble_mutex` promoted to recursive so `disconnect()` →
+  `unsubscribe()` reentry doesn't deadlock. Standalone
+  `unsubscribe()` now takes the mutex too.
+- ✅ Wired `onSample(cb)` into `vernier-adapter` and `main.cpp`'s
+  `vernierHandler`. Adapter owns a depth-2 FreeRTOS queue
+  (`_sample_queue`); the onSample lambda fed by the NimBLE notify
+  task pushes `Sample` structs (~140 B each) into it.
+  `waitForSample(out, count, timeout_ms)` blocks consumer-side on
+  `xQueueReceive`. `vernierHandler` no longer polls
+  `sampleReady()` on an adaptive tick — it sleeps in
+  `xQueueReceive` until either a sample arrives or the timeout
+  hits (capped at 500 ms for snappy disconnect detection on long
+  periods). Queue-full drops bump a per-adapter `_push_dropped`
+  counter that gets summed into `droppedSamples()`. Submodule
+  decodeMeasurement also flipped to skip `sample_ready=true`
+  when on_sample is bound, so the lib's own drop-detection
+  doesn't false-alarm every frame in push mode.
 - [ ] Drop `g_ble_mutex` during the 500 ms async-disconnect wait so
   multi-device throughput isn't pathological.
-- [ ] Wire `onSample(cb)` into `vernier-adapter` so `vernierHandler`
-  becomes notification-driven instead of polling `sampleReady()`
-  every tick. Required before multi-device because polling N
-  instances scales badly.
 - [ ] Extend `vernier-adapter.cpp` to a slot table
   (`VernierAdapter[CONFIG_NIMBLE_MAX_CONNECTIONS]`), keyed by device id.
+  Per-slot push queue, per-slot onSample lambda capturing slot id.
 - [ ] Extend host wire protocol (`include/uart-adapter.h`) with `dev`
   (u8) on every per-device frame: `T_DEVINFO`, `T_DEVSTATS`,
   `T_FIELDS`, `T_SENS_VALUES`. `T_HELLO` stays device-agnostic. Add
