@@ -107,7 +107,14 @@ HardwareSerial gogoSerial(0);
 // #undef Serial
 // #define Serial gogoSerial
 
-VernierAdapter vernier;
+// Phase 4 step 3.1: introduce per-slot adapters. Keeping `vernier` as
+// a reference to slots[0] preserves the existing single-slot code
+// paths verbatim while we migrate uartHandler / connectAndReport /
+// vernierHandler to be slot-aware in the following sub-commits
+// (3.2 .. 3.5). Slots 1..N exist but stay idle until 3.4 lands the
+// first-free slot allocator.
+VernierAdapter slots[VERNIER_MAX_SLOTS];
+VernierAdapter &vernier = slots[0];
 UartAdapter uart(gogoSerial);
 
 TaskHandle_t uartProcessTask, vernierProcessTask;
