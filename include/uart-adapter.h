@@ -55,6 +55,20 @@ public:
     void sendSensorValues(const float *values, size_t count, uint8_t dev = 0);
     void sendSensorValuesTs(const float *values, size_t count, uint32_t ts_ms, uint8_t dev = 0);
 
+    // T_DEV_LIST entry. One per slot — caller fills VERNIER_MAX_SLOTS
+    // entries (occupied + empty) so host can render the full slot
+    // table without guessing capacity. Empty slot: name="", order="",
+    // connected=false. UartAdapter doesn't depend on VernierAdapter
+    // — caller marshals from slots[] before calling.
+    struct DevListEntry
+    {
+        uint8_t     dev;
+        const char *name;
+        const char *order;
+        bool        connected;
+    };
+    void sendDevList(const DevListEntry *entries, uint8_t count);
+
     // sendAck: `dev` defaults to -1 meaning "no dev field" (legacy
     // global ack). For slot-scoped commands (C_CONNECT, C_DISCONNECT,
     // C_SET_PERIOD post-v2), pass the slot id so the host can route

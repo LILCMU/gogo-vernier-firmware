@@ -138,6 +138,24 @@ void UartAdapter::sendSensorValuesTs(const float *values, size_t count, uint32_t
     send();
 }
 
+void UartAdapter::sendDevList(const DevListEntry *entries, uint8_t count)
+{
+    SendLock _lk(_send_mutex);
+    _doc["t"] = T_DEV_LIST;
+    _doc["seq"] = _seq++;
+
+    JsonArray arr = _doc["slots"].to<JsonArray>();
+    for (uint8_t i = 0; i < count; ++i)
+    {
+        JsonObject s = arr.add<JsonObject>();
+        s["dev"]       = entries[i].dev;
+        s["name"]      = entries[i].name  ? entries[i].name  : "";
+        s["order"]     = entries[i].order ? entries[i].order : "";
+        s["connected"] = entries[i].connected;
+    }
+    send();
+}
+
 void UartAdapter::sendAck(uint32_t req_seq, bool ok, const char *msg, int16_t dev)
 {
     SendLock _lk(_send_mutex);

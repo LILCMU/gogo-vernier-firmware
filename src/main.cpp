@@ -125,6 +125,8 @@ static bool foundSavedDevice = false;
 unsigned long startPressTime = 0;
 ButtonEvent prevButtonEvent = BUTTON_RELEASE;
 
+static void emitDevList();  // forward decl — defined below connectAndReport for grouping with other event helpers
+
 static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST)
 {
     if (slot >= VERNIER_MAX_SLOTS)
@@ -186,7 +188,33 @@ static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST)
     if (req_seq != NO_HOST_REQUEST)
         uart.sendAck(req_seq, ok, ok ? nullptr : "connect failed", static_cast<int16_t>(slot));
 
+    // Per design D4: T_DEV_LIST auto-pushed after every connect attempt
+    // (success OR failure — the failure case still tells the host that
+    // its connect didn't take, so the slot table stays accurate).
+    emitDevList();
+
     return ok;
+}
+
+// Marshal slot table from slots[] into UartAdapter::DevListEntry[]
+// then push T_DEV_LIST. Per design D4 this is auto-emitted on every
+// connect / disconnect event so the host's slot table stays in sync
+// without polling.
+//
+// "connected" reflects isReady() (= D2PIO handshake complete + channel
+// mask populated) — the same gate the rest of the firmware uses for
+// "this slot is producing samples".
+static void emitDevList()
+{
+    UartAdapter::DevListEntry entries[VERNIER_MAX_SLOTS];
+    for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+    {
+        entries[i].dev       = i;
+        entries[i].name      = slots[i].deviceName();
+        entries[i].order     = slots[i].orderCode();
+        entries[i].connected = slots[i].isReady();
+    }
+    uart.sendDevList(entries, VERNIER_MAX_SLOTS);
 }
 
 auto autoConnectDevice = []
@@ -377,7 +405,8 @@ void uartHandler(void *parameter)
     {
         C_CONNECT = 1,
         C_DISCONNECT = 2,
-        C_SET_PERIOD = 3
+        C_SET_PERIOD = 3,
+        C_DEV_LIST = 4,  // v2: host requests T_DEV_LIST snapshot
     };
 
     const TickType_t xWaitTime = pdMS_TO_TICKS(UART_POLL_MS);
@@ -433,6 +462,18 @@ void uartHandler(void *parameter)
             }
             slots[dev].disconnect();
             uart.sendAck(req, true, "disconnected", static_cast<int16_t>(dev));
+            // D4: T_DEV_LIST after disconnect so host's slot table
+            // reflects the slot becoming free.
+            emitDevList();
+            break;
+        }
+        case C_DEV_LIST:
+        {
+            // D4: explicit host-side query for the slot table. Always
+            // ack'd before the T_DEV_LIST push so seq ordering on the
+            // wire matches the host's request → ack → push expectation.
+            uart.sendAck(req, true, "dev list");
+            emitDevList();
             break;
         }
         case C_SET_PERIOD:
