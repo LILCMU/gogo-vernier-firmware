@@ -495,20 +495,42 @@ void uartHandler(void *parameter)
         {
         case C_CONNECT:
         {
-            // First-free slot allocation per design D2: vernier picks
-            // the lowest unoccupied slot. Host treats slot id as
-            // opaque — never specifies dev on connect, learns it from
-            // T_ACK.dev. "Occupied" = ready (handshake done) OR
-            // streaming (in transition). isReady() catches the steady
-            // state; isStreaming() guards the brief mid-handshake
-            // window where ready hasn't flipped yet.
+            // Slot allocation:
+            //   - If host specifies `dev` (kid pressed an empty slot
+            //     card on the multi-device main view), target THAT
+            //     slot so the UI's CONNECTING animation lines up with
+            //     the slot the kid actually pressed.
+            //   - Otherwise (legacy host, auto-detect path) fall back
+            //     to first-free per design D2.
+            // "Occupied" = ready (handshake done) OR streaming (in
+            // transition); isReady() catches the steady state and
+            // isStreaming() guards the brief mid-handshake window.
             int8_t target_slot = -1;
-            for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+            const bool hasDev = root["dev"].is<uint8_t>();
+            if (hasDev)
             {
-                if (!slots[i].isReady() && !slots[i].isStreaming())
+                const uint8_t requested = root["dev"].as<uint8_t>();
+                if (requested >= VERNIER_MAX_SLOTS)
                 {
-                    target_slot = static_cast<int8_t>(i);
+                    uart.sendAck(req, false, "dev out of range");
                     break;
+                }
+                if (slots[requested].isReady() || slots[requested].isStreaming())
+                {
+                    uart.sendAck(req, false, "slot busy");
+                    break;
+                }
+                target_slot = static_cast<int8_t>(requested);
+            }
+            else
+            {
+                for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+                {
+                    if (!slots[i].isReady() && !slots[i].isStreaming())
+                    {
+                        target_slot = static_cast<int8_t>(i);
+                        break;
+                    }
                 }
             }
             if (target_slot < 0)
