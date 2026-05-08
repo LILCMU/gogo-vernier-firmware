@@ -553,6 +553,17 @@ void uartHandler(void *parameter)
                 uart.sendAck(req, false, "dev out of range");
                 break;
             }
+            if (!slotHasSavedDevice[dev]
+                && !slots[dev].isReady()
+                && !slots[dev].isStreaming())
+            {
+                // No persistent state and no live link — Forget is a
+                // no-op. Reply ok so the host can still bounce the kid
+                // back to the main view, but skip the NVS write entirely.
+                uart.sendAck(req, true, "already empty", static_cast<int16_t>(dev));
+                emitDevList();
+                break;
+            }
             // Disconnect first so the device's BLE link drops cleanly.
             // Safe to call when already disconnected (no-op).
             slots[dev].disconnect();
