@@ -238,47 +238,57 @@ auto buttonHandler = []
     }
 };
 
+// Per-slot housekeeping state used by vernierHandler. Lives static so
+// state persists across loop iterations without polluting global
+// scope.
+struct SlotStreamState
+{
+    int      lastPushedBatt    = INITIAL_DEVSTATS_SENTINEL;
+    int      lastPushedCharge  = INITIAL_DEVSTATS_SENTINEL;
+    int      lastPushedRssi    = INITIAL_DEVSTATS_SENTINEL;
+    uint32_t lastPushedDrop    = 0;
+    uint32_t lastRefreshMs     = 0;
+    uint32_t samplesSinceFields = 0;
+};
+
 void vernierHandler(void *parameter)
 {
-    static float sampleBuffer[gogo_vernier::MAX_CHANNELS];
-    size_t sampleCount = 0;
-    uint32_t samplesSinceLastStats = 0;
+    static float          sampleBuffer[gogo_vernier::MAX_CHANNELS];
+    static SlotStreamState slotState[VERNIER_MAX_SLOTS];
 
     for (;;)
     {
-        // Idle guard. waitForSample below blocks on an empty queue,
-        // but we still need to gate on session state: when no device
-        // is open or the stream is paused, sleep and retry rather
-        // than block on a dead queue.
-        if (!vernier.isReady())
-        {
-            vTaskDelay(pdMS_TO_TICKS(IDLE_SLEEP_MS));
-            continue;
-        }
-        if (!vernier.isStreaming())
-        {
-            vernier.startReading();
-            vTaskDelay(pdMS_TO_TICKS(START_RETRY_MS));
-            continue;
-        }
+        bool anyReady   = false;
+        bool anySampled = false;
+        uint32_t minActivePeriod = MAX_PERIOD_MS;
 
-        // Notification-driven sample drain. Block up to
-        // SAMPLE_WAIT_PERIOD_MUL × period so we wake within reasonable
-        // budget if the link stalls; capped at MAX_SAMPLE_WAIT_MS to
-        // keep disconnect detection snappy on long periods (e.g.
-        // 120 s the host might program for slow experiments).
+        for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
         {
-            uint32_t timeout_ms = vernier.samplingPeriod() * SAMPLE_WAIT_PERIOD_MUL;
-            if (timeout_ms > MAX_SAMPLE_WAIT_MS) timeout_ms = MAX_SAMPLE_WAIT_MS;
-            if (vernier.waitForSample(sampleBuffer, sampleCount, timeout_ms))
+            VernierAdapter &dev = slots[i];
+            if (!dev.isReady())
+                continue;
+            anyReady = true;
+
+            if (!dev.isStreaming())
             {
-                uart.sendSensorValuesTs(sampleBuffer, sampleCount, millis());
-                samplesSinceLastStats++;
+                dev.startReading();
+                continue;
             }
-        }
 
-        if (vernier.isReady() && vernier.isStreaming())
-        {
+            if (dev.samplingPeriod() < minActivePeriod)
+                minActivePeriod = dev.samplingPeriod();
+
+            // Non-blocking sample drain. Round-robin across slots so a
+            // single slow slot can't block the others. Per-pass cost is
+            // one xQueueReceive(timeout=0) per ready slot — cheap.
+            size_t sampleCount = 0;
+            if (dev.waitForSample(sampleBuffer, sampleCount, 0))
+            {
+                uart.sendSensorValuesTs(sampleBuffer, sampleCount, millis(), i);
+                slotState[i].samplesSinceFields++;
+                anySampled = true;
+            }
+
             // DEVSTATS push — change-based, decoupled from sample cadence.
             // Battery/charge/RSSI are cached on connect in VernierAdapter and
             // only refresh when getDeviceInfo() is called, so we do that here
@@ -286,33 +296,27 @@ void vernierHandler(void *parameter)
             // something actually changed (RSSI needs a small threshold since
             // it naturally jitters by 1 dBm on a quiet link).
             {
-                static int lastPushedBatt    = INITIAL_DEVSTATS_SENTINEL;
-                static int lastPushedCharge  = INITIAL_DEVSTATS_SENTINEL;
-                static int lastPushedRssi    = INITIAL_DEVSTATS_SENTINEL;
-                static uint32_t lastPushedDrop = 0;
-                static uint32_t lastRefreshMs  = 0;
-
                 uint32_t now = millis();
-                if (now - lastRefreshMs >= DEVSTATS_REFRESH_MS)
+                if (now - slotState[i].lastRefreshMs >= DEVSTATS_REFRESH_MS)
                 {
-                    vernier.getDeviceInfo(true);
-                    lastRefreshMs = now;
+                    dev.getDeviceInfo(true);
+                    slotState[i].lastRefreshMs = now;
 
-                    int batt     = vernier.batteryPercent();
-                    int charge   = vernier.chargeState();
-                    int rssi     = vernier.rssi();
-                    uint32_t drop = vernier.droppedSamples();
-                    bool changed = (batt != lastPushedBatt)
-                                || (charge != lastPushedCharge)
-                                || (abs(rssi - lastPushedRssi) >= RSSI_CHANGE_THRESHOLD)
-                                || (drop != lastPushedDrop);
+                    int batt     = dev.batteryPercent();
+                    int charge   = dev.chargeState();
+                    int rssi     = dev.rssi();
+                    uint32_t drop = dev.droppedSamples();
+                    bool changed = (batt != slotState[i].lastPushedBatt)
+                                || (charge != slotState[i].lastPushedCharge)
+                                || (abs(rssi - slotState[i].lastPushedRssi) >= RSSI_CHANGE_THRESHOLD)
+                                || (drop != slotState[i].lastPushedDrop);
                     if (changed)
                     {
-                        uart.sendDeviceStats(batt, charge, rssi, drop);
-                        lastPushedBatt   = batt;
-                        lastPushedCharge = charge;
-                        lastPushedRssi   = rssi;
-                        lastPushedDrop   = drop;
+                        uart.sendDeviceStats(batt, charge, rssi, drop, i);
+                        slotState[i].lastPushedBatt   = batt;
+                        slotState[i].lastPushedCharge = charge;
+                        slotState[i].lastPushedRssi   = rssi;
+                        slotState[i].lastPushedDrop   = drop;
                     }
                 }
             }
@@ -320,26 +324,48 @@ void vernierHandler(void *parameter)
             // DEVFIELDS re-emit every DEVFIELDS_REPUSH_EVERY samples —
             // helps the host recover its field cache if it rebooted
             // mid-session.
-            if (samplesSinceLastStats >= DEVFIELDS_REPUSH_EVERY)
+            if (slotState[i].samplesSinceFields >= DEVFIELDS_REPUSH_EVERY)
             {
-                uint32_t mask = vernier.enabledChannelMask();
+                uint32_t mask = dev.enabledChannelMask();
                 const char *names[gogo_vernier::MAX_CHANNELS];
                 const char *units[gogo_vernier::MAX_CHANNELS];
                 uint8_t count = 0;
-                for (uint8_t i = 0; i < gogo_vernier::MAX_CHANNELS; ++i)
+                for (uint8_t k = 0; k < gogo_vernier::MAX_CHANNELS; ++k)
                 {
-                    if (mask & (1u << i))
+                    if (mask & (1u << k))
                     {
-                        names[count] = vernier.sensorName(i);
-                        units[count] = vernier.sensorUnit(i);
+                        names[count] = dev.sensorName(k);
+                        units[count] = dev.sensorUnit(k);
                         ++count;
                     }
                 }
                 if (count > 0)
-                    uart.sendDeviceFields(count, names, units);
+                    uart.sendDeviceFields(count, names, units, i);
 
-                samplesSinceLastStats = 0;
+                slotState[i].samplesSinceFields = 0;
             }
+        }
+
+        // Sleep policy: scale wake cadence to traffic.
+        // - No slot ready → long idle sleep (button or host command will wake us).
+        // - At least one ready but no samples this pass → quarter-period
+        //   poll (capped MAX_SAMPLE_WAIT_MS so we still respond to
+        //   disconnects on long-period setups).
+        // - Samples flowed → tight loop, only START_RETRY_MS yield.
+        if (!anyReady)
+        {
+            vTaskDelay(pdMS_TO_TICKS(IDLE_SLEEP_MS));
+        }
+        else if (!anySampled)
+        {
+            uint32_t sleep_ms = minActivePeriod / 4u;
+            if (sleep_ms < START_RETRY_MS) sleep_ms = START_RETRY_MS;
+            if (sleep_ms > MAX_SAMPLE_WAIT_MS) sleep_ms = MAX_SAMPLE_WAIT_MS;
+            vTaskDelay(pdMS_TO_TICKS(sleep_ms));
+        }
+        else
+        {
+            vTaskDelay(pdMS_TO_TICKS(START_RETRY_MS));
         }
     }
 };
