@@ -122,6 +122,11 @@ SemaphoreHandle_t nvsMutex;
 
 static bool startAutoConnect = false;
 static bool foundSavedDevice = false;
+// Per-slot "has a saved device name in NVS, eligible for auto-connect"
+// flag. Populated at boot from NVS keys deviceName0..N. Used by
+// autoConnectDevice to know which slots to attempt on the
+// startAutoConnect trigger from C_SET_PERIOD.
+static bool slotHasSavedDevice[VERNIER_MAX_SLOTS] = {false};
 unsigned long startPressTime = 0;
 ButtonEvent prevButtonEvent = BUTTON_RELEASE;
 
@@ -168,20 +173,25 @@ static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST)
         if (count > 0)
             uart.sendDeviceFields(count, names, units, slot);
 
-        // Persist last connected device name to NVS (writeable). Per-slot
-        // NVS keys land in step 3.7; until then, slot 0's name still
-        // shadows the legacy single-key schema and other slots are
-        // ephemeral (lost on reboot).
-        if (slot == 0)
+        // Persist last connected device name to NVS under the per-slot
+        // key (deviceName0..N). Read back at boot so each slot can
+        // auto-reconnect to its previously paired device.
         {
-            log_d("Saving device name to NVS: %s", dev.deviceName());
+            char key[16];
+            snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)slot);
+            log_d("NVS slot %u: saving %s = %s", (unsigned)slot, key, dev.deviceName());
             xSemaphoreTake(nvsMutex, portMAX_DELAY);
             if (preferences.begin(NVS_NAMESPACE_SETTING, false))
             {
-                preferences.putString(NVS_KEY_DEVICE_NAME, dev.deviceName());
+                preferences.putString(key, dev.deviceName());
                 preferences.end();
             }
             xSemaphoreGive(nvsMutex);
+            // Mark this slot as eligible for future auto-connect on
+            // boot — even though we won't reach autoConnectDevice
+            // again until the next reboot + C_SET_PERIOD trigger.
+            slotHasSavedDevice[slot] = true;
+            foundSavedDevice = true;
         }
     }
 
@@ -219,12 +229,24 @@ static void emitDevList()
 
 auto autoConnectDevice = []
 {
-    if (startAutoConnect)
-    {
-        startAutoConnect = false;
+    if (!startAutoConnect)
+        return;
+    startAutoConnect = false;
 
-        log_i("Auto-connecting to saved device ...");
-        connectAndReport(0); // no request sequence; slot 0 default until step 3.7 adds per-slot NVS
+    // Per design D6: walk slots in order, attempt connect on each one
+    // that has a saved name in NVS. Sequential rather than parallel —
+    // each handshake monopolises the BLE controller's scan + connect
+    // path. With NimBLE max 3 conns this is at most ~3×7s = ~21s
+    // total worst case to settle the slot table on boot. The host
+    // can drive a faster reconnect by sending C_CONNECT explicitly
+    // after boot if it doesn't want to wait.
+    for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+    {
+        if (slotHasSavedDevice[i])
+        {
+            log_i("Auto-connecting slot %u to saved device ...", (unsigned)i);
+            connectAndReport(i); // no request sequence
+        }
     }
 };
 
@@ -567,24 +589,52 @@ void setup()
 
     pinMode(BOOT_BUTTON_PIN, INPUT);
 
-    // INFO: get device local setting/info from nvs
+    // INFO: get device local setting/info from nvs.
+    //
+    // v2 schema: per-slot keys deviceName0..N. v1 schema had a single
+    // deviceName key — migrated to deviceName0 on first v2 boot,
+    // legacy key left in place so a rollback to v1 firmware still
+    // works against the same paired device.
     xSemaphoreTake(nvsMutex, portMAX_DELAY);
-    if (!preferences.begin(NVS_NAMESPACE_SETTING, true)) // NOTE: read-only
+    if (!preferences.begin(NVS_NAMESPACE_SETTING, false)) // RW so we can migrate
     {
-        log_e("failed to open nvs: try to enter writable nvs");
-
-        preferences.begin(NVS_NAMESPACE_SETTING, false);
-        preferences.putString(NVS_KEY_DEVICE_NAME, VERNIER_DEFAULT_DEVICE_NAME); // default to proximity scan
+        log_e("failed to open nvs (rw)");
     }
-    String deviceName = preferences.getString(NVS_KEY_DEVICE_NAME, VERNIER_DEFAULT_DEVICE_NAME);
-    if (deviceName != VERNIER_DEFAULT_DEVICE_NAME)
+    else
     {
-        log_i("Loaded saved device name from NVS: %s", deviceName.c_str());
-        vernier.setOpenDevice(deviceName.c_str());
-        foundSavedDevice = true;
-    }
+        // One-shot migration: if legacy "deviceName" exists but new
+        // "deviceName0" doesn't, copy across. Won't run again on
+        // subsequent boots because deviceName0 will then exist.
+        if (preferences.isKey(NVS_KEY_DEVICE_NAME)
+            && !preferences.isKey("deviceName0"))
+        {
+            String legacy = preferences.getString(NVS_KEY_DEVICE_NAME, "");
+            if (legacy.length() > 0 && legacy != VERNIER_DEFAULT_DEVICE_NAME)
+            {
+                preferences.putString("deviceName0", legacy.c_str());
+                log_i("NVS migration: %s -> deviceName0 (%s)",
+                      NVS_KEY_DEVICE_NAME, legacy.c_str());
+            }
+        }
 
-    preferences.end();
+        // Per-slot load.
+        for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+        {
+            char key[16];
+            snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)i);
+            String name = preferences.getString(key, VERNIER_DEFAULT_DEVICE_NAME);
+            if (name != VERNIER_DEFAULT_DEVICE_NAME)
+            {
+                log_i("Slot %u: loaded saved name from NVS: %s",
+                      (unsigned)i, name.c_str());
+                slots[i].setOpenDevice(name.c_str());
+                slotHasSavedDevice[i] = true;
+                foundSavedDevice = true;
+            }
+        }
+
+        preferences.end();
+    }
     xSemaphoreGive(nvsMutex);
 
     xTaskCreate(

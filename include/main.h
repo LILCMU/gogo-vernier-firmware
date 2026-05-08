@@ -15,5 +15,14 @@ enum ButtonEvent {
 
 // NOTE: preference nvs keys
 const constexpr char *NVS_NAMESPACE_SETTING = "vernierSetting";
+
+// Legacy single-slot key (v1 schema). Migrated into deviceName0 on
+// first v2 boot. Kept defined so the migration code can read it; new
+// writes go through NVS_KEY_DEVICE_NAME_FMT below.
 const constexpr char *NVS_KEY_DEVICE_NAME   = "deviceName";
+
+// v2 per-slot key format. snprintf(buf, sizeof(buf), NVS_KEY_DEVICE_NAME_FMT, slot)
+// produces "deviceName0", "deviceName1", ... — under the 15-char NVS
+// key length cap for slot ids up to 9999.
+const constexpr char *NVS_KEY_DEVICE_NAME_FMT = "deviceName%u";
 
