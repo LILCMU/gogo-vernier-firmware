@@ -316,16 +316,27 @@ Backend ready. UI still single-slot (legacy accessors all read
 _slots[_primary_slot=0], so display behaves identically). Multi-
 slot machinery available for step 4b's UI work.
 
-### Phase 4 step 4b — host UI slot list + drill-down [next]
-Per design D8 (Option C). Touches gogo-display.{h,cpp} and
-gogo-firmware.cpp's VERNIER_* UI cases. Roughly:
-- Slot list view: vertical list of N rows (slot id, device name
-  or "Empty", connection badge, first sensor value).
-- Drill-down view: existing single-slot layout, fed by
-  setPrimarySlot(i). Period setting + Disconnect button per
-  slot. Back button returns to list view.
-- C_DEV_LIST request at host boot to populate slot table early.
-- Cycle button uses cyclePrimarySlot().
+### Phase 4 step 4b — host UI multi-slot
+Split into two batches:
+
+**4b mini-batch ✅ DONE** (3 commits on host
+feature/co-mcu-auto-detect):
+- 4b.1 `f044e46` feat: request slot enumeration at host boot.
+- 4b.2 `eaa582f` feat(vernier-display): VERNIER_CYCLE menu item +
+  Slot N/M indicator.
+- 4b.3 (no code change): per-slot disconnect already works via
+  4a.5's disconnect(dev=primary) + the cycle button picking the
+  primary slot.
+
+This gives multi-slot UX (see which slots occupied via cycle,
+disconnect a specific slot by cycling first) without redesigning
+the display state machine.
+
+**4b.4 deferred** — full slot list view + drill-down per design
+D8 (Option C). Detailed plan in
+`.claude/plans/multi-device-ui-step-4b4.md`. Sequenced after
+step 5 hardware smoke so display work doesn't pile on top of
+backend bugs.
 
 ### Phase 4 step 5 — multi-device smoke
 - Hardware test: 1× GDX-LC + 1× GDX-TMP + 1× GDX-ACC simultaneously.
