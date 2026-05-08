@@ -506,10 +506,20 @@ void uartHandler(void *parameter)
             // transition); isReady() catches the steady state and
             // isStreaming() guards the brief mid-handshake window.
             int8_t target_slot = -1;
-            const bool hasDev = root["dev"].is<uint8_t>();
+            // MsgPack codec can pick any integer width for "dev"
+            // depending on the value (0..127 → int8, 128..255 → uint8,
+            // etc.). Check presence via !isNull() instead of a typed
+            // is<uint8_t>() which would miss alternative widths.
+            const bool hasDev = !root["dev"].isNull();
             if (hasDev)
             {
-                const uint8_t requested = root["dev"].as<uint8_t>();
+                const int requestedRaw = root["dev"].as<int>();
+                if (requestedRaw < 0)
+                {
+                    uart.sendAck(req, false, "dev out of range");
+                    break;
+                }
+                const uint8_t requested = (uint8_t)requestedRaw;
                 if (requested >= VERNIER_MAX_SLOTS)
                 {
                     uart.sendAck(req, false, "dev out of range");
@@ -544,6 +554,9 @@ void uartHandler(void *parameter)
             // re-attempting the slot's saved name. Host C_CONNECT
             // semantics = "connect to whatever's around", matching
             // pre-Phase-4 behaviour.
+            log_i("C_CONNECT: target slot=%u (%s)",
+                  (unsigned)target_slot,
+                  hasDev ? "host-specified" : "first-free");
             connectAndReport(static_cast<uint8_t>(target_slot), req, /*force=*/true);
             break;
         }
