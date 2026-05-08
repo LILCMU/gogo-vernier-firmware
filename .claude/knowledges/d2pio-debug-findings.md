@@ -6,10 +6,35 @@ should read this before tweaking BLE / log / Serial config.
 
 ## Session-end snapshot — pick up here
 
-Phase 3 + Phase 3.5 (wire-corruption hardening) + Phase 4 step 1
-all working end-to-end. GoGo display flips to live values on
-connect, disconnect button works, vernier reset auto-recovered
-within ~5 sec by host liveness watchdog.
+Phase 4 multi-device backend complete on both sides. Wire is v2,
+vernier owns a 3-slot pool with first-free allocation + per-slot
+NVS persistence + slot-aware command routing, host has the slot
+table backend (per-slot dispatch, liveness, enumeration accessors).
+
+What's left for full multi-device: **step 4b** (host UI slot
+list + drill-down per design D8 Option C — touches gogo-display
++ gogo-firmware UI cases) and **step 5** (multi-device hardware
+smoke with 2-3 GDX devices simultaneously).
+
+Single-device behaviour preserved end-to-end at every step:
+legacy callers and v1 peers all transparently land on slot 0
+with identical wire bytes (modulo the optional `dev` field that
+v1 ignores).
+
+Key recent work (this session):
+- Step 2: protocol v2 bump — non-breaking in either direction.
+  Both firmwares now declare VERNIER_PROTOCOL_VERSION=2 and
+  VERNIER_MAX_SLOTS=3.
+- Step 3: vernier slot pool — 8 sub-commits, see plan doc for
+  the SHA list and per-commit scope.
+- Step 4a: host backend slot table — 5 sub-commits. UI still
+  renders slot 0 only via the legacy accessors that route
+  through `_slots[_primary_slot=0]`. cyclePrimarySlot() and
+  slot-indexed accessors ready for step 4b's UI to consume.
+
+Working-tree state: clean on both sides (all step-3 + step-4a
+commits committed; vernier pushed to develop; host on
+feature/co-mcu-auto-detect branch, not yet pushed).
 
 Key wins from the corruption-debug saga (full detail below in
 "UART corruption saga"):

@@ -334,6 +334,29 @@ sample frames. Documented in detail in
   multi-press ACKs flip the UI cleanly.
 
 ### Phase 4 — vernier-firmware integration + multi-device [in progress]
+
+Sub-phase tracker (full design rationale in
+`.claude/plans/multi-device-design.md`):
+
+- ✅ Step 1 — notification-driven sample path (Phase 4 step 1).
+- ✅ Step 2 — wire protocol v2 (`dev` field on per-device frames,
+  `max_slots` in T_HELLO, `T_DEV_LIST=9` reserved).
+- ✅ Step 3 — vernier slot pool (VernierAdapter[3], slot-aware
+  uart dispatch, first-free C_CONNECT allocator, per-slot
+  vernierHandler iteration, T_DEV_LIST emit, per-slot NVS
+  persistence with v1 migration, slot-aware buttonHandler).
+- ✅ Step 4a — host backend slot table (VernierSlot[3],
+  per-slot dispatch in _handleFrame, per-slot liveness watchdog,
+  T_DEV_LIST handler, slot enumeration accessors, outbound
+  commands carry dev field).
+- [ ] Step 4b — host UI slot list + drill-down per design D8
+  (Option C). Display layer + UI case work.
+- [ ] Step 5 — multi-device hardware smoke (1× LC + 1× TMP
+  + 1× ACC simultaneously).
+- [ ] Verify mut-ex enforce branch on real GDX-3MG / GDX-ACC.
+
+Original sub-tasks below kept for archaeology:
+
 - ✅ Replaced `g_active_impl` global pointer in `NimBleXport.cpp`
   with per-instance subscribe lambda capturing `Impl*`. h2zero's
   `NimBLERemoteCharacteristic::subscribe(true, std::function)`

@@ -289,22 +289,43 @@ read from `_slots[_primary_slot]`.
   (defaulting 0). Slot 0 still single-device. Compatible with
   v1 firmware on either end.
 
-### Phase 4 step 3 — vernier slot pool
-- `VernierAdapter slots[VERNIER_MAX_SLOTS]` in main.cpp.
-- uartHandler routes commands by `dev` field; auto-assigns slot
-  on `C_CONNECT`.
-- vernierHandler iterates slots with short timeout.
-- NVS schema bump: `deviceName0..N`, migration from `deviceName`.
-- T_DEV_LIST emit on connect/disconnect events.
-- buttonHandler updated for slot-aware semantics.
-- Smoke test single-device: must behave identically to current.
+### Phase 4 step 3 — vernier slot pool ✅ DONE
+8 sub-commits (3.1–3.8) on vernier-firmware develop:
+- 3.1 `8abc856` refactor: wrap singleton in slots[VERNIER_MAX_SLOTS]
+- 3.2 `e4675c5` feat(uart): route C_DISCONNECT/C_SET_PERIOD by dev
+- 3.3 `d03b7a9` feat(main): connectAndReport(slot, …); per-slot frames
+- 3.4 `37d124d` feat(main): C_CONNECT first-free allocator; T_ACK echoes dev
+- 3.5 `52269ee` feat(main): vernierHandler iterates slots, per-slot DEVSTATS
+- 3.6 `be2006e` feat(uart): T_DEV_LIST emit + C_DEV_LIST handler
+- 3.7 `add2926` feat(nvs): per-slot deviceName0..N + legacy migration
+- 3.8 `2ef0364` feat(main): buttonHandler multi-slot + force flag
 
-### Phase 4 step 4 — host slot rendering
-- `VernierSlot _slots[N]` in host.
-- `_handleFrame` dispatches by `dev`.
-- UI option A (primary slot + cycle) implemented unless D8 overridden.
-- C_DEV_LIST request on host boot to bootstrap slot table.
-- Smoke test single-device: identical UX to today.
+Single-device behaviour preserved end-to-end on the wire (smoke
+trace from boot 3.7 shows: scan saved name → handshake → save
+deviceName0 → re-load on next boot → auto-connect identically).
+
+### Phase 4 step 4a — host backend slot table ✅ DONE
+5 sub-commits on gogo-firmware feature/co-mcu-auto-detect:
+- 4a.1 `bed45a5` refactor: VernierSlot[] + primary slot routing
+- 4a.2 `6969b32` feat: _handleFrame dispatches by dev field
+- 4a.3 `d90c9b2` feat: per-slot liveness watchdog
+- 4a.4 `5266358` feat: T_DEV_LIST handler + slot enumeration accessors
+- 4a.5 `9cd04b8` feat: outbound commands carry dev; add requestDevList
+
+Backend ready. UI still single-slot (legacy accessors all read
+_slots[_primary_slot=0], so display behaves identically). Multi-
+slot machinery available for step 4b's UI work.
+
+### Phase 4 step 4b — host UI slot list + drill-down [next]
+Per design D8 (Option C). Touches gogo-display.{h,cpp} and
+gogo-firmware.cpp's VERNIER_* UI cases. Roughly:
+- Slot list view: vertical list of N rows (slot id, device name
+  or "Empty", connection badge, first sensor value).
+- Drill-down view: existing single-slot layout, fed by
+  setPrimarySlot(i). Period setting + Disconnect button per
+  slot. Back button returns to list view.
+- C_DEV_LIST request at host boot to populate slot table early.
+- Cycle button uses cyclePrimarySlot().
 
 ### Phase 4 step 5 — multi-device smoke
 - Hardware test: 1× GDX-LC + 1× GDX-TMP + 1× GDX-ACC simultaneously.
