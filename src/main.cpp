@@ -361,16 +361,33 @@ void uartHandler(void *parameter)
         }
         case C_DISCONNECT:
         {
-            vernier.disconnect();
+            // v2 wire: `dev` selects which slot to disconnect. Absent
+            // (v1 host) → default 0, identical to legacy behaviour.
+            uint8_t dev = root["dev"] | (uint8_t)0;
+            if (dev >= VERNIER_MAX_SLOTS)
+            {
+                uart.sendAck(req, false, "dev out of range");
+                break;
+            }
+            slots[dev].disconnect();
             uart.sendAck(req, true, "disconnected");
             break;
         }
         case C_SET_PERIOD:
         {
+            // v2 wire (per D5 A): `dev` selects which slot's period
+            // to set — each slot keeps its own rate. Absent (v1 host)
+            // → default 0.
+            uint8_t dev = root["dev"] | (uint8_t)0;
+            if (dev >= VERNIER_MAX_SLOTS)
+            {
+                uart.sendAck(req, false, "dev out of range");
+                break;
+            }
             // Accept the host's value in u32 first so a 90s/120s setting
             // (mentioned as a use case in CLAUDE.md's adaptive-tick comment)
             // doesn't get silently mod-2^16-truncated at the JSON cast.
-            uint32_t period32 = root["period_ms"] | (uint32_t)vernier.samplingPeriod();
+            uint32_t period32 = root["period_ms"] | (uint32_t)slots[dev].samplingPeriod();
             if (period32 == 0)
                 period32 = VERNIER_DEFAULT_PERIOD_MS;
             if (period32 > MAX_PERIOD_MS)
@@ -379,7 +396,7 @@ void uartHandler(void *parameter)
                 break;
             }
             uint16_t period = static_cast<uint16_t>(period32);
-            vernier.setSamplingRate(period);
+            slots[dev].setSamplingRate(period);
             uart.sendAck(req, true, "rate set");
 
             // INFO: start auto-connect after gogo set sampling rate at boot
