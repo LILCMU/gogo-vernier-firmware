@@ -132,7 +132,17 @@ ButtonEvent prevButtonEvent = BUTTON_RELEASE;
 
 static void emitDevList();  // forward decl — defined below connectAndReport for grouping with other event helpers
 
-static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST)
+// connectAndReport(slot, req_seq, force):
+//   slot     — target slot in slots[].
+//   req_seq  — host's C_CONNECT seq for the terminal T_ACK; pass
+//              NO_HOST_REQUEST when not driven by a host command
+//              (autoConnect, button) so we skip the ack send.
+//   force    — when true, scan for the highest-RSSI nearby GDX device
+//              regardless of the slot's saved _open_device. Used by
+//              host C_CONNECT (probe for new pairing) and the BOOT
+//              button. Auto-connect path passes false so it scans for
+//              the slot's NVS-saved name.
+static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST, bool force = false)
 {
     if (slot >= VERNIER_MAX_SLOTS)
     {
@@ -141,7 +151,7 @@ static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST)
         return false;
     }
     VernierAdapter &dev = slots[slot];
-    bool ok = dev.connect((req_seq != NO_HOST_REQUEST) ? true : false);
+    bool ok = dev.connect(force);
     if (ok)
     {
         dev.getDeviceInfo();
@@ -260,9 +270,22 @@ auto buttonHandler = []
             {
                 prevButtonEvent = BUTTON_LONG_PRESS;
 
-                // INFO: long press event
-                log_i("disconnect the device");
-                vernier.disconnect();
+                // Long-press: disconnect ALL active slots. Host UI
+                // disconnect-by-slot routes through C_DISCONNECT
+                // instead; the BOOT button is a coarse "tear
+                // everything down" escape hatch (e.g. when the
+                // host MCU is unavailable or stuck).
+                log_i("button long-press: disconnect all slots");
+                bool any = false;
+                for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+                {
+                    if (slots[i].isReady() || slots[i].isStreaming())
+                    {
+                        slots[i].disconnect();
+                        any = true;
+                    }
+                }
+                if (any) emitDevList();
             }
         }
         else if (prevButtonEvent == BUTTON_RELEASE)
@@ -270,12 +293,37 @@ auto buttonHandler = []
             prevButtonEvent = BUTTON_PRESS;
             startPressTime = millis();
 
-            // INFO: press event
-            log_i("start connecting nearby device ...");
-
-            if (!vernier.connect(true))
+            // Short-press: connect the lowest free slot via proximity
+            // scan. Same first-free allocation as C_CONNECT, plus
+            // force=true so we probe nearby instead of re-using the
+            // slot's saved name.
+            int8_t target_slot = -1;
+            for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
             {
-                log_i("GDX.open() failed. Disconnect/Reconnect USB");
+                if (!slots[i].isReady() && !slots[i].isStreaming())
+                {
+                    target_slot = static_cast<int8_t>(i);
+                    break;
+                }
+            }
+            if (target_slot < 0)
+            {
+                log_w("button: all slots full, ignoring connect press");
+            }
+            else
+            {
+                log_i("button: connecting nearby device → slot %u",
+                      (unsigned)target_slot);
+                // No req_seq — button is a local trigger, no host ack.
+                // connectAndReport still emits T_DEVINFO/T_FIELDS/etc.
+                // and T_DEV_LIST so the host UI catches the new
+                // session.
+                if (!connectAndReport(static_cast<uint8_t>(target_slot),
+                                      NO_HOST_REQUEST, /*force=*/true))
+                {
+                    log_i("button: connect failed (slot %u)",
+                          (unsigned)target_slot);
+                }
             }
         }
     }
@@ -469,7 +517,11 @@ void uartHandler(void *parameter)
                 uart.sendAck(req, false, "all slots full");
                 break;
             }
-            connectAndReport(static_cast<uint8_t>(target_slot), req);
+            // force=true: probe nearby for a NEW pairing rather than
+            // re-attempting the slot's saved name. Host C_CONNECT
+            // semantics = "connect to whatever's around", matching
+            // pre-Phase-4 behaviour.
+            connectAndReport(static_cast<uint8_t>(target_slot), req, /*force=*/true);
             break;
         }
         case C_DISCONNECT:
