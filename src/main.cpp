@@ -184,7 +184,7 @@ static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST)
     }
 
     if (req_seq != NO_HOST_REQUEST)
-        uart.sendAck(req_seq, ok, ok ? nullptr : "connect failed");
+        uart.sendAck(req_seq, ok, ok ? nullptr : "connect failed", static_cast<int16_t>(slot));
 
     return ok;
 }
@@ -369,10 +369,30 @@ void uartHandler(void *parameter)
         {
         case C_CONNECT:
         {
-            // Step 3.4 will swap this for first-free slot allocation.
-            // Until then C_CONNECT always lands on slot 0 — single-
-            // device behaviour preserved.
-            connectAndReport(0, req);
+            // First-free slot allocation per design D2: vernier picks
+            // the lowest unoccupied slot. Host treats slot id as
+            // opaque — never specifies dev on connect, learns it from
+            // T_ACK.dev. "Occupied" = ready (handshake done) OR
+            // streaming (in transition). isReady() catches the steady
+            // state; isStreaming() guards the brief mid-handshake
+            // window where ready hasn't flipped yet.
+            int8_t target_slot = -1;
+            for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+            {
+                if (!slots[i].isReady() && !slots[i].isStreaming())
+                {
+                    target_slot = static_cast<int8_t>(i);
+                    break;
+                }
+            }
+            if (target_slot < 0)
+            {
+                // Per design D9: respond with ok=false + diagnostic
+                // msg. Host UI surfaces this to the user.
+                uart.sendAck(req, false, "all slots full");
+                break;
+            }
+            connectAndReport(static_cast<uint8_t>(target_slot), req);
             break;
         }
         case C_DISCONNECT:
@@ -386,7 +406,7 @@ void uartHandler(void *parameter)
                 break;
             }
             slots[dev].disconnect();
-            uart.sendAck(req, true, "disconnected");
+            uart.sendAck(req, true, "disconnected", static_cast<int16_t>(dev));
             break;
         }
         case C_SET_PERIOD:
@@ -413,7 +433,7 @@ void uartHandler(void *parameter)
             }
             uint16_t period = static_cast<uint16_t>(period32);
             slots[dev].setSamplingRate(period);
-            uart.sendAck(req, true, "rate set");
+            uart.sendAck(req, true, "rate set", static_cast<int16_t>(dev));
 
             // INFO: start auto-connect after gogo set sampling rate at boot
             if (foundSavedDevice)

@@ -138,7 +138,7 @@ void UartAdapter::sendSensorValuesTs(const float *values, size_t count, uint32_t
     send();
 }
 
-void UartAdapter::sendAck(uint32_t req_seq, bool ok, const char *msg)
+void UartAdapter::sendAck(uint32_t req_seq, bool ok, const char *msg, int16_t dev)
 {
     SendLock _lk(_send_mutex);
     _doc["t"] = T_ACK;
@@ -147,5 +147,7 @@ void UartAdapter::sendAck(uint32_t req_seq, bool ok, const char *msg)
     _doc["ok"] = ok;
     if (msg && *msg)
         _doc["msg"] = msg;
+    if (dev >= 0)
+        _doc["dev"] = static_cast<uint8_t>(dev);
     send();
 }

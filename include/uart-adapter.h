@@ -55,7 +55,11 @@ public:
     void sendSensorValues(const float *values, size_t count, uint8_t dev = 0);
     void sendSensorValuesTs(const float *values, size_t count, uint32_t ts_ms, uint8_t dev = 0);
 
-    void sendAck(uint32_t req_seq, bool ok, const char *msg = nullptr);
+    // sendAck: `dev` defaults to -1 meaning "no dev field" (legacy
+    // global ack). For slot-scoped commands (C_CONNECT, C_DISCONNECT,
+    // C_SET_PERIOD post-v2), pass the slot id so the host can route
+    // the ack back to its per-slot pending-cmd tracker.
+    void sendAck(uint32_t req_seq, bool ok, const char *msg = nullptr, int16_t dev = -1);
 
 private:
     // Value 6 retired (was T_DEF_VALUE — single-value sample variant superseded
