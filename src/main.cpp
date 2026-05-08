@@ -477,6 +477,7 @@ void uartHandler(void *parameter)
         C_DISCONNECT = 2,
         C_SET_PERIOD = 3,
         C_DEV_LIST = 4,  // v2: host requests T_DEV_LIST snapshot
+        C_FORGET = 5,    // v2: disconnect + clear NVS deviceName{slot}
     };
 
     const TickType_t xWaitTime = pdMS_TO_TICKS(UART_POLL_MS);
@@ -538,6 +539,38 @@ void uartHandler(void *parameter)
             uart.sendAck(req, true, "disconnected", static_cast<int16_t>(dev));
             // D4: T_DEV_LIST after disconnect so host's slot table
             // reflects the slot becoming free.
+            emitDevList();
+            break;
+        }
+        case C_FORGET:
+        {
+            // Phase 4 step 4b.4.7 — drop the BLE link AND clear the
+            // slot's NVS deviceName key so it won't auto-reconnect on
+            // next boot. Host's "Forget" action in Vernier > Settings.
+            uint8_t dev = root["dev"] | (uint8_t)0;
+            if (dev >= VERNIER_MAX_SLOTS)
+            {
+                uart.sendAck(req, false, "dev out of range");
+                break;
+            }
+            // Disconnect first so the device's BLE link drops cleanly.
+            // Safe to call when already disconnected (no-op).
+            slots[dev].disconnect();
+            // Clear NVS deviceName{dev} so autoConnectDevice on next
+            // boot skips this slot.
+            {
+                char key[16];
+                snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)dev);
+                xSemaphoreTake(nvsMutex, portMAX_DELAY);
+                if (preferences.begin(NVS_NAMESPACE_SETTING, false))
+                {
+                    preferences.remove(key);
+                    preferences.end();
+                }
+                xSemaphoreGive(nvsMutex);
+            }
+            slotHasSavedDevice[dev] = false;
+            uart.sendAck(req, true, "forgotten", static_cast<int16_t>(dev));
             emitDevList();
             break;
         }
