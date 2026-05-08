@@ -288,21 +288,62 @@ Touched files (expected):
 - Cursor change calls `gogoVernier.setPrimarySlot(_currentSlotListCursor)`
   — primary-slot follows cursor.
 
-### 4b.4.4 — action bar (CONNECT / SETTINGS)
+### 4b.4.4 — zone model + context-sensitive press + footer hint
 
-- Bottom action band shows two buttons:
-  - Left button: context-sensitive label
-    - cursor on connected slot → `[ Disconnect ]` calls
-      `disconnect(cursor_slot)`.
-    - cursor on empty slot → `[ + Add sensor ]` calls `connect()`
-      (vernier picks first-free slot).
-    - cursor on connecting slot → `[ Cancel ]` calls
-      `disconnect(cursor_slot)` to abort.
-  - Right button: `[ Settings ]` always available; opens settings
-    sub-page scoped to cursor slot.
+Reshapes the vernier page to use the existing **zoned-page input
+model** (motor/servo/relay convention) so the kid gets full coverage
+with one short-press button:
 
-- New `display_id_t` value `DISPLAY_VERNIER_SETTINGS` for the
-  sub-page.
+- Each slot row is one **zone**. UP/DOWN walks zones; rotary
+  LEFT/RIGHT is unused on this page (no within-zone items).
+- Edge-overflow: UP at first slot / DOWN at last slot cycles to
+  the next page (matches `canCyclePage` pattern).
+- Long-press stays globally reserved for "go HOME" — not overridden.
+
+**Press dispatch on the cursor's slot:**
+- Empty slot → `gogoVernier.connect()` (vernier picks first-free).
+- Connected slot → `setCurrentDisplayPage(DISPLAY_VERNIER_SETTINGS)`
+  scoped to that slot's index. Disconnect path lives inside the
+  Settings sub-page as the Forget action (4b.4.7).
+
+**Footer hint** replaces the previously-planned bottom action bar:
+- `↑ ↓ slots  ·  press to connect` when cursor on empty slot.
+- `↑ ↓ slots  ·  press for settings` when cursor on connected slot.
+
+Touched code:
+- `gogo-display.h`:
+  - Add `enum vernier_zone_t { VERNIER_ZONE_SLOT_0, _SLOT_1, _SLOT_2,
+    VERNIER_ZONE_COUNT }` mirroring `VERNIER_MAX_SLOTS`.
+  - Add `DISPLAY_VERNIER_SETTINGS` page id (sub-page placeholder;
+    skeleton lands in 4b.4.5).
+  - Resize slot rows to ~30 px now that the action bar's gone;
+    drop `VERNIER_ACTION_*` constants.
+- `gogo-display.cpp`:
+  - `vernierSlotListView` reads `_currentZone` for the cursor row
+    (was `_currentDisplayMenu`); appends `drawFooterHint` based on
+    the cursor's slot connected-state.
+  - Drop the DISPLAY_VERNIER_SENSOR case in `advanceDisplayMenu`
+    (cursor moves via UP/DOWN now).
+- `gogo-firmware.cpp`:
+  - `canCyclePage` adds DISPLAY_VERNIER_SENSOR (true at zone 0
+    going up / zone VERNIER_ZONE_COUNT-1 going down).
+  - `advanceWithinPage` adds DISPLAY_VERNIER_SENSOR →
+    `advanceZone(forward, VERNIER_ZONE_COUNT)` followed by
+    `gogoVernier.setPrimarySlot(getCurrentZone())`.
+  - `pageControlPress` DISPLAY_VERNIER_SENSOR case rewritten to
+    dispatch on `getCurrentZone()` (slot index): empty → connect;
+    connected → goToPage(DISPLAY_VERNIER_SETTINGS).
+  - `pageControlAdjust` DISPLAY_VERNIER_SENSOR case becomes no-op
+    (rotary unused on this page).
+  - Page-init: `setCurrentZone(gogoVernier.primarySlot())` (was
+    `setCurrentDisplayMenu`).
+- DISPLAY_VERNIER_SETTINGS render path: minimal "Settings (WIP)"
+  placeholder + back hint. Long-press still goes HOME.
+
+> **STOP HERE for user smoke** after build verifies. New behaviour:
+> kid uses UP/DOWN to walk slots; pressing on a connected slot
+> opens an intentionally blank "Vernier > Settings (WIP)" page.
+> 4b.4.5 fills the sub-page in next.
 
 ### 4b.4.5 — Vernier > Settings sub-page skeleton (read-only)
 
