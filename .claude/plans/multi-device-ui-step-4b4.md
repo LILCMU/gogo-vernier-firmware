@@ -547,3 +547,109 @@ disconnect of highlighted slot.
 Why dropped: modal navigation, hidden gestures, and duplicate
 affordances were all kid-hostile. Single-screen redesign covers the
 same use cases without the cognitive load.
+
+---
+
+## Implementation status
+
+All sub-steps of step 4b.4 shipped, plus a code-review pass and
+an iterative smoke-feedback loop. Two repos affected:
+- `gogo-firmware` on branch `feature/co-mcu-auto-detect`
+- `vernier-firmware` on branch `develop` + submodule
+  `lib/GoGoVernier` on branch `main`
+
+### Sub-steps
+
+| Step | Done | Commit | Note |
+|------|------|--------|------|
+| 4b.4.1 — palette + chip widget | ✅ | `6083a317` | TFT_GOGO_RED/BLUE/GREEN per slot |
+| 4b.4.2 — slot list view + 4b.2 cleanup | ✅ | `db2617c7` | atomic swap; deletes vernierMonitor + vernierControlMenu |
+| 4b.4.3 — vertical bar cursor + slot nav | ✅ | `0722351c` | superseded by 4b.4.4 zone model |
+| 4b.4.4 — zone model + Settings sub-page entry | ✅ | `1a2b9d5d` | UP/DOWN walks zones; press → Settings; LEFT exits |
+| 4b.4.5 — Settings sub-page skeleton | ✅ | `a4a35cfa` | Period row + Forget greyed |
+| 4b.4.5b — field list + primary field picker | ✅ | `3ad584fd` | scrollable, NVS-persisted primary |
+| 4b.4.6 — per-slot Period editor + NVS bump | ✅ | `a3757148` | yellow pill, LEFT/RIGHT cycle, press commit |
+| 4b.4.7 — Forget action | ✅ | `8db6ebae`, `d8ce589` (vernier MCU) | C_FORGET wire command |
+| 4b.4.8 — empty-slot affordance polish | ✅ | `eb0eaf6c` | "+" symbol on empty chip |
+
+### Smoke feedback fixes
+
+| Fix | Commit | Issue |
+|-----|--------|-------|
+| Banner overlap, footer flicker, SPI assertion | `b57a32b0` | 3 issues: title/subtitle overlap, padding fillRect every tick, smooth-font drawGlyph endWrite race |
+| Per-row diff cache + nav-dot clearance | `1aed32a4` | Cursor move re-rendered whole page; right padding clipped nav dots |
+| Right padding + name truncation policy | `d36b80c2` | Long names like "Temperature" got value-padding clipped |
+| Unit text wrapping off-screen | `0767ad9c` | Sub-page unit overflowed past 160 px |
+| Unit padding rect erasing nav dots | `7e898f5f` | Unit's 3-W padding reached nav dot column |
+| Sub-page field flicker, full-page redraw on cursor, LEFT/RIGHT period | `4b6fb802` | Removed forceDraw on cursor change paths |
+| Period + Forget row diff cache | `0a556a37` | Period kept blinking on idle ticks |
+| Lock UP/DOWN during Period edit | `5279e6df` | Cursor escape mid-edit left flag set |
+| Right-align indicator on slot row | `963a8955` | First inline placement; later swapped for `*` |
+| Indicator → "*N/M" without brackets | `f1886630` | "[N/M]" felt heavy |
+| Indicator collapsed to single purple "*" | `76e63709` | Even compact "*N/M" forced name truncation |
+| Inline indicator + bold headers | `5cd923f6` | "*" moved to right-of-name; sub-page header BOLD |
+| snapshot pf-drift refill | `c6a8348` | New primary took 5 sec to render |
+| device_name always-copy | `6220d95` | First slot showed blank name post-boot |
+| connecting... hint | `68ffd26` | Connected-but-no-fields blank gap |
+| Status row visual glyphs (battery + signal bars) | `6f6c74d7` | "Battery N% · -N dBm" hard to read |
+| GoGo palette slot colors | `9d241b37` | TFT_GOGO_RED/BLUE/GREEN |
+
+### Code-review fixes
+
+Triggered by an `oh-my-claudecode:code-reviewer` pass after the
+feature-complete state. 14 findings (0 critical, 3 high, 6 medium, 5
+low). Actioned the highs + selected mediums; the rest are deferred.
+
+| Severity | Finding | Commit |
+|----------|---------|--------|
+| HIGH | Forget/Period press fires on empty slot | `22e2073` |
+| HIGH | gblVernierSetting overload (flag + index) | `d7d85d8` |
+| HIGH | setPeriodPreset broadcast path unused | `4773c75` |
+| MED | Cursor-bar fillRect duplication | `2b4da9c` |
+| MED | Footer hint pointer-equality + perf cache | `b2749aa` |
+| LOW | C_FORGET unpaired-slot shortcut | `a91264a` |
+
+### Wire protocol additions
+
+| ID | Direction | Purpose |
+|----|-----------|---------|
+| `C_FORGET = 5` | host → vernier | disconnect + clear NVS deviceName{slot} |
+
+### NVS schema additions (host side)
+
+| Key | Type | Default | Purpose |
+|-----|------|---------|---------|
+| `vernierPrFld%u` (per slot) | uint8 | 0 | kid's chosen primary field index |
+| `vernierPrd%u` (per slot) | uint8 | legacy `vernierPeriod` value | per-slot period preset (one-shot migration from legacy) |
+
+### NVS schema additions (vernier side)
+
+`deviceName%u` per slot was already in place since step 3.7.
+`C_FORGET` now removes the per-slot key on demand.
+
+### Submodule bump
+
+`lib/GoGoVernier` `main` advanced by `aee108c`:
+- `D2PIOProtocol.h` adds `CMD_GET_STATUS = 0x10` (godirect-py hardcoded opcode).
+- `GoGoVernier::refreshStatus()` now sends CMD_GET_STATUS, parses
+  battery_percent + charger_state from response (offsets 16/17 of
+  the response frame). Resolves the always-0% battery readout.
+
+### Deferred / known issues
+
+- **Multi-slot connect serialization on vernier MCU.** During boot
+  auto-connect, `vernierHandler` is single-task; while slot N is
+  BLE-handshaking, slot N-1 can't pump samples. Slot 0's first
+  sample is delayed ~7 sec on a 3-sensor setup. UI shows
+  "connecting..." in the gap. Architectural fix would parallelize
+  the connect off the poll task.
+- **Lambdas in gogo-firmware.cpp** (`pageControlPress`,
+  `pageControlAdjust`, `advanceWithinPage`) carry per-page logic
+  for both vernier views; large-ish but not painful. Code review
+  proposed extracting `VernierPageController` — useful but outside
+  the kid-UX scope.
+- **Wire-protocol enum drift.** `C_*` opcodes defined separately on
+  host and vernier MCU (one source of truth in either repo, with a
+  comment cross-reference). Single shared header / submodule for
+  the protocol would prevent silent drift but touches build
+  topology.
