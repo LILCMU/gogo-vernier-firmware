@@ -125,25 +125,32 @@ static bool foundSavedDevice = false;
 unsigned long startPressTime = 0;
 ButtonEvent prevButtonEvent = BUTTON_RELEASE;
 
-static bool connectAndReport(uint32_t req_seq = NO_HOST_REQUEST)
+static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST)
 {
-    bool ok = vernier.connect((req_seq != NO_HOST_REQUEST) ? true : false);
+    if (slot >= VERNIER_MAX_SLOTS)
+    {
+        if (req_seq != NO_HOST_REQUEST)
+            uart.sendAck(req_seq, false, "slot out of range");
+        return false;
+    }
+    VernierAdapter &dev = slots[slot];
+    bool ok = dev.connect((req_seq != NO_HOST_REQUEST) ? true : false);
     if (ok)
     {
-        vernier.getDeviceInfo();
+        dev.getDeviceInfo();
         // If a previous connect (auto-connect on boot) already started
         // streaming, calling startReading() again restarts the GATT
         // subscription and resets the dropped-sample counter mid-experiment.
         // Only kick off the stream when the link isn't already producing.
-        if (!vernier.isStreaming())
-            vernier.startReading(vernier.samplingPeriod());
+        if (!dev.isStreaming())
+            dev.startReading(dev.samplingPeriod());
 
-        uart.sendHello();
-        uart.sendStatus(true, 1);
-        uart.sendDeviceInfo(vernier.deviceName(), vernier.orderCode(), vernier.serialNumber());
-        uart.sendDeviceStats(vernier.batteryPercent(), vernier.chargeState(), vernier.rssi(), vernier.droppedSamples());
+        uart.sendHello();        // global — no dev
+        uart.sendStatus(true, 1); // global — no dev (per protocol-v2 spec)
+        uart.sendDeviceInfo(dev.deviceName(), dev.orderCode(), dev.serialNumber(), slot);
+        uart.sendDeviceStats(dev.batteryPercent(), dev.chargeState(), dev.rssi(), dev.droppedSamples(), slot);
 
-        uint32_t mask = vernier.enabledChannelMask();
+        uint32_t mask = dev.enabledChannelMask();
         const char *names[gogo_vernier::MAX_CHANNELS];
         const char *units[gogo_vernier::MAX_CHANNELS];
         uint8_t count = 0;
@@ -151,23 +158,29 @@ static bool connectAndReport(uint32_t req_seq = NO_HOST_REQUEST)
         {
             if (mask & (1u << i))
             {
-                names[count] = vernier.sensorName(i);
-                units[count] = vernier.sensorUnit(i);
+                names[count] = dev.sensorName(i);
+                units[count] = dev.sensorUnit(i);
                 ++count;
             }
         }
         if (count > 0)
-            uart.sendDeviceFields(count, names, units);
+            uart.sendDeviceFields(count, names, units, slot);
 
-        // Persist last connected device name to NVS (writeable)
-        log_d("Saving device name to NVS: %s", vernier.deviceName());
-        xSemaphoreTake(nvsMutex, portMAX_DELAY);
-        if (preferences.begin(NVS_NAMESPACE_SETTING, false))
+        // Persist last connected device name to NVS (writeable). Per-slot
+        // NVS keys land in step 3.7; until then, slot 0's name still
+        // shadows the legacy single-key schema and other slots are
+        // ephemeral (lost on reboot).
+        if (slot == 0)
         {
-            preferences.putString(NVS_KEY_DEVICE_NAME, vernier.deviceName());
-            preferences.end();
+            log_d("Saving device name to NVS: %s", dev.deviceName());
+            xSemaphoreTake(nvsMutex, portMAX_DELAY);
+            if (preferences.begin(NVS_NAMESPACE_SETTING, false))
+            {
+                preferences.putString(NVS_KEY_DEVICE_NAME, dev.deviceName());
+                preferences.end();
+            }
+            xSemaphoreGive(nvsMutex);
         }
-        xSemaphoreGive(nvsMutex);
     }
 
     if (req_seq != NO_HOST_REQUEST)
@@ -183,7 +196,7 @@ auto autoConnectDevice = []
         startAutoConnect = false;
 
         log_i("Auto-connecting to saved device ...");
-        connectAndReport(); // no request sequence
+        connectAndReport(0); // no request sequence; slot 0 default until step 3.7 adds per-slot NVS
     }
 };
 
@@ -356,7 +369,10 @@ void uartHandler(void *parameter)
         {
         case C_CONNECT:
         {
-            connectAndReport(req);
+            // Step 3.4 will swap this for first-free slot allocation.
+            // Until then C_CONNECT always lands on slot 0 — single-
+            // device behaviour preserved.
+            connectAndReport(0, req);
             break;
         }
         case C_DISCONNECT:
