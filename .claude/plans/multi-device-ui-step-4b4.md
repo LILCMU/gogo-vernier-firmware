@@ -1,200 +1,508 @@
-# Phase 4 step 4b.4 — host UI slot list + drill-down (D8 Option C)
+# Phase 4 step 4b.4 — host UI multi-slot redesign (kids-UX, v2)
 
-Plan for the full multi-slot UI refactor on host side (`gogo-firmware`),
-deferred from the 4b mini-batch (4b.1 + 4b.2 + 4b.3) because of
-display-layer surface area.
+Plan for the multi-slot UI on host side (`gogo-firmware`), deferred from
+the 4b mini-batch (4b.1 + 4b.2 + 4b.3) because of display-layer surface
+area.
+
+This document is **v2** — the original v1 plan (D8 Option C: list +
+drill-down) was reviewed under a kids-UX lens and replaced. v1 design
+intent recap is preserved at the end of this file under "Design history"
+for traceability.
 
 Predecessors landed (4b.1–4b.3):
 - T_DEV_LIST request fires at host boot → slot table populated early.
 - `VERNIER_CYCLE` sub-menu item rotates `_primary_slot` to the next
-  CONNECTED slot. Existing `vernierMonitor` renders whichever slot
-  is primary; cycle button greyed when ≤1 slots connected.
+  CONNECTED slot.
 - Existing `VERNIER_CONNECT` button calls `disconnect()` /
-  `connect()` — already per-slot via `_primary_slot` default in
-  the host adapter (4a.5).
+  `connect()` per-slot via `_primary_slot` default in the host
+  adapter (4a.5).
 
-What 4b.4 still owes per design D8 Option C: a dedicated **slot list
-view** as the entry screen for the vernier page. Drill-down view =
-the existing per-slot detail layout (currently the only view).
+These will be **removed / re-purposed** in the v2 redesign — see
+sub-step 4b.4.0 cleanup.
 
 ---
 
-## User-visible flow after 4b.4 lands
+## Design principles (kids-UX)
+
+1. **No modes.** Single main screen. All 3 slots always visible.
+2. **Color = identity.** Slot 1 = red, slot 2 = blue, slot 3 = green.
+   Same chip colors echo into plots / legends / printouts later.
+3. **Words, not abbreviations.** "Light", "Temperature", "Forget".
+4. **Big primary value.** Current first-field value is the dominant
+   text on each row — kids look for the number first.
+5. **One button, one action.** No long-press semantics. No hidden
+   gestures.
+6. **Cursor IS primary.** Whatever slot the cursor sits on becomes
+   `_primary_slot`. No separate "cycle" concept.
+7. **Hide expert controls.** Period preset, battery %, signal
+   dBm, Forget all live in `Vernier > Settings` sub-page, opened
+   from the main screen and scoped to the cursor's slot.
+8. **Field names must be discoverable.** Many GDX sensors expose
+   multiple fields (e.g. GDX-LC: Light / UV / 615 nm / 525 nm /
+   465 nm). The kid needs to **read the exact field name** so they
+   can reference it later in their GoGo program. The Settings
+   sub-page lists all fields by name with their live values; the
+   main view shows the kid's chosen "primary field" per slot.
+
+## Hardware constraints
+
+- Display: **160 × 128 px, horizontal**.
+- Existing widgets to reuse: `drawButton`, alpha-blended row highlight,
+  page banner band.
+- Page accent stays purple (`TFT_GOGO_PURPLE`); slot identity colors
+  are additional palette entries (red/blue/green), not replacements.
+
+---
+
+## Screen layouts (160 × 128)
+
+### Main view — always-on slot list
+
+Each row shows the slot's **primary field** (default = field 0,
+re-pickable in the Settings sub-page). When the slot has more than
+one field, a `★ N/M` indicator on the device-name line tells the
+kid "this slot has more — see Settings to read all field names".
 
 ```
-┌─────────────────────────────┐    ┌─────────────────────────────┐
-│ Vernier Sensor              │    │ Vernier Sensor              │
-├─────────────────────────────┤    ├─────────────────────────────┤
-│ ▶ Slot 1: GDX-LC            │    │ Slot 2: GDX-TMP             │
-│   Light: 56.2 lux           │    │   Temperature: 23.4 °C      │
-│ ─────────────────────────── │    │   Period: 1 s               │
-│   Slot 2: GDX-TMP           │    │   Battery: 87%              │
-│   Temperature: 23.4 °C      │    │   ────────────────────────  │
-│ ─────────────────────────── │    │   Light: ...                │
-│   Slot 3: Empty             │    │   ...                       │
-│   Press to connect          │    │                             │
-├─────────────────────────────┤    ├─────────────────────────────┤
-│ [Connect][Period][Info][Cyc]│    │ [Disconnect][Period][⌫Back] │
-└─────────────────────────────┘    └─────────────────────────────┘
-   Slot list view (default)            Drill-down view
+y=0   ┌─────────────────────────────────────────────────┐
+       │ Vernier Sensors                 2/3 connected   │  banner (purple)
+y=14   ├─────────────────────────────────────────────────┤
+       │┃● 1  GDX-LC                            ★ 1/5    │  cursor row
+       │┃     Light                        56.2  lux     │  primary field
+y=42   ├ - - - - - - - - - - - - - - - - - - - - - - - - ┤
+       │ ● 2  GDX-TMP                                    │  single-field sensor
+       │      Temperature                  23.4  °C      │  no ★ indicator
+y=70   ├ - - - - - - - - - - - - - - - - - - - - - - - - ┤
+       │ ○ 3  Empty                                      │
+       │      press to add sensor                        │
+y=98   ├─────────────────────────────────────────────────┤
+       │   [ Disconnect ]            [ Settings ]        │  action bar
+y=128  └─────────────────────────────────────────────────┘
 ```
 
-Cursor scrolls slot rows in list view. Press = enter drill-down on
-selected slot. Drill-down "⌫Back" returns to list. Cycle button on
-the drill-down view rotates the primary slot (= the slot rendered
-in drill-down) without leaving drill-down — useful for quick
-side-by-side comparison if the user keeps pressing it.
+Reading guide:
+- `★ N/M` — slot's primary field is N (1-indexed) of M total fields.
+  Kid sees "★ 1/5" → "there are 5 fields here, I'm seeing field 1".
+  Pressing Settings reveals all 5 by name with live values.
+- Single-field sensors omit the indicator (no clutter).
+
+When cursor sits on the empty slot, the action bar swaps:
+
+```
+y=98   ├─────────────────────────────────────────────────┤
+       │   [ + Add sensor ]          [ Settings ]        │
+y=128  └─────────────────────────────────────────────────┘
+```
+
+While a connect attempt is in flight on the cursor's slot:
+
+```
+y=70   ├ - - - - - - - - - - - - - - - - - - - - - - - - ┤
+       │┃◐ 3  Searching…       (5 s)                     │  ◐ pulses
+       │┃     please wait                                │
+y=98   ├─────────────────────────────────────────────────┤
+       │   [ Cancel ]                [ Settings ]        │
+y=128  └─────────────────────────────────────────────────┘
+```
+
+### Vernier > Settings sub-page
+
+Opened by pressing **[ Settings ]** on the main view. Always scoped to
+the slot the cursor was on when entered. Breadcrumb header includes
+slot id + device name so it's visually distinct from the GoGo
+top-level Settings page and the kid sees which sensor they're
+configuring without ambiguity.
+
+Page is **scrollable** — needed because GDX-LC has 5 fields, GDX-3MG
+has 4, GDX-ACC has 4 (3 axes + magnitude). Worst case ~10 fields
+per sensor.
+
+```
+y=0   ┌─────────────────────────────────────────────────┐
+       │ Vernier > Settings · Slot 1: GDX-LC             │  breadcrumb + device
+y=14   ├─────────────────────────────────────────────────┤
+       │┃Period           [  1 s  ▾ ]                    │  cursor on Period
+       │  Battery 87% · Signal -52 dBm                   │  inline status (no cursor)
+       ├ - - - - - - - - - - - - - - - - - - - - - - - - ┤
+       │ ★ Light          56.234   lux                   │  ★ = primary field
+       │   UV              0.000                         │  press = make primary
+       │   615 nm          1.881                         │
+       │   525 nm          1.987                         │  scrolls if more
+       │   465 nm          2.439                         │
+       ├ - - - - - - - - - - - - - - - - - - - - - - - - ┤
+       │              [ Forget ]                         │
+y=98   ├─────────────────────────────────────────────────┤
+       │   [ ◀ Back ]                                    │
+y=128  └─────────────────────────────────────────────────┘
+```
+
+Cursor stops, in order:
+1. `Period` row — press = enter period preset cycle (yellow pill);
+   writes per-slot preset.
+2. Each field row (one stop per field) — press = set that field as
+   the slot's primary (★ moves to the new row, main view re-renders
+   to show it next time).
+3. `Forget` row — press = `disconnect(slot)` + clear slot's NVS keys
+   (`deviceName{slot}` and `vernierPeriodPreset{slot}`).
+
+When the page has more rows than fit on-screen, cursor up/down past
+the visible viewport scrolls the content (Period and Forget rows
+stay sticky if there's room; otherwise scroll past).
+
+For single-field sensors (e.g. GDX-TMP), the field list collapses to
+one row; the ★ is decorative since there's nothing to pick.
+
+When the slot is empty, sub-page shows a placeholder and only Back is
+available:
+
+```
+y=14   ├─────────────────────────────────────────────────┤
+       │ Empty slot                                      │
+       │                                                 │
+       │       Connect a sensor first.                   │
+       │                                                 │
+y=98   ├─────────────────────────────────────────────────┤
+       │   [ ◀ Back ]                                    │
+y=128  └─────────────────────────────────────────────────┘
+```
+
+---
+
+## Cursor style — vertical left-edge bar
+
+Reused across both screens. Replaces the alpha-blend horizontal pill
+used elsewhere (specific to this page; main menu / settings stay
+as-is). Reason: horizontal pills fight with the slot-color chip on
+the same row; a thin vertical bar cleanly separates "selection" from
+"identity".
+
+Spec:
+- Width: **3 px** at `x = 0..3`.
+- Height: full row height (28 px on main view, 14 px on settings
+  rows / 16 px on tab band).
+- Color: `TFT_GOGO_PURPLE` (page accent).
+- No row tint — bar alone signals the cursor.
+
+```
+┃●1  GDX-LC          56.2 lux        ← cursor row
+ ●2  GDX-TMP         23.4 °C
+ ○3  Empty
+```
+
+Same primitive on settings sub-page rows.
+
+---
+
+## Slot color palette
+
+Fixed slot identity per K6:
+
+| Slot | Color | Hex (TFT16) | Usage |
+|------|-------|-------------|-------|
+| 1 | Red | `TFT_RED` | filled chip, empty outline |
+| 2 | Blue | `TFT_BLUE` | filled chip, empty outline |
+| 3 | Green | `TFT_GREEN` | filled chip, empty outline |
+
+Constants live in `gogo-display.h` as `VERNIER_SLOT_COLOR[VERNIER_MAX_SLOTS]`.
+Same palette will be reused later by plotting / data export when
+those land — kids learn "sensor 1 is always red" once.
 
 ---
 
 ## Sub-step breakdown
 
-Each row a separable commit. Build + smoke between each.
+Each row a separable commit per the user's "split for look back"
+preference. Build + smoke between behaviour-changing commits per
+"wait me tested".
 
-### 4b.4.1 — `DISPLAY_VERNIER_SLOT_LIST` mode + state machine
+### 4b.4.1 — slot-color palette + chip widget
 
-- New `display_id_t` value `DISPLAY_VERNIER_SLOT_LIST` alongside
-  `DISPLAY_VERNIER_SENSOR`.
-- New global flag `gblVernierInDrillDown` (or a new state machine
-  variable) toggled by Press / Back.
-- Main loop's `case DISPLAY_VERNIER_SENSOR` branches:
-  - drill-down mode → `vernierMonitor` + `vernierControlMenu`
-    as today.
-  - list mode → new `vernierSlotListView()`.
-- Long-press button on list row = enter drill-down. Long-press on
-  drill-down = back to list. (Or: short-press = press, long-press
-  = back. Discuss.)
+**Code-only, no user-visible change.**
 
-### 4b.4.2 — `vernierSlotListView()` render function
+- Add `VERNIER_SLOT_COLOR[VERNIER_MAX_SLOTS]` constant in
+  `gogo-display.h`: `{ TFT_RED, TFT_BLUE, TFT_GREEN }`.
+- Add helper `drawSlotChip(x, y, slot_id, connected)` in
+  `GoGoDisplay`: filled colored circle when connected, outline
+  circle when empty, slot number overlay either way.
+- Not wired into any page yet — primitive only, exercised via main
+  view in 4b.4.2.
 
-Layout (in `src/display/gogo-display.cpp`):
+> Safe to ship without smoke: dead code, will not affect any
+> existing render path.
 
-```
-y=22  ┌─────────────────────────────┐
-      │ ▶ Slot 1: GDX-LC            │  highlighted (cursor)
-      │   Light: 56.2 lux           │
-      │ Slot 2: GDX-TMP             │
-      │   Temperature: 23.4 °C      │
-      │ Slot 3: Empty               │
-      │   Press connect to add      │
-y=110 └─────────────────────────────┘
-```
+### 4b.4.2 — main view replacement (`vernierSlotListView`) + 4b.2 cleanup
 
-Row layout:
-- Row height ~30 px (= 3 slots fit in ~90 px content area).
-- First line: slot id + device name (or "Empty").
-- Second line: first sensor value + unit (or hint text).
-- Cursor row gets `▶` prefix + slight bg highlight.
+**First user-visible change. Atomic swap: old vernier page → new.**
 
-Inputs:
-- `VernierSlotListData` snapshot struct (new) — N entries each
-  with `connected`, `name`, `first_field_name`, `first_field_unit`,
-  `first_field_value`. Populated by new
-  `GoGoVernier::snapshotSlotList(out)` accessor that walks
-  `_slots[]` and fills.
+Folds the originally-planned 4b.4.0 cleanup into the same commit so
+git history never carries a transient regression frame.
 
-### 4b.4.3 — Cursor navigation in list view
+Add:
+- `VernierSlotListData` snapshot struct: per-slot `connected`,
+  `device_name`, `first_field_name`, `first_field_unit`,
+  `first_field_value`, `battery`, `is_searching`, `is_primary`.
+- `GoGoVernier::snapshotSlotList(out)` walks `_slots[]` and fills.
+- `vernierSlotListView(const VernierSlotListData *)` renders 3 rows
+  × 28 px with chip + name + value + unit per row.
+- Action bar with placeholder `[ Disconnect ]` / `[ Settings ]`
+  buttons (wired up properly in 4b.4.4; here they're static labels
+  to fill the layout band).
 
-- Repurpose existing rotary / button up-down events to scroll
-  through `0..VERNIER_MAX_SLOTS-1` rows when in list mode.
-- New `_currentSlotListCursor` member on `GoGoDisplay` (analog to
-  `_currentDisplayMenu`).
-- Press → `setPrimarySlot(_currentSlotListCursor)` then enter
-  drill-down.
+Remove (4b.2 / pre-4b cleanup):
+- `vernierMonitor` (replaced by row-per-slot rendering).
+- `vernierControlMenu` switch and its CYCLE / PERIOD / INFO cases.
+- `VERNIER_CYCLE`, `VERNIER_PERIOD`, `VERNIER_INFO`, `VERNIER_CONNECT`
+  enum entries → replaced by new state machine in 4b.4.3.
+- `VERNIER_MODE_COUNT` and mode-dot rendering — no modes anymore.
+- Mode-dot constants in `gogo-display.h` (`VERNIER_MODE_DOT_*`).
 
-### 4b.4.4 — Back button on drill-down
+Touched files (expected):
+- `include/display/gogo-display.h` — palette consts already in
+  4b.4.1; remove mode-dot block; add new view layout consts.
+- `src/display/gogo-display.cpp` — delete vernierMonitor +
+  vernierControlMenu; add vernierSlotListView.
+- `include/peripherals/gogo-vernier.h` — declare snapshotSlotList.
+- `src/peripherals/gogo-vernier.cpp` — implement snapshotSlotList.
+- `include/display/display-assets/vernier-data.h` — add
+  VernierSlotListData; trim VernierDisplayData fields no longer used.
+- `src/gogo-firmware.cpp` — swap render call site for vernier page.
 
-- Drill-down's button menu (`VERNIER_CONNECT / PERIOD / INFO /
-  CYCLE`) gains a 5th cursor `VERNIER_BACK`. Press = exit
-  drill-down → list view.
-- Bumps `VERNIER_MODE_COUNT` to 5.
+> **STOP HERE for user smoke.** First commit that changes what
+> the kid sees on screen.
+> Test plan:
+>   - 0 sensors: 3 empty rows, slot colors visible (red/blue/green
+>     outlines).
+>   - 1 sensor: row 1 shows it (red filled chip + name + value +
+>     unit), rows 2/3 empty.
+>   - Reboot persists the saved sensor → row 1 re-shows it.
 
-### 4b.4.5 — List view default on entering vernier page
+### 4b.4.3 — vertical bar cursor + cursor navigation
 
-- When user navigates into the vernier page (from main menu), land
-  on slot list view, not drill-down. Drill-down only on explicit
-  press from list.
-- Initial state save / restore: NVS `vernierLastView` (list vs
-  drill-down + last cursor row) so the screen resumes where the
-  user left it. Optional polish — could skip and always default
-  to list.
+- Add `_currentSlotListCursor` member on `GoGoDisplay` (range
+  `0..VERNIER_MAX_SLOTS-1`).
+- Render 3 px purple bar at `x=0..3` on the cursor's row in
+  `vernierSlotListView`.
+- Wire button up/down (matches existing menu navigation device — to
+  confirm at impl: rotary or two-button per the actual hardware) to
+  move cursor among rows.
+- Cursor change calls `gogoVernier.setPrimarySlot(_currentSlotListCursor)`
+  — primary-slot follows cursor.
 
-### 4b.4.6 — Empty-slot row "Press to connect" semantics
+### 4b.4.4 — action bar (CONNECT / SETTINGS)
 
-- When cursor is on an Empty row and user presses, send
-  `gogoVernier.connect()`. Vernier still picks first-free slot,
-  which won't necessarily be the row the user pressed (if multiple
-  empty slots). For v1 of the UI: just trigger connect, let the
-  result land wherever vernier puts it. Highlight the resulting
-  slot when its T_DEV_LIST update arrives.
+- Bottom action band shows two buttons:
+  - Left button: context-sensitive label
+    - cursor on connected slot → `[ Disconnect ]` calls
+      `disconnect(cursor_slot)`.
+    - cursor on empty slot → `[ + Add sensor ]` calls `connect()`
+      (vernier picks first-free slot).
+    - cursor on connecting slot → `[ Cancel ]` calls
+      `disconnect(cursor_slot)` to abort.
+  - Right button: `[ Settings ]` always available; opens settings
+    sub-page scoped to cursor slot.
 
-### 4b.4.7 — Per-slot period control in drill-down
+- New `display_id_t` value `DISPLAY_VERNIER_SETTINGS` for the
+  sub-page.
 
-- Existing `VERNIER_PERIOD` editor mutates `_vernierSettings[VERNIER_PERIOD_PRESET]`
-  globally. Per design D5 (per-slot period), it should mutate a
-  per-slot value.
-- Add `_vernierPeriodPresetPerSlot[VERNIER_MAX_SLOTS]` array.
-  `setPeriodPreset(idx, dev)` writes to slot dev. UI in drill-down
-  reads/writes the displayed slot's preset.
-- NVS schema bump: `vernierPeriodPreset0..N` keys (mirror of
-  step 3.7's `deviceName0..N`). Migrate `vernierPeriodPreset`
-  legacy key to slot 0.
+### 4b.4.5 — Vernier > Settings sub-page skeleton (read-only)
+
+- Add render function `vernierSettingsSubPage(slot_id, snapshot)`
+  with breadcrumb header `Vernier > Settings · Slot N: <device>`.
+- Static layout: Period row (read-only display only in this commit),
+  inline Battery/Signal status line, separator, Forget button (greyed).
+- `[ ◀ Back ]` returns to main view, restoring main cursor.
+- Cursor on sub-page navigates Period ↔ Forget (Forget greyed; press
+  does nothing).
+- **No field list yet** — landed in 4b.4.5b for separate review.
+
+> Smoke between 4b.4.5 and 4b.4.5b: open settings, see Period /
+> Battery / Signal, back. No write paths yet. Safe to ship.
+
+### 4b.4.5b — Field list + primary field picker
+
+Critical for kid programmability — lets the kid read all field
+names exposed by their sensor so they can use them in GoGo programs.
+
+- Extend `VernierSlotListData` (and host adapter snapshot) so it
+  includes `primary_field_index` per slot.
+- Add `_vernierPrimaryFieldPerSlot[VERNIER_MAX_SLOTS]` member on
+  host adapter; default = 0; clamped on field-count change.
+- Settings sub-page renders **scrollable field list** between Period
+  and Forget. Each row: `★ <name>  <value>  <unit>` if primary, else
+  `  <name>  <value>  <unit>`. Live-updating values.
+- Each field row is a cursor stop. Press = `setPrimaryField(slot,
+  field_idx)` → ★ moves; main view re-renders with new primary.
+- Scrolling: when total cursor stops (Period + N fields + Forget)
+  exceed visible viewport, the field-list band scrolls; Period and
+  Forget stay sticky at top/bottom.
+- NVS persistence: new key `vernierPrimaryField{slot}` (uint8),
+  written on press. Default = 0 if absent.
+- Main view (`vernierSlotListView`) updated to render
+  `data->field_names[primary_field_index]` and
+  `data->values[primary_field_index]` instead of always field 0.
+- Star indicator `★ N/M` on main view row's device line shown when
+  field count > 1; hidden for single-field sensors.
+
+> Smoke: connect GDX-LC, open settings, see all 5 fields by name +
+> live values; press 615 nm → ★ moves to it → back → main view now
+> shows "615 nm  1.881  ".  Re-boot → primary persists from NVS.
+
+### 4b.4.6 — per-slot Period editor + NVS schema bump
+
+- Add `_vernierPeriodPresetPerSlot[VERNIER_MAX_SLOTS]` array on
+  host adapter.
+- `setPeriodPreset(idx, dev)` now writes to slot `dev`.
+- Sub-page Period row press = enter preset cycle (yellow pill
+  pattern) writing into displayed slot.
+- NVS schema bump:
+  - New keys: `vernierPeriodPreset0..N` (`vernierPeriodPreset%u`
+    format).
+  - One-shot legacy migration: on first v3 boot, copy
+    `vernierPeriodPreset` → all slot keys, then leave legacy key
+    in place (mirrors 3.7's `deviceName` migration).
+- Wire commands per slot via `gogoVernier.sendSetRate(period, dev)`.
+
+### 4b.4.7 — Forget action
+
+- Sub-page Forget button press:
+  - Calls `disconnect(slot)` to drop the BLE link if connected.
+  - Clears slot's NVS keys: `deviceName{slot}` and
+    `vernierPeriodPreset{slot}` (latter resets to default 1 s).
+  - Returns to main view.
+
+### 4b.4.8 — empty slot affordance polish
+
+- Empty rows render with outline chip `○ N` + greyed text
+  `Empty / press to add sensor`.
+- `+ Add sensor` button on cursor-on-empty highlighted in slot
+  color so the visual cue ties button to row.
 
 ---
 
-## Open decisions to revisit before coding 4b.4
+## NVS schema
 
-| # | Question | Default proposal |
-|---|----------|------------------|
-| Q1 | Up-down navigation in list view: rotary encoder, two-button (next/prev), or single-button cycle? | Match existing menu navigation. Likely rotary on this device. |
-| Q2 | "Press" vs "Long-press" for enter drill-down? | Short = enter; long = quick disconnect of highlighted slot. |
-| Q3 | Empty-slot row: prompt "Press to connect" or skip rendering empty slots? | Render with hint — affordance for users to know slot exists. |
-| Q4 | Drill-down BACK button: cursor item or hardware back button if available? | Add as 5th cursor item (4b.4.4). |
-| Q5 | Per-slot period preset: per-slot UI (4b.4.7 in scope) or stay global? | Per-slot per ratified D5. Add to 4b.4.7. |
-| Q6 | NVS migration for 4b.4.7 period schema | Same one-shot pattern as step 3.7's deviceName. |
-| Q7 | Default sub-menu cursor on entering drill-down: CONNECT, CYCLE, or BACK? | CONNECT (matches today's default + most common action). |
-| Q8 | Display memory budget for VernierSlotListData snapshot | One copy: ~100 B per slot × 3 = 300 B static. Same display task as today, no extra task contention. |
+After step 4b.4.6:
+
+| Key | Scope | Notes |
+|-----|-------|-------|
+| `deviceName0..N` | per-slot | populated since 3.7 |
+| `vernierPeriodPreset0..N` | per-slot | new in 4b.4.6 |
+| `vernierPrimaryField0..N` | per-slot | new in 4b.4.5b; uint8, default 0 |
+| `vernierPeriodPreset` | legacy | kept for read-only fallback during one boot, never written after migration |
+
+No protocol bump — wire format from 4a (v2 with `dev` field) is
+sufficient for per-slot period commands.
+
+---
+
+## Removed from v1
+
+| v1 element | Why removed |
+|------------|-------------|
+| Drill-down view | Single screen kid principle. No mode = no get-stuck. |
+| `VERNIER_BACK` 5th cursor item | No drill-down to back out of. |
+| Long-press = quick disconnect | Hidden gesture, kid-hostile. Disconnect is the explicit action button. |
+| `VERNIER_CYCLE` mode + pill | Cursor on list IS the cycle. Two affordances for one action confused users. |
+| NVS `vernierLastView` resume | Single view → nothing to resume. |
+| Drill-down INFO mode | Folded into Vernier > Settings sub-page. |
+| Per-slot period in drill-down | Moved to settings sub-page where it belongs (advanced control). |
+
+---
+
+## Smoke test plan (post 4b.4.x)
+
+Single device (GDX-LC has 5 fields, exercises field picker):
+- Boot → main view shows 1 occupied row (slot 1 red) + 2 empty rows
+  (slot 2 blue outline, slot 3 green outline).
+- Slot 1 device-name line shows `★ 1/5` indicator (5 fields, primary
+  is field 0 = "Light").
+- Slot 1 value line shows `Light  56.234  lux`.
+- Cursor on slot 1: action button = `[ Disconnect ]`.
+- Cursor on slot 2 / 3: action button = `[ + Add sensor ]`.
+- Press Settings → sub-page header `Vernier > Settings · Slot 1: GDX-LC`.
+  - Period row shows current preset.
+  - Battery / Signal status line populated.
+  - Field list shows all 5: `★ Light / UV / 615 nm / 525 nm /
+    465 nm` with live values.
+- Cursor down to `615 nm`, press → ★ moves to 615 nm; back → main
+  view now shows `615 nm  1.881   ` and `★ 3/5` indicator.
+- Re-enter Settings → ★ still on 615 nm (in-memory persistence).
+- Reboot host → main view re-renders with `★ 3/5` from NVS.
+- Sub-page Period press → cycles through presets (50ms / 100ms /
+  500ms / 1s / 2s / 5s).
+- Single-field sensor variant (e.g. GDX-TMP): main view row shows
+  no `★ N/M` indicator; settings field list has 1 row only.
+- Forget on slot 1 → BLE drops, slot 1 row becomes Empty, NVS
+  `deviceName0`, `vernierPeriodPreset0`, `vernierPrimaryField0`
+  all cleared.
+
+Multi-device (requires step 5 hardware):
+- Boot with 2 saved devices → both auto-connect → rows 1 & 2 show
+  values, row 3 Empty.
+- Move cursor between slots → primary-slot follows.
+- Per-slot period: set slot 1 to 100 ms, slot 2 stays at 1 s. Verify
+  on co-MCU log: `T_ACK seq=N dev=0` then `T_ACK seq=M dev=1`
+  with different periods.
+- Forget slot 1 → row 1 becomes Empty, slot 2 keeps streaming.
+- Add sensor on row 1 (now empty) → vernier picks first-free
+  slot = 0 → reconnects, slot color stays red.
 
 ---
 
 ## Estimated scope
 
-- ~5–7 commits (one per sub-step above, plus a docs commit).
-- ~1 dedicated session (2–4 hours of focused display-layer work
-  + iteration).
-- Most risk concentrated in 4b.4.1 (state machine refactor) and
-  4b.4.7 (per-slot period + NVS migration).
-
----
-
-## Smoke test plan after 4b.4
-
-Single device:
-- Boot → list view shows 1 occupied row + N-1 empty rows.
-- Press connected row → drill-down opens with values.
-- Back → returns to list.
-- Existing CONNECT/PERIOD buttons still work in drill-down.
-- No regression vs 4b.2 behaviour.
-
-Multi-device (requires step 5 hardware):
-- Boot with 2 saved devices → both auto-connect → list shows both.
-- Press row 0 → drill-down on slot 0. Back. Press row 1 →
-  drill-down on slot 1. Values flow independently per slot.
-- Per-slot period: change slot 0 to 100 ms in drill-down, slot 1
-  stays at 1 s. Verify wire commands (T_ACK with dev field).
-- Disconnect slot 0 in drill-down → list shows slot 0 empty,
-  slot 1 still streaming.
-- Empty-slot connect → first-free allocator places it; if both
-  slots free, lands on slot 0.
+- 8 commits (4b.4.1, 4b.4.2 [folds old 4b.4.0 cleanup], 4b.4.3,
+  4b.4.4, 4b.4.5, 4b.4.5b, 4b.4.6, 4b.4.7, 4b.4.8 + final docs).
+- ~1 dedicated session (4–6 hours of focused display-layer work +
+  per-step smoke).
+- Highest risk concentrated in:
+  - 4b.4.2 atomic swap (delete-old + add-new in one commit; first
+    user-visible change → mandatory smoke before continuing).
+  - 4b.4.5b scrolling math (sticky Period/Forget + scrollable field
+    band; touch up at impl time if scroll feels janky).
+  - 4b.4.6 NVS migration (per 3.7 lesson: one-shot, idempotent,
+    non-destructive of legacy key).
 
 ---
 
 ## When to start
 
-Pick up 4b.4 after step 5 hardware smoke ratifies the multi-slot
-backend works on real BLE peers. Doing 4b.4 first risks UI work
-against backend bugs. Hardware-first uncovers issues in the
-proven path before fancy UI lands on top.
+After step 5 hardware smoke ratifies multi-slot backend on real
+BLE peers. Doing UI on top of unproven backend risks debugging two
+moving parts at once.
 
-Sequence: 4b.1 (✅ done) → 4b.2 (✅ done) → step 5 (multi-device
-hardware smoke) → 4b.4.
+Sequence: 4b.1 (✅) → 4b.2 (✅) → step 5 (multi-device hardware
+smoke) → 4b.4.0..4b.4.8.
+
+---
+
+## Design history
+
+### v2 — kids-UX redesign (this document, 2026-05-08)
+
+Driver: review under "kids usage" UX hat surfaced 7 issues with v1
+(see "Removed from v1" table). Locked decisions:
+
+| # | Decision | Outcome |
+|---|----------|---------|
+| K1 | Slot color chips with purple page accent | Approved — purple stays page accent, slot palette is identity-only |
+| K2 | Per-slot period adjustability | Kept; lives in Settings sub-page (not main view) |
+| K3 | Wording: "Forget" vs "Disconnect" | "Forget" |
+| K4 | Row content: name + value | Both shown |
+| K5 | INFO mode survival | Folded into Settings sub-page |
+| K6 | Slot palette: fixed vs device-specific | Fixed (R/B/G) |
+| extra | Settings page header | Breadcrumb `Vernier > Settings · Slot N: <device>` to disambiguate from GoGo Settings |
+| extra | Cursor style | Vertical 3 px purple bar at left edge, applied across vernier pages |
+| extra | Field discoverability | Settings sub-page lists ALL fields by name + live values; main view shows kid-picked primary field per slot with `★ N/M` indicator. Driven by need to read field names for GoGo programs. |
+
+### v1 — D8 Option C (superseded)
+
+Original plan: separate **slot list view** as entry, **drill-down
+view** = single-slot detail (today's monitor). 5th cursor item
+`VERNIER_BACK` to exit drill-down. Optional NVS resume of last view.
+Per-slot period editor inside drill-down. Long-press for quick
+disconnect of highlighted slot.
+
+Why dropped: modal navigation, hidden gestures, and duplicate
+affordances were all kid-hostile. Single-screen redesign covers the
+same use cases without the cognitive load.
