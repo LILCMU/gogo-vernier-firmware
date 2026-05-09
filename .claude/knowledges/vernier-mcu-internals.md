@@ -216,6 +216,102 @@ Host side (post-fix):
 
 ---
 
+## Cross-task discipline (FreeRTOS task hand-off)
+
+Single-core RISC-V (ESP32-C3) means single-byte writes are atomic and
+no Xtensa `memw` instruction exists (it would not assemble). What we
+still need:
+
+- `volatile` on every cross-task flag/state so the compiler can't
+  hoist or reorder its load. Today this covers the boot-time
+  hand-off triple (`startAutoConnect`, `foundSavedDevice`,
+  `slotHasSavedDevice[]`) and the protocol-version flags inside
+  `UartAdapter`.
+- A compiler reordering barrier (`__asm__ volatile("" ::: "memory")`)
+  at the publish point of any fill-then-flag pattern. The
+  `C_SET_PERIOD` handler issues one before flipping
+  `startAutoConnect` so the loop reader sees a fully-populated
+  `slotHasSavedDevice[]`.
+
+Tasks at play:
+- `setup()` → fills NVS + per-slot saved-device flags.
+- `uartHandler` task → reads C_SET_PERIOD, flips startAutoConnect.
+- `loop()` → reads startAutoConnect, dispatches autoConnectDevice.
+- `vernierHandler` task → polls slots[i] state.
+
+`nvsMutex` (FreeRTOS semaphore) gates every Preferences begin/end
+pair so concurrent NVS reads/writes from setup, uartHandler and
+loop never collide.
+
+---
+
+## NACK acks always echo `dev` for slot-scoped commands
+
+Every C_CONNECT / C_DISCONNECT / C_FORGET / C_SET_PERIOD NACK
+includes the requested `dev` in the ack so the host can roll back
+its per-slot UI tracker (the `is_connecting` animation) against the
+right card. Without this, a "slot busy" or "dev out of range" reply
+forces the host to guess the slot from `req`, which only works if
+exactly one outstanding command is mapped 1:1 to a slot.
+
+Wire layout: `T_ACK = {t, req:u32, ok:bool, msg?:str, dev?:i16}`.
+`dev = -1` (the default in `sendAck`) means "no slot context",
+typical for global commands like C_DEV_LIST.
+
+The C_CONNECT ok-path also echoes `dev` (via `connectAndReport`'s
+trailing ack). On the failure paths the host gets enough info to
+clear the CONNECTING animation immediately instead of waiting on
+the slot's CONNECTING handshake timeout.
+
+---
+
+## Wire-protocol enums — single source of truth
+
+`UartAdapter::MsgType` (T_*) and `UartAdapter::CmdType` (C_*) are
+the canonical wire-protocol numeric IDs. Both are public enums
+inside `UartAdapter` with byte-layout comments next to each
+constant. `UartAdapter::CoreState` enumerates the values carried
+by the global `T_STATUS.core_state` field.
+
+Older code kept a duplicate `enum CommandType` inside `uartHandler`'s
+function body. That duplicate was dropped — the dispatcher pulls
+`constexpr auto C_CONNECT = UartAdapter::C_CONNECT;` etc. into
+local scope so case labels stay terse without a second source of
+truth to drift.
+
+When adding a new wire frame:
+1. Bump `VERNIER_PROTOCOL_VERSION` if existing field semantics
+   change (additive fields are optional and don't require a bump).
+2. Add the constant + byte-layout comment in `uart-adapter.h`.
+3. Add the handler in `_handleFrame` (host) or `onCommand`
+   (vernier) branching on the enum value.
+4. Mirror in the host's command/message enum in `gogo-vernier.h`.
+
+---
+
+## Deferred / known issues (do before architecture lands)
+
+- **D2 design-doc amendment.** `multi-device-design.md` D2 still
+  reads "host never specifies dev on connect; vernier picks". Code
+  now accepts an optional `dev` (kid-pressed empty slot) — the doc
+  needs a v2.1 amendment so a reviewer reading the spec doesn't
+  assume the implementation is wrong. Spec'd-but-unimplemented
+  `name` field on C_CONNECT should also be either implemented or
+  struck.
+- **Mid-handshake C_DISCONNECT race.** `connectAndReport` is called
+  synchronously from the command dispatch, blocking uartHandler for
+  ~7 sec during the BLE handshake. C_DISCONNECT for the same slot
+  arriving in that window queues until the handshake finishes. If
+  the connect succeeds, NVS gets written for a slot the user just
+  asked to forget. Architectural fix: hand off connectAndReport to
+  a worker task (the existing TODO in main.cpp acknowledges this).
+- **Per-slot auto-connect failure cap.** A slot whose saved device
+  vanished burns ~7 sec at every boot retrying. Add a per-slot
+  `_autoConnectFailures` counter; clear `slotHasSavedDevice[slot]`
+  + the NVS key after K consecutive failures.
+
+---
+
 ## Cross-references
 
 - Plans: `.claude/plans/multi-device-ui-step-4b4.md`,
