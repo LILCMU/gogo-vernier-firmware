@@ -321,7 +321,7 @@ When adding a new wire frame:
   - `.claude/knowledges/d2pio-debug-findings.md` — protocol-level
     debugging session notes (preserved as-is, captures pre-Phase-4
     findings).
-- Submodule: `lib/GoGoVernier@main` carries the GDX driver
+- Submodule: `lib/GoGoVernier@main` (pinned at v1.0.0) carries the GDX driver
   including `refreshStatus()` battery support.
 - Host-side display patterns:
   `gogo-firmware/.claude/knowledges/vernier-display-patterns.md`.
