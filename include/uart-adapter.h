@@ -38,11 +38,51 @@ constexpr uint8_t GOGOBOARD_FIRMWARE_ID_TASMOTA = 3;
 class UartAdapter
 {
 public:
+    // Wire-protocol message types (vernier → host). Numeric values
+    // are part of the protocol — keep stable; document each frame's
+    // layout next to the constant.
+    //
+    // Value 6 retired (was T_DEF_VALUE — single-value sample variant
+    // superseded by T_SENS_VALUES with count=1). Do not re-use without
+    // bumping protocol.
+    enum MsgType : uint8_t
+    {
+        T_STATUS      = 1,  // global. {t, status:bool, core_state:CoreState}. NO `dev`.
+        T_DEVINFO     = 2,  // per-slot. {t, dev, device_name, order, serial}.
+        T_DEVSTATS    = 3,  // per-slot. {t, dev, battery, charge_state, rssi, dropped}.
+        T_FIELDS      = 4,  // per-slot. {t, dev, fields:[{name, unit}, ...]}.
+        T_SENS_VALUES = 5,  // per-slot. {t, dev, ts, sensors:[float, ...], seq}.
+        T_ACK         = 7,  // {t, req:u32, ok:bool, msg?:str, dev?:i16}. dev echoed when slot-scoped.
+        T_HELLO       = 8,  // global. {t, proto_version, firmware_id, version_*, max_slots}.
+        T_DEV_LIST    = 9,  // global. {t, slots:[{dev, name, order, connected}, ...]}.
+    };
+
+    // Wire-protocol command codes (host → vernier). Numeric values
+    // are part of the protocol — keep stable; mirror the byte layout
+    // in the comment so the host registry stays in sync.
+    enum CmdType : uint8_t
+    {
+        C_CONNECT    = 1,  // {c, seq, dev?:u8}. dev opt = host-targeted slot.
+        C_DISCONNECT = 2,  // {c, seq, dev:u8}.
+        C_SET_PERIOD = 3,  // {c, seq, dev:u8, period_ms:u32 (capped at MAX_PERIOD_MS)}.
+        C_DEV_LIST   = 4,  // {c, seq}. Triggers a T_DEV_LIST push.
+        C_FORGET     = 5,  // {c, seq, dev:u8}. Disconnect + clear NVS deviceName{dev}.
+    };
+
+    // T_STATUS.core_state values — peer-health enum carried by the
+    // global status frame. Currently only READY is sent on a healthy
+    // boot; reserve values for future BOOTING / FAULT signals.
+    enum CoreState : uint8_t
+    {
+        CORE_STATE_BOOTING = 0,
+        CORE_STATE_READY   = 1,
+    };
+
     explicit UartAdapter(Print &out);
     ~UartAdapter();
 
     void sendHello();
-    void sendStatus(bool status, uint8_t core_state);
+    void sendStatus(bool status, CoreState core_state);
     // Per-device sends: `dev` is the slot id the frame describes.
     // Defaults to 0 — single-device callers omit the arg, behaviour
     // unchanged. Multi-device callers (Phase 4 step 3+) pass the
@@ -76,20 +116,6 @@ public:
     void sendAck(uint32_t req_seq, bool ok, const char *msg = nullptr, int16_t dev = -1);
 
 private:
-    // Value 6 retired (was T_DEF_VALUE — single-value sample variant superseded
-    // by T_SENS_VALUES with count=1). Do not re-use without bumping protocol.
-    enum MsgType : uint8_t
-    {
-        T_STATUS      = 1,
-        T_DEVINFO     = 2,
-        T_DEVSTATS    = 3,
-        T_FIELDS      = 4,
-        T_SENS_VALUES = 5,
-        T_ACK         = 7,
-        T_HELLO       = 8,
-        T_DEV_LIST    = 9,  // v2: slot enumeration; emit method lands in Phase 4 step 3
-    };
-
     void send(); // serialize MsgPack with 2-byte BE length prefix
 
     Print &_out;

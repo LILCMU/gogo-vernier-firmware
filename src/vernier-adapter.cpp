@@ -96,7 +96,6 @@ void VernierAdapter::disconnect()
     if (_gv.isStreaming()) _gv.stop();
     if (_gv.isConnected()) _gv.close();
     if (_sample_queue) xQueueReset(_sample_queue);
-    clearDeviceInfo();
 }
 
 void VernierAdapter::setSamplingRate(uint16_t period_ms)
@@ -129,21 +128,10 @@ void VernierAdapter::stopReading()
     _gv.stop();
 }
 
-void VernierAdapter::poll()
-{
-    // Notification-driven now; intentionally empty. Kept so existing call
-    // sites compile unchanged.
-}
-
 void VernierAdapter::getDeviceInfo(bool force)
 {
     if (!_gv.isConnected() && !force) return;
     _gv.refreshStatus();
-}
-
-void VernierAdapter::clearDeviceInfo()
-{
-    // Cached device info lives inside GoGoVernier and is reset on open()/close().
 }
 
 uint32_t VernierAdapter::droppedSamples() const  { return _gv.droppedSamples() + _push_dropped; }

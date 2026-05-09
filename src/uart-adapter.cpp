@@ -42,13 +42,13 @@ void UartAdapter::send()
     _doc.clear();
 }
 
-void UartAdapter::sendStatus(bool status, uint8_t core_state)
+void UartAdapter::sendStatus(bool status, CoreState core_state)
 {
     SendLock _lk(_send_mutex);
     _doc["t"] = T_STATUS;
     _doc["seq"] = _seq++;
     _doc["status"] = status;
-    _doc["core_state"] = core_state;
+    _doc["core_state"] = (uint8_t)core_state;
     send();
 }
 

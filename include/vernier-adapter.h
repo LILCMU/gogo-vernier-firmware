@@ -33,10 +33,8 @@ public:
     void setSamplingRate(uint16_t period_ms);
     void startReading(uint16_t period_ms = 0);
     void stopReading();
-    void poll(); // no-op today; reserved for future host-side housekeeping
 
     void getDeviceInfo(bool force = false);
-    void clearDeviceInfo();
 
     bool isConnected() const { return _gv.isConnected(); }
     // True only after open() finished the full D2PIO handshake. Use this

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stddef.h>
+
 #define BOOT_BUTTON_PIN 9
 #define BUTTON_LONG_PRESS_THRESHOLD 2000
 
@@ -25,4 +27,9 @@ const constexpr char *NVS_KEY_DEVICE_NAME   = "deviceName";
 // produces "deviceName0", "deviceName1", ... — under the 15-char NVS
 // key length cap for slot ids up to 9999.
 const constexpr char *NVS_KEY_DEVICE_NAME_FMT = "deviceName%u";
+
+// Stack-buffer size for any NVS key built from the formats above.
+// ESP32 Preferences caps keys at 15 chars + NUL; this matches that
+// budget so a buffer overflow is impossible at compile time.
+constexpr size_t NVS_KEY_MAX_LEN = 16;
 

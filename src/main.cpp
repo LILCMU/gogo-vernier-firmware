@@ -120,13 +120,23 @@ UartAdapter uart(gogoSerial);
 TaskHandle_t uartProcessTask, vernierProcessTask;
 SemaphoreHandle_t nvsMutex;
 
-static bool startAutoConnect = false;
-static bool foundSavedDevice = false;
+// Cross-task FreeRTOS hand-off flags. uartHandler writes
+// startAutoConnect from inside C_SET_PERIOD; loop() reads it and
+// dispatches autoConnectDevice. foundSavedDevice / slotHasSavedDevice
+// are written by setup + connectAndReport (loop/uart contexts) and
+// read in autoConnectDevice (loop) + C_SET_PERIOD handler (uart).
+// Per host CLAUDE.md cross-task rule: mark volatile to prevent
+// compiler hoisting. ESP32-C3 is single-core RISC-V — single-byte
+// writes are atomic, so a compiler reordering barrier
+// (`__asm__ volatile("" ::: "memory")`) at the publish point is
+// sufficient; no Xtensa `memw` is needed (and would not assemble).
+static volatile bool startAutoConnect = false;
+static volatile bool foundSavedDevice = false;
 // Per-slot "has a saved device name in NVS, eligible for auto-connect"
 // flag. Populated at boot from NVS keys deviceName0..N. Used by
 // autoConnectDevice to know which slots to attempt on the
 // startAutoConnect trigger from C_SET_PERIOD.
-static bool slotHasSavedDevice[VERNIER_MAX_SLOTS] = {false};
+static volatile bool slotHasSavedDevice[VERNIER_MAX_SLOTS] = {false};
 unsigned long startPressTime = 0;
 ButtonEvent prevButtonEvent = BUTTON_RELEASE;
 
@@ -162,8 +172,8 @@ static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST, b
         if (!dev.isStreaming())
             dev.startReading(dev.samplingPeriod());
 
-        uart.sendHello();        // global — no dev
-        uart.sendStatus(true, 1); // global — no dev (per protocol-v2 spec)
+        uart.sendHello();                                     // global — no dev
+        uart.sendStatus(true, UartAdapter::CORE_STATE_READY); // global — no dev (per protocol-v2 spec)
         uart.sendDeviceInfo(dev.deviceName(), dev.orderCode(), dev.serialNumber(), slot);
         uart.sendDeviceStats(dev.batteryPercent(), dev.chargeState(), dev.rssi(), dev.droppedSamples(), slot);
 
@@ -187,7 +197,7 @@ static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST, b
         // key (deviceName0..N). Read back at boot so each slot can
         // auto-reconnect to its previously paired device.
         {
-            char key[16];
+            char key[NVS_KEY_MAX_LEN];
             snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)slot);
             log_d("NVS slot %u: saving %s = %s", (unsigned)slot, key, dev.deviceName());
             xSemaphoreTake(nvsMutex, portMAX_DELAY);
@@ -229,10 +239,14 @@ static void emitDevList()
     UartAdapter::DevListEntry entries[VERNIER_MAX_SLOTS];
     for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
     {
+        // Empty / disconnected slots return "" for name + order so the
+        // host doesn't read a stale device name from a previous session
+        // (VernierAdapter::deviceName/orderCode survive disconnect).
+        const bool live = slots[i].isReady();
         entries[i].dev       = i;
-        entries[i].name      = slots[i].deviceName();
-        entries[i].order     = slots[i].orderCode();
-        entries[i].connected = slots[i].isReady();
+        entries[i].name      = live ? slots[i].deviceName() : "";
+        entries[i].order     = live ? slots[i].orderCode() : "";
+        entries[i].connected = live;
     }
     uart.sendDevList(entries, VERNIER_MAX_SLOTS);
 }
@@ -470,15 +484,14 @@ void vernierHandler(void *parameter)
 
 void uartHandler(void *parameter)
 {
-    // Command IDs from host MCU
-    enum CommandType : uint8_t
-    {
-        C_CONNECT = 1,
-        C_DISCONNECT = 2,
-        C_SET_PERIOD = 3,
-        C_DEV_LIST = 4,  // v2: host requests T_DEV_LIST snapshot
-        C_FORGET = 5,    // v2: disconnect + clear NVS deviceName{slot}
-    };
+    // Command codes are owned by UartAdapter::CmdType (single source
+    // of truth for the wire protocol). Pull short aliases into local
+    // scope so the dispatch case labels stay readable.
+    constexpr auto C_CONNECT    = UartAdapter::C_CONNECT;
+    constexpr auto C_DISCONNECT = UartAdapter::C_DISCONNECT;
+    constexpr auto C_SET_PERIOD = UartAdapter::C_SET_PERIOD;
+    constexpr auto C_DEV_LIST   = UartAdapter::C_DEV_LIST;
+    constexpr auto C_FORGET     = UartAdapter::C_FORGET;
 
     const TickType_t xWaitTime = pdMS_TO_TICKS(UART_POLL_MS);
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -513,21 +526,23 @@ void uartHandler(void *parameter)
             const bool hasDev = !root["dev"].isNull();
             if (hasDev)
             {
+                // Echo `dev` on every NACK so the host can roll back
+                // the per-slot CONNECTING animation against the right
+                // card instead of guessing from `req` alone.
                 const int requestedRaw = root["dev"].as<int>();
-                if (requestedRaw < 0)
+                if (requestedRaw < 0 || requestedRaw >= VERNIER_MAX_SLOTS)
                 {
-                    uart.sendAck(req, false, "dev out of range");
+                    log_w("C_CONNECT NACK: dev=%d out of range", requestedRaw);
+                    uart.sendAck(req, false, "dev out of range",
+                                 static_cast<int16_t>(requestedRaw));
                     break;
                 }
                 const uint8_t requested = (uint8_t)requestedRaw;
-                if (requested >= VERNIER_MAX_SLOTS)
-                {
-                    uart.sendAck(req, false, "dev out of range");
-                    break;
-                }
                 if (slots[requested].isReady() || slots[requested].isStreaming())
                 {
-                    uart.sendAck(req, false, "slot busy");
+                    log_w("C_CONNECT NACK: slot %u busy", (unsigned)requested);
+                    uart.sendAck(req, false, "slot busy",
+                                 static_cast<int16_t>(requested));
                     break;
                 }
                 target_slot = static_cast<int8_t>(requested);
@@ -567,7 +582,8 @@ void uartHandler(void *parameter)
             uint8_t dev = root["dev"] | (uint8_t)0;
             if (dev >= VERNIER_MAX_SLOTS)
             {
-                uart.sendAck(req, false, "dev out of range");
+                uart.sendAck(req, false, "dev out of range",
+                             static_cast<int16_t>(dev));
                 break;
             }
             slots[dev].disconnect();
@@ -585,7 +601,8 @@ void uartHandler(void *parameter)
             uint8_t dev = root["dev"] | (uint8_t)0;
             if (dev >= VERNIER_MAX_SLOTS)
             {
-                uart.sendAck(req, false, "dev out of range");
+                uart.sendAck(req, false, "dev out of range",
+                             static_cast<int16_t>(dev));
                 break;
             }
             if (!slotHasSavedDevice[dev]
@@ -605,7 +622,7 @@ void uartHandler(void *parameter)
             // Clear NVS deviceName{dev} so autoConnectDevice on next
             // boot skips this slot.
             {
-                char key[16];
+                char key[NVS_KEY_MAX_LEN];
                 snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)dev);
                 xSemaphoreTake(nvsMutex, portMAX_DELAY);
                 if (preferences.begin(NVS_NAMESPACE_SETTING, false))
@@ -637,7 +654,8 @@ void uartHandler(void *parameter)
             uint8_t dev = root["dev"] | (uint8_t)0;
             if (dev >= VERNIER_MAX_SLOTS)
             {
-                uart.sendAck(req, false, "dev out of range");
+                uart.sendAck(req, false, "dev out of range",
+                             static_cast<int16_t>(dev));
                 break;
             }
             // Accept the host's value in u32 first so a 90s/120s setting
@@ -648,16 +666,22 @@ void uartHandler(void *parameter)
                 period32 = VERNIER_DEFAULT_PERIOD_MS;
             if (period32 > MAX_PERIOD_MS)
             {
-                uart.sendAck(req, false, "period exceeds 16-bit range");
+                uart.sendAck(req, false, "period exceeds 16-bit range",
+                             static_cast<int16_t>(dev));
                 break;
             }
             uint16_t period = static_cast<uint16_t>(period32);
             slots[dev].setSamplingRate(period);
             uart.sendAck(req, true, "rate set", static_cast<int16_t>(dev));
 
-            // INFO: start auto-connect after gogo set sampling rate at boot
+            // INFO: start auto-connect after gogo set sampling rate at boot.
+            // Memory barrier so autoConnectDevice's reader sees a fully-
+            // populated slotHasSavedDevice[] before the trigger flips.
             if (foundSavedDevice)
+            {
+                __asm__ volatile("" ::: "memory");
                 startAutoConnect = true;
+            }
 
             break;
         }
@@ -751,7 +775,7 @@ void setup()
         // Per-slot load.
         for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
         {
-            char key[16];
+            char key[NVS_KEY_MAX_LEN];
             snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)i);
             String name = preferences.getString(key, VERNIER_DEFAULT_DEVICE_NAME);
             if (name != VERNIER_DEFAULT_DEVICE_NAME)
