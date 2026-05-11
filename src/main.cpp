@@ -9,6 +9,7 @@
 #include "main.h"
 
 #include "framed-msgpack-receiver.h"
+#include "slot-helpers.h"
 #include "uart-adapter.h"
 #include "vernier-adapter.h"
 
@@ -154,7 +155,7 @@ static void emitDevList();  // forward decl — defined below connectAndReport f
 //              the slot's NVS-saved name.
 static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST, bool force = false)
 {
-    if (slot >= VERNIER_MAX_SLOTS)
+    if (!slotInRange(slot))
     {
         if (req_seq != NO_HOST_REQUEST)
             uart.sendAck(req_seq, false, "slot out of range");
@@ -176,22 +177,7 @@ static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST, b
         uart.sendStatus(true, UartAdapter::CORE_STATE_READY); // global — no dev (per protocol-v2 spec)
         uart.sendDeviceInfo(dev.deviceName(), dev.orderCode(), dev.serialNumber(), slot);
         uart.sendDeviceStats(dev.batteryPercent(), dev.chargeState(), dev.rssi(), dev.droppedSamples(), slot);
-
-        uint32_t mask = dev.enabledChannelMask();
-        const char *names[gogo_vernier::MAX_CHANNELS];
-        const char *units[gogo_vernier::MAX_CHANNELS];
-        uint8_t count = 0;
-        for (uint8_t i = 0; i < gogo_vernier::MAX_CHANNELS; ++i)
-        {
-            if (mask & (1u << i))
-            {
-                names[count] = dev.sensorName(i);
-                units[count] = dev.sensorUnit(i);
-                ++count;
-            }
-        }
-        if (count > 0)
-            uart.sendDeviceFields(count, names, units, slot);
+        sendDeviceFieldsFor(uart, dev, slot);
 
         // Persist last connected device name to NVS under the per-slot
         // key (deviceName0..N). Read back at boot so each slot can
@@ -200,13 +186,10 @@ static bool connectAndReport(uint8_t slot, uint32_t req_seq = NO_HOST_REQUEST, b
             char key[NVS_KEY_MAX_LEN];
             snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)slot);
             log_d("NVS slot %u: saving %s = %s", (unsigned)slot, key, dev.deviceName());
-            xSemaphoreTake(nvsMutex, portMAX_DELAY);
-            if (preferences.begin(NVS_NAMESPACE_SETTING, false))
             {
-                preferences.putString(key, dev.deviceName());
-                preferences.end();
+                NvsScope nvs(nvsMutex, preferences, NVS_NAMESPACE_SETTING, false);
+                if (nvs) preferences.putString(key, dev.deviceName());
             }
-            xSemaphoreGive(nvsMutex);
             // Mark this slot as eligible for future auto-connect on
             // boot — even though we won't reach autoConnectDevice
             // again until the next reboot + C_SET_PERIOD trigger.
@@ -311,15 +294,7 @@ auto buttonHandler = []
             // scan. Same first-free allocation as C_CONNECT, plus
             // force=true so we probe nearby instead of re-using the
             // slot's saved name.
-            int8_t target_slot = -1;
-            for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
-            {
-                if (!slots[i].isReady() && !slots[i].isStreaming())
-                {
-                    target_slot = static_cast<int8_t>(i);
-                    break;
-                }
-            }
+            int8_t target_slot = firstFreeSlot();
             if (target_slot < 0)
             {
                 log_w("button: all slots full, ignoring connect press");
@@ -438,22 +413,7 @@ void vernierHandler(void *parameter)
             // mid-session.
             if (slotState[i].samplesSinceFields >= DEVFIELDS_REPUSH_EVERY)
             {
-                uint32_t mask = dev.enabledChannelMask();
-                const char *names[gogo_vernier::MAX_CHANNELS];
-                const char *units[gogo_vernier::MAX_CHANNELS];
-                uint8_t count = 0;
-                for (uint8_t k = 0; k < gogo_vernier::MAX_CHANNELS; ++k)
-                {
-                    if (mask & (1u << k))
-                    {
-                        names[count] = dev.sensorName(k);
-                        units[count] = dev.sensorUnit(k);
-                        ++count;
-                    }
-                }
-                if (count > 0)
-                    uart.sendDeviceFields(count, names, units, i);
-
+                sendDeviceFieldsFor(uart, dev, i);
                 slotState[i].samplesSinceFields = 0;
             }
         }
@@ -538,7 +498,7 @@ void uartHandler(void *parameter)
                     break;
                 }
                 const uint8_t requested = (uint8_t)requestedRaw;
-                if (slots[requested].isReady() || slots[requested].isStreaming())
+                if (isSlotOccupied(requested))
                 {
                     log_w("C_CONNECT NACK: slot %u busy", (unsigned)requested);
                     uart.sendAck(req, false, "slot busy",
@@ -549,14 +509,7 @@ void uartHandler(void *parameter)
             }
             else
             {
-                for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
-                {
-                    if (!slots[i].isReady() && !slots[i].isStreaming())
-                    {
-                        target_slot = static_cast<int8_t>(i);
-                        break;
-                    }
-                }
+                target_slot = firstFreeSlot();
             }
             if (target_slot < 0)
             {
@@ -580,7 +533,7 @@ void uartHandler(void *parameter)
             // v2 wire: `dev` selects which slot to disconnect. Absent
             // (v1 host) → default 0, identical to legacy behaviour.
             uint8_t dev = root["dev"] | (uint8_t)0;
-            if (dev >= VERNIER_MAX_SLOTS)
+            if (!slotInRange(dev))
             {
                 uart.sendAck(req, false, "dev out of range",
                              static_cast<int16_t>(dev));
@@ -599,15 +552,13 @@ void uartHandler(void *parameter)
             // slot's NVS deviceName key so it won't auto-reconnect on
             // next boot. Host's "Forget" action in Vernier > Settings.
             uint8_t dev = root["dev"] | (uint8_t)0;
-            if (dev >= VERNIER_MAX_SLOTS)
+            if (!slotInRange(dev))
             {
                 uart.sendAck(req, false, "dev out of range",
                              static_cast<int16_t>(dev));
                 break;
             }
-            if (!slotHasSavedDevice[dev]
-                && !slots[dev].isReady()
-                && !slots[dev].isStreaming())
+            if (!slotHasSavedDevice[dev] && !isSlotOccupied(dev))
             {
                 // No persistent state and no live link — Forget is a
                 // no-op. Reply ok so the host can still bounce the kid
@@ -624,13 +575,8 @@ void uartHandler(void *parameter)
             {
                 char key[NVS_KEY_MAX_LEN];
                 snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)dev);
-                xSemaphoreTake(nvsMutex, portMAX_DELAY);
-                if (preferences.begin(NVS_NAMESPACE_SETTING, false))
-                {
-                    preferences.remove(key);
-                    preferences.end();
-                }
-                xSemaphoreGive(nvsMutex);
+                NvsScope nvs(nvsMutex, preferences, NVS_NAMESPACE_SETTING, false);
+                if (nvs) preferences.remove(key);
             }
             slotHasSavedDevice[dev] = false;
             uart.sendAck(req, true, "forgotten", static_cast<int16_t>(dev));
@@ -652,7 +598,7 @@ void uartHandler(void *parameter)
             // to set — each slot keeps its own rate. Absent (v1 host)
             // → default 0.
             uint8_t dev = root["dev"] | (uint8_t)0;
-            if (dev >= VERNIER_MAX_SLOTS)
+            if (!slotInRange(dev))
             {
                 uart.sendAck(req, false, "dev out of range",
                              static_cast<int16_t>(dev));
@@ -750,47 +696,46 @@ void setup()
     // deviceName key — migrated to deviceName0 on first v2 boot,
     // legacy key left in place so a rollback to v1 firmware still
     // works against the same paired device.
-    xSemaphoreTake(nvsMutex, portMAX_DELAY);
-    if (!preferences.begin(NVS_NAMESPACE_SETTING, false)) // RW so we can migrate
     {
-        log_e("failed to open nvs (rw)");
-    }
-    else
-    {
-        // One-shot migration: if legacy "deviceName" exists but new
-        // "deviceName0" doesn't, copy across. Won't run again on
-        // subsequent boots because deviceName0 will then exist.
-        if (preferences.isKey(NVS_KEY_DEVICE_NAME)
-            && !preferences.isKey("deviceName0"))
+        NvsScope nvs(nvsMutex, preferences, NVS_NAMESPACE_SETTING, false); // RW so we can migrate
+        if (!nvs)
         {
-            String legacy = preferences.getString(NVS_KEY_DEVICE_NAME, "");
-            if (legacy.length() > 0 && legacy != VERNIER_DEFAULT_DEVICE_NAME)
+            log_e("failed to open nvs (rw)");
+        }
+        else
+        {
+            // One-shot migration: if legacy "deviceName" exists but new
+            // "deviceName0" doesn't, copy across. Won't run again on
+            // subsequent boots because deviceName0 will then exist.
+            if (preferences.isKey(NVS_KEY_DEVICE_NAME)
+                && !preferences.isKey("deviceName0"))
             {
-                preferences.putString("deviceName0", legacy.c_str());
-                log_i("NVS migration: %s -> deviceName0 (%s)",
-                      NVS_KEY_DEVICE_NAME, legacy.c_str());
+                String legacy = preferences.getString(NVS_KEY_DEVICE_NAME, "");
+                if (legacy.length() > 0 && legacy != VERNIER_DEFAULT_DEVICE_NAME)
+                {
+                    preferences.putString("deviceName0", legacy.c_str());
+                    log_i("NVS migration: %s -> deviceName0 (%s)",
+                          NVS_KEY_DEVICE_NAME, legacy.c_str());
+                }
+            }
+
+            // Per-slot load.
+            for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+            {
+                char key[NVS_KEY_MAX_LEN];
+                snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)i);
+                String name = preferences.getString(key, VERNIER_DEFAULT_DEVICE_NAME);
+                if (name != VERNIER_DEFAULT_DEVICE_NAME)
+                {
+                    log_i("Slot %u: loaded saved name from NVS: %s",
+                          (unsigned)i, name.c_str());
+                    slots[i].setOpenDevice(name.c_str());
+                    slotHasSavedDevice[i] = true;
+                    foundSavedDevice = true;
+                }
             }
         }
-
-        // Per-slot load.
-        for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
-        {
-            char key[NVS_KEY_MAX_LEN];
-            snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)i);
-            String name = preferences.getString(key, VERNIER_DEFAULT_DEVICE_NAME);
-            if (name != VERNIER_DEFAULT_DEVICE_NAME)
-            {
-                log_i("Slot %u: loaded saved name from NVS: %s",
-                      (unsigned)i, name.c_str());
-                slots[i].setOpenDevice(name.c_str());
-                slotHasSavedDevice[i] = true;
-                foundSavedDevice = true;
-            }
-        }
-
-        preferences.end();
     }
-    xSemaphoreGive(nvsMutex);
 
     xTaskCreate(
         uartHandler,
