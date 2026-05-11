@@ -148,6 +148,22 @@ struct SlotStreamState
     uint32_t samplesSinceFields = 0;
 };
 
+// Scale wake cadence to traffic:
+// - No slot ready → long idle sleep (button or host command wakes us).
+// - At least one ready but no samples this pass → quarter-period poll,
+//   bounded by [START_RETRY_MS, MAX_SAMPLE_WAIT_MS] so we still notice
+//   disconnects on long-period setups.
+// - Samples flowed this pass → tight loop, only START_RETRY_MS yield.
+static uint32_t nextSleepMs(bool anyReady, bool anySampled, uint32_t minActivePeriod)
+{
+    if (!anyReady)  return IDLE_SLEEP_MS;
+    if (anySampled) return START_RETRY_MS;
+    uint32_t s = minActivePeriod / 4u;
+    if (s < START_RETRY_MS)     s = START_RETRY_MS;
+    if (s > MAX_SAMPLE_WAIT_MS) s = MAX_SAMPLE_WAIT_MS;
+    return s;
+}
+
 void vernierHandler(void *parameter)
 {
     static float          sampleBuffer[gogo_vernier::MAX_CHANNELS];
@@ -230,27 +246,7 @@ void vernierHandler(void *parameter)
             }
         }
 
-        // Sleep policy: scale wake cadence to traffic.
-        // - No slot ready → long idle sleep (button or host command will wake us).
-        // - At least one ready but no samples this pass → quarter-period
-        //   poll (capped MAX_SAMPLE_WAIT_MS so we still respond to
-        //   disconnects on long-period setups).
-        // - Samples flowed → tight loop, only START_RETRY_MS yield.
-        if (!anyReady)
-        {
-            vTaskDelay(pdMS_TO_TICKS(IDLE_SLEEP_MS));
-        }
-        else if (!anySampled)
-        {
-            uint32_t sleep_ms = minActivePeriod / 4u;
-            if (sleep_ms < START_RETRY_MS) sleep_ms = START_RETRY_MS;
-            if (sleep_ms > MAX_SAMPLE_WAIT_MS) sleep_ms = MAX_SAMPLE_WAIT_MS;
-            vTaskDelay(pdMS_TO_TICKS(sleep_ms));
-        }
-        else
-        {
-            vTaskDelay(pdMS_TO_TICKS(START_RETRY_MS));
-        }
+        vTaskDelay(pdMS_TO_TICKS(nextSleepMs(anyReady, anySampled, minActivePeriod)));
     }
 };
 

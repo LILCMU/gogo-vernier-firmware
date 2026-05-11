@@ -11,11 +11,10 @@ enum ButtonEvent {
     BUTTON_LONG_PRESS,
 };
 
-// Firmware version reported in T_HELLO comes from -D FIRMWARE_*_VERSION
-// build flags in platformio.ini (matches the gogo-firmware pattern).
-// Keep in sync with the latest release tag.
-
-// NOTE: preference nvs keys
+// ---- NVS keys ----------------------------------------------------------
+// Firmware version values themselves are injected via -D FIRMWARE_*_VERSION
+// build flags in platformio.ini; nothing in this header needs to mirror
+// them.
 const constexpr char *NVS_NAMESPACE_SETTING = "vernierSetting";
 
 // Legacy single-slot key (v1 schema). Migrated into deviceName0 on
