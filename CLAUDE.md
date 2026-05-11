@@ -29,22 +29,35 @@ After every successful build, `platformio-scripts/combine-firmware.py` runs `esp
 
 ### Runtime layout
 
-`src/main.cpp` owns all globals and FreeRTOS setup. Two pinned-priority tasks plus `loop()`:
+The translation units are split by responsibility:
 
-- **`uartHandler` task** — owns a `FramedMsgPackReceiver` over `gogoSerial` (HardwareSerial(0), 115200). Polls frames and dispatches commands from the host MCU: `C_CONNECT=1`, `C_DISCONNECT=2`, `C_SET_PERIOD=3`. Connect flow lives in `connectAndReport()`.
-- **`vernierHandler` task** — drives the GDX device: `vernier.poll()` every tick, pushes fresh samples via `uart.sendSensorValuesTs(...)`, and every 50 samples re-emits `DEVSTATS` + `FIELDS` so the host stays in sync. If connected but not streaming, it restarts reading.
-- **`loop()`** — `autoConnectDevice()` (fires once after host sends `C_SET_PERIOD` if a saved device was loaded from NVS) and `buttonHandler()` (GPIO9 boot button: short press → scan & connect, long press ≥2s → disconnect).
+- `src/main.cpp` — globals (UART, NVS, `slots[]`, cross-task volatile flags), FreeRTOS task entrypoints, `setup()`, `loop()`, and `serial_log_vprintf`.
+- `src/control-loop.cpp` — host-protocol control flow: `connectAndReport`, `emitDevList`, `autoConnectDevice`, `buttonHandler`, the five `cmd*` per-command handlers, and the `dispatchHostCommand` entry point.
+- `src/slot-helpers.cpp` — `NvsScope` RAII, `firstFreeSlot` / `isSlotOccupied` / `slotInRange` predicates, `sendDeviceFieldsFor` marshaller.
+- `src/vernier-adapter.cpp` / `src/uart-adapter.cpp` — Vernier device facade and the wire-protocol codec.
 
-A single `nvsMutex` (`SemaphoreHandle_t`) guards all `Preferences` access — always take it before `preferences.begin()` and give it back after `preferences.end()`.
+Two pinned-priority FreeRTOS tasks plus `loop()`:
+
+- **`uartHandler` task** — owns a `FramedMsgPackReceiver` over `gogoSerial` (HardwareSerial(0), 115200). Polls frames and forwards each parsed root to `dispatchHostCommand(root)` in control-loop.cpp. Wire commands: `C_CONNECT=1`, `C_DISCONNECT=2`, `C_SET_PERIOD=3`, `C_DEV_LIST=4`, `C_FORGET=5` (single source of truth: `UartAdapter::CmdType`).
+- **`vernierHandler` task** — round-robins across `slots[]`. For each ready slot it drains the push-mode sample queue via `dev.waitForSample()` (depth-2 FreeRTOS queue fed from the NimBLE notify task), emits `T_SENS_VALUES`, refreshes battery/charge/RSSI on a 10 s wall-clock and pushes a change-based `T_DEVSTATS`, and every 50 samples re-emits `T_FIELDS` so the host can recover its field cache after a reboot. Sleep cadence is adaptive — see `nextSleepMs()`.
+- **`loop()`** — `autoConnectDevice()` (fires once after the host sends `C_SET_PERIOD`, walks `slotHasSavedDevice[]` and reconnects each marked slot) and `buttonHandler()` (GPIO9 boot button: short press → connect first-free slot via proximity scan, long press ≥2 s → disconnect every active slot).
+
+A single `nvsMutex` (`SemaphoreHandle_t`) guards all `Preferences` access. Use the `NvsScope` RAII guard in `include/slot-helpers.h` — take the mutex, open the namespace, release both on scope exit. Don't call `preferences.begin/end` directly.
 
 ### Host ↔ co-processor wire protocol
 
 Frame: `[uint16 big-endian length][MsgPack payload]`. Payloads are serialized from `ArduinoJson` `JsonDocument`s on both ends.
 
-- **Inbound** (`FramedMsgPackReceiver` in `include/framed-msgpack-receiver.h`): payloads must fit in the caller-provided buffer (512 B in `main.cpp`); oversize frames are skipped, not truncated. Handler receives `JsonVariantConst root`; the doc is cleared after dispatch. Command fields: `c` (u8 command), `seq` (u32 request id), plus command-specific args (e.g. `period_ms`).
-- **Outbound** (`UartAdapter` in `src/uart-adapter.cpp`, declared in `include/uart-adapter.h`): message types `T_STATUS=1, T_DEVINFO=2, T_DEVSTATS=3, T_FIELDS=4, T_SENS_VALUES=5, T_DEF_VALUE=6, T_ACK=7`. Every send uses the shared `_doc`; the helper writes the 2-byte BE length then the MsgPack body.
+- **Inbound** (`FramedMsgPackReceiver` in `include/framed-msgpack-receiver.h`): payloads must fit in the caller-provided buffer (512 B in `main.cpp`); oversize frames are skipped, not truncated. Handler receives `JsonVariantConst root`; the doc is cleared after dispatch. Common fields: `c` (u8 command), `seq` (u32 request id), `dev` (u8 slot id — optional on `C_CONNECT`, required on slot-scoped commands), plus command-specific args (e.g. `period_ms`).
+- **Outbound** (`UartAdapter` in `src/uart-adapter.cpp`, declared in `include/uart-adapter.h`): message types `T_STATUS=1, T_DEVINFO=2, T_DEVSTATS=3, T_FIELDS=4, T_SENS_VALUES=5, T_ACK=7, T_HELLO=8, T_DEV_LIST=9` (value 6 is retired — the old `T_DEF_VALUE` — do not reuse without a protocol bump). Every send uses the shared `_doc` guarded by `_send_mutex`; the helper writes the 2-byte BE length then the MsgPack body. Per-slot frames carry an optional `dev` field naming the slot.
+- **Protocol version**: `VERNIER_PROTOCOL_VERSION` (currently 2) is reported in `T_HELLO`. Bump on any breaking change to message layout. Non-breaking additions (new optional keys, new message types) do not require a bump.
 
-If you add a new command or msg type, update both the enum in `main.cpp`'s `uartHandler` (command IDs) and the `UartAdapter::MsgType` enum, and keep the numeric values stable — the host MCU relies on them.
+If you add a new wire command:
+1. Add the enum value to `UartAdapter::CmdType` in `include/uart-adapter.h`.
+2. Add a `cmd*` handler in `src/control-loop.cpp` and a case in `dispatchHostCommand`.
+3. Keep numeric values stable — the host MCU's command registry mirrors them.
+
+For a new outbound message type: add to `UartAdapter::MsgType`, add a `sendXxx()` method in `uart-adapter.h/.cpp`, document the frame layout next to the enum.
 
 ### Vernier layer
 
@@ -52,7 +65,11 @@ If you add a new command or msg type, update both the enum in `main.cpp`'s `uart
 
 ### Persistence
 
-NVS namespace `"vennierSetting"` (typo intentional — changing it orphans existing devices), key `"deviceName"`. Default value `"proximity"` means "open the first nearby device" in GDXLib. Written on every successful connect. At boot, if a non-default name is present, `foundSavedDevice = true` and auto-connect fires after the host sets the sampling period.
+NVS namespace `"vernierSetting"`. Keys are per-slot: `"deviceName0"`, `"deviceName1"`, ... — written by `connectAndReport` on every successful connect, cleared by `C_FORGET`. Default value `"proximity"` means "open the first nearby device" in GoGoVernier.
+
+The legacy v1 schema used a single un-suffixed `"deviceName"` key; a one-shot migration in `setup()` copies it into `"deviceName0"` on first v2 boot and leaves the legacy key in place so a v1 firmware rollback still works against the same paired device.
+
+At boot, each slot whose NVS key holds a non-default name is flagged via `slotHasSavedDevice[slot] = true` (and the global `foundSavedDevice` for the fast-path early-out). Auto-connect fires from `autoConnectDevice()` in `loop()` once the host sends its first `C_SET_PERIOD` — sequential per slot since each handshake monopolises the BLE controller.
 
 ### Build flags that matter
 
@@ -72,7 +89,7 @@ The platform is pinned to `pioarduino/platform-espressif32#develop`, not the ups
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **gogo-vernier-firmware** (559 symbols, 874 relationships, 8 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **gogo-vernier-firmware** (643 symbols, 1066 relationships, 25 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
