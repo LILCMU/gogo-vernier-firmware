@@ -442,17 +442,171 @@ void vernierHandler(void *parameter)
     }
 };
 
+// ---- per-command handlers ----------------------------------------------
+// Each handler takes the parsed MsgPack root and the host's request seq
+// and is responsible for emitting its own ack and any follow-up events.
+// Returning early on a NACK is fine — the dispatcher does no work after
+// the handler returns.
+
+static void cmdConnect(JsonVariantConst root, uint32_t req)
+{
+    // Slot allocation:
+    //   - If host specifies `dev` (kid pressed an empty slot card on
+    //     the multi-device main view), target THAT slot so the UI's
+    //     CONNECTING animation lines up with the slot the kid pressed.
+    //   - Otherwise (legacy host, auto-detect path) fall back to
+    //     first-free per design D2.
+    // MsgPack picks any integer width for "dev" depending on the value
+    // (0..127 → int8, 128..255 → uint8, etc.). Check presence via
+    // !isNull() — a typed is<uint8_t>() would miss alternative widths.
+    int8_t target_slot = -1;
+    const bool hasDev = !root["dev"].isNull();
+    if (hasDev)
+    {
+        // Echo `dev` on every NACK so the host can roll back the
+        // per-slot CONNECTING animation against the right card instead
+        // of guessing from `req` alone.
+        const int requestedRaw = root["dev"].as<int>();
+        if (!slotInRange(requestedRaw))
+        {
+            log_w("C_CONNECT NACK: dev=%d out of range", requestedRaw);
+            uart.sendAck(req, false, "dev out of range",
+                         static_cast<int16_t>(requestedRaw));
+            return;
+        }
+        const uint8_t requested = static_cast<uint8_t>(requestedRaw);
+        if (isSlotOccupied(requested))
+        {
+            log_w("C_CONNECT NACK: slot %u busy", (unsigned)requested);
+            uart.sendAck(req, false, "slot busy",
+                         static_cast<int16_t>(requested));
+            return;
+        }
+        target_slot = static_cast<int8_t>(requested);
+    }
+    else
+    {
+        target_slot = firstFreeSlot();
+    }
+    if (target_slot < 0)
+    {
+        // Per design D9: respond with ok=false + diagnostic msg.
+        // Host UI surfaces this to the user.
+        uart.sendAck(req, false, "all slots full");
+        return;
+    }
+    // force=true: probe nearby for a NEW pairing rather than re-attempting
+    // the slot's saved name. Host C_CONNECT semantics = "connect to
+    // whatever's around", matching pre-Phase-4 behaviour.
+    log_i("C_CONNECT: target slot=%u (%s)",
+          (unsigned)target_slot,
+          hasDev ? "host-specified" : "first-free");
+    connectAndReport(static_cast<uint8_t>(target_slot), req, /*force=*/true);
+}
+
+static void cmdDisconnect(JsonVariantConst root, uint32_t req)
+{
+    // v2 wire: `dev` selects which slot to disconnect. Absent (v1
+    // host) → default 0, identical to legacy behaviour.
+    uint8_t dev = root["dev"] | (uint8_t)0;
+    if (!slotInRange(dev))
+    {
+        uart.sendAck(req, false, "dev out of range",
+                     static_cast<int16_t>(dev));
+        return;
+    }
+    slots[dev].disconnect();
+    uart.sendAck(req, true, "disconnected", static_cast<int16_t>(dev));
+    // D4: T_DEV_LIST after disconnect so host's slot table reflects
+    // the slot becoming free.
+    emitDevList();
+}
+
+static void cmdForget(JsonVariantConst root, uint32_t req)
+{
+    // Phase 4 step 4b.4.7 — drop the BLE link AND clear the slot's NVS
+    // deviceName key so it won't auto-reconnect on next boot. Host's
+    // "Forget" action in Vernier > Settings.
+    uint8_t dev = root["dev"] | (uint8_t)0;
+    if (!slotInRange(dev))
+    {
+        uart.sendAck(req, false, "dev out of range",
+                     static_cast<int16_t>(dev));
+        return;
+    }
+    if (!slotHasSavedDevice[dev] && !isSlotOccupied(dev))
+    {
+        // No persistent state and no live link — Forget is a no-op.
+        // Reply ok so the host can still bounce the kid back to the
+        // main view, but skip the NVS write entirely.
+        uart.sendAck(req, true, "already empty", static_cast<int16_t>(dev));
+        emitDevList();
+        return;
+    }
+    // Disconnect first so the device's BLE link drops cleanly. Safe to
+    // call when already disconnected (no-op).
+    slots[dev].disconnect();
+    // Clear NVS deviceName{dev} so autoConnectDevice on next boot skips
+    // this slot.
+    {
+        char key[NVS_KEY_MAX_LEN];
+        snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)dev);
+        NvsScope nvs(nvsMutex, preferences, NVS_NAMESPACE_SETTING, false);
+        if (nvs) preferences.remove(key);
+    }
+    slotHasSavedDevice[dev] = false;
+    uart.sendAck(req, true, "forgotten", static_cast<int16_t>(dev));
+    emitDevList();
+}
+
+static void cmdDevList(JsonVariantConst /*root*/, uint32_t req)
+{
+    // D4: explicit host-side query for the slot table. Always ack'd
+    // BEFORE the T_DEV_LIST push so seq ordering on the wire matches
+    // the host's request → ack → push expectation.
+    uart.sendAck(req, true, "dev list");
+    emitDevList();
+}
+
+static void cmdSetPeriod(JsonVariantConst root, uint32_t req)
+{
+    // v2 wire (per D5 A): `dev` selects which slot's period to set —
+    // each slot keeps its own rate. Absent (v1 host) → default 0.
+    uint8_t dev = root["dev"] | (uint8_t)0;
+    if (!slotInRange(dev))
+    {
+        uart.sendAck(req, false, "dev out of range",
+                     static_cast<int16_t>(dev));
+        return;
+    }
+    // Accept the host's value in u32 first so a 90s/120s setting
+    // (mentioned as a use case in CLAUDE.md's adaptive-tick comment)
+    // doesn't get silently mod-2^16-truncated at the JSON cast.
+    uint32_t period32 = root["period_ms"] | (uint32_t)slots[dev].samplingPeriod();
+    if (period32 == 0)
+        period32 = VERNIER_DEFAULT_PERIOD_MS;
+    if (period32 > MAX_PERIOD_MS)
+    {
+        uart.sendAck(req, false, "period exceeds 16-bit range",
+                     static_cast<int16_t>(dev));
+        return;
+    }
+    uint16_t period = static_cast<uint16_t>(period32);
+    slots[dev].setSamplingRate(period);
+    uart.sendAck(req, true, "rate set", static_cast<int16_t>(dev));
+
+    // INFO: start auto-connect after gogo set sampling rate at boot.
+    // Memory barrier so autoConnectDevice's reader sees a fully-
+    // populated slotHasSavedDevice[] before the trigger flips.
+    if (foundSavedDevice)
+    {
+        __asm__ volatile("" ::: "memory");
+        startAutoConnect = true;
+    }
+}
+
 void uartHandler(void *parameter)
 {
-    // Command codes are owned by UartAdapter::CmdType (single source
-    // of truth for the wire protocol). Pull short aliases into local
-    // scope so the dispatch case labels stay readable.
-    constexpr auto C_CONNECT    = UartAdapter::C_CONNECT;
-    constexpr auto C_DISCONNECT = UartAdapter::C_DISCONNECT;
-    constexpr auto C_SET_PERIOD = UartAdapter::C_SET_PERIOD;
-    constexpr auto C_DEV_LIST   = UartAdapter::C_DEV_LIST;
-    constexpr auto C_FORGET     = UartAdapter::C_FORGET;
-
     const TickType_t xWaitTime = pdMS_TO_TICKS(UART_POLL_MS);
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
@@ -461,179 +615,17 @@ void uartHandler(void *parameter)
 
     auto onCommand = [](JsonVariantConst root, void *)
     {
-        uint8_t c = root["c"] | 0;
-        uint32_t req = root["seq"] | 0;
+        const uint8_t  c   = root["c"]   | 0;
+        const uint32_t req = root["seq"] | 0;
 
         switch (c)
         {
-        case C_CONNECT:
-        {
-            // Slot allocation:
-            //   - If host specifies `dev` (kid pressed an empty slot
-            //     card on the multi-device main view), target THAT
-            //     slot so the UI's CONNECTING animation lines up with
-            //     the slot the kid actually pressed.
-            //   - Otherwise (legacy host, auto-detect path) fall back
-            //     to first-free per design D2.
-            // "Occupied" = ready (handshake done) OR streaming (in
-            // transition); isReady() catches the steady state and
-            // isStreaming() guards the brief mid-handshake window.
-            int8_t target_slot = -1;
-            // MsgPack codec can pick any integer width for "dev"
-            // depending on the value (0..127 → int8, 128..255 → uint8,
-            // etc.). Check presence via !isNull() instead of a typed
-            // is<uint8_t>() which would miss alternative widths.
-            const bool hasDev = !root["dev"].isNull();
-            if (hasDev)
-            {
-                // Echo `dev` on every NACK so the host can roll back
-                // the per-slot CONNECTING animation against the right
-                // card instead of guessing from `req` alone.
-                const int requestedRaw = root["dev"].as<int>();
-                if (requestedRaw < 0 || requestedRaw >= VERNIER_MAX_SLOTS)
-                {
-                    log_w("C_CONNECT NACK: dev=%d out of range", requestedRaw);
-                    uart.sendAck(req, false, "dev out of range",
-                                 static_cast<int16_t>(requestedRaw));
-                    break;
-                }
-                const uint8_t requested = (uint8_t)requestedRaw;
-                if (isSlotOccupied(requested))
-                {
-                    log_w("C_CONNECT NACK: slot %u busy", (unsigned)requested);
-                    uart.sendAck(req, false, "slot busy",
-                                 static_cast<int16_t>(requested));
-                    break;
-                }
-                target_slot = static_cast<int8_t>(requested);
-            }
-            else
-            {
-                target_slot = firstFreeSlot();
-            }
-            if (target_slot < 0)
-            {
-                // Per design D9: respond with ok=false + diagnostic
-                // msg. Host UI surfaces this to the user.
-                uart.sendAck(req, false, "all slots full");
-                break;
-            }
-            // force=true: probe nearby for a NEW pairing rather than
-            // re-attempting the slot's saved name. Host C_CONNECT
-            // semantics = "connect to whatever's around", matching
-            // pre-Phase-4 behaviour.
-            log_i("C_CONNECT: target slot=%u (%s)",
-                  (unsigned)target_slot,
-                  hasDev ? "host-specified" : "first-free");
-            connectAndReport(static_cast<uint8_t>(target_slot), req, /*force=*/true);
-            break;
-        }
-        case C_DISCONNECT:
-        {
-            // v2 wire: `dev` selects which slot to disconnect. Absent
-            // (v1 host) → default 0, identical to legacy behaviour.
-            uint8_t dev = root["dev"] | (uint8_t)0;
-            if (!slotInRange(dev))
-            {
-                uart.sendAck(req, false, "dev out of range",
-                             static_cast<int16_t>(dev));
-                break;
-            }
-            slots[dev].disconnect();
-            uart.sendAck(req, true, "disconnected", static_cast<int16_t>(dev));
-            // D4: T_DEV_LIST after disconnect so host's slot table
-            // reflects the slot becoming free.
-            emitDevList();
-            break;
-        }
-        case C_FORGET:
-        {
-            // Phase 4 step 4b.4.7 — drop the BLE link AND clear the
-            // slot's NVS deviceName key so it won't auto-reconnect on
-            // next boot. Host's "Forget" action in Vernier > Settings.
-            uint8_t dev = root["dev"] | (uint8_t)0;
-            if (!slotInRange(dev))
-            {
-                uart.sendAck(req, false, "dev out of range",
-                             static_cast<int16_t>(dev));
-                break;
-            }
-            if (!slotHasSavedDevice[dev] && !isSlotOccupied(dev))
-            {
-                // No persistent state and no live link — Forget is a
-                // no-op. Reply ok so the host can still bounce the kid
-                // back to the main view, but skip the NVS write entirely.
-                uart.sendAck(req, true, "already empty", static_cast<int16_t>(dev));
-                emitDevList();
-                break;
-            }
-            // Disconnect first so the device's BLE link drops cleanly.
-            // Safe to call when already disconnected (no-op).
-            slots[dev].disconnect();
-            // Clear NVS deviceName{dev} so autoConnectDevice on next
-            // boot skips this slot.
-            {
-                char key[NVS_KEY_MAX_LEN];
-                snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)dev);
-                NvsScope nvs(nvsMutex, preferences, NVS_NAMESPACE_SETTING, false);
-                if (nvs) preferences.remove(key);
-            }
-            slotHasSavedDevice[dev] = false;
-            uart.sendAck(req, true, "forgotten", static_cast<int16_t>(dev));
-            emitDevList();
-            break;
-        }
-        case C_DEV_LIST:
-        {
-            // D4: explicit host-side query for the slot table. Always
-            // ack'd before the T_DEV_LIST push so seq ordering on the
-            // wire matches the host's request → ack → push expectation.
-            uart.sendAck(req, true, "dev list");
-            emitDevList();
-            break;
-        }
-        case C_SET_PERIOD:
-        {
-            // v2 wire (per D5 A): `dev` selects which slot's period
-            // to set — each slot keeps its own rate. Absent (v1 host)
-            // → default 0.
-            uint8_t dev = root["dev"] | (uint8_t)0;
-            if (!slotInRange(dev))
-            {
-                uart.sendAck(req, false, "dev out of range",
-                             static_cast<int16_t>(dev));
-                break;
-            }
-            // Accept the host's value in u32 first so a 90s/120s setting
-            // (mentioned as a use case in CLAUDE.md's adaptive-tick comment)
-            // doesn't get silently mod-2^16-truncated at the JSON cast.
-            uint32_t period32 = root["period_ms"] | (uint32_t)slots[dev].samplingPeriod();
-            if (period32 == 0)
-                period32 = VERNIER_DEFAULT_PERIOD_MS;
-            if (period32 > MAX_PERIOD_MS)
-            {
-                uart.sendAck(req, false, "period exceeds 16-bit range",
-                             static_cast<int16_t>(dev));
-                break;
-            }
-            uint16_t period = static_cast<uint16_t>(period32);
-            slots[dev].setSamplingRate(period);
-            uart.sendAck(req, true, "rate set", static_cast<int16_t>(dev));
-
-            // INFO: start auto-connect after gogo set sampling rate at boot.
-            // Memory barrier so autoConnectDevice's reader sees a fully-
-            // populated slotHasSavedDevice[] before the trigger flips.
-            if (foundSavedDevice)
-            {
-                __asm__ volatile("" ::: "memory");
-                startAutoConnect = true;
-            }
-
-            break;
-        }
-        default:
-            uart.sendAck(req, false, "unknown command");
-            break;
+        case UartAdapter::C_CONNECT:    cmdConnect(root, req);    break;
+        case UartAdapter::C_DISCONNECT: cmdDisconnect(root, req); break;
+        case UartAdapter::C_FORGET:     cmdForget(root, req);     break;
+        case UartAdapter::C_DEV_LIST:   cmdDevList(root, req);    break;
+        case UartAdapter::C_SET_PERIOD: cmdSetPeriod(root, req);  break;
+        default:                        uart.sendAck(req, false, "unknown command"); break;
         }
     };
 
@@ -642,7 +634,6 @@ void uartHandler(void *parameter)
     for (;;)
     {
         vTaskDelayUntil(&xLastWakeTime, xWaitTime);
-
         cmdRx.poll();
     }
 };
