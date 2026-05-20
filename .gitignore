@@ -6,5 +6,4 @@
 dist
 compile_commands.json
 .claude/tmp/
-.gitnexus
 /.omc
