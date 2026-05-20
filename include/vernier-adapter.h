@@ -18,8 +18,8 @@ constexpr uint16_t VERNIER_DEFAULT_PERIOD_MS = 1000;
 constexpr UBaseType_t VERNIER_SAMPLE_QUEUE_DEPTH = 2;
 
 // Thin facade over gogo_vernier::GoGoVernier that preserves the call-site
-// shape main.cpp already uses. Owns one device session today; the multi-
-// device upgrade lives in Phase 4 (see .claude/plans/gdxlib-rewrite.md).
+// shape the firmware uses. One adapter per slot; slots[] in main.cpp
+// holds VERNIER_MAX_SLOTS of them.
 class VernierAdapter
 {
 public:
@@ -63,18 +63,18 @@ public:
 
     const char *sensorName(byte selectedSensor = 255)
     {
-        const auto *c = _gv.channel(selectedSensor < 32 ? selectedSensor : 0);
+        const auto *c = _gv.channel(selectedSensor < gogo_vernier::MAX_CHANNELS ? selectedSensor : 0);
         return c ? c->description : "";
     }
     const char *sensorUnit(byte selectedSensor = 255)
     {
-        const auto *c = _gv.channel(selectedSensor < 32 ? selectedSensor : 0);
+        const auto *c = _gv.channel(selectedSensor < gogo_vernier::MAX_CHANNELS ? selectedSensor : 0);
         return c ? c->units : "";
     }
     float defaultMeasurement() { return _gv.measurement(0); }
     float readMeasurement(byte selectedSensor = 255)
     {
-        return _gv.measurement(selectedSensor < 32 ? selectedSensor : 0);
+        return _gv.measurement(selectedSensor < gogo_vernier::MAX_CHANNELS ? selectedSensor : 0);
     }
 
     // Sample buffer interface — delegates to GoGoVernier. Polling

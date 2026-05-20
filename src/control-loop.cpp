@@ -311,9 +311,9 @@ static void cmdDisconnect(JsonVariantConst root, uint32_t req)
 
 static void cmdForget(JsonVariantConst root, uint32_t req)
 {
-    // Phase 4 step 4b.4.7 — drop the BLE link AND clear the slot's NVS
-    // deviceName key so it won't auto-reconnect on next boot. Host's
-    // "Forget" action in Vernier > Settings.
+    // Drop the BLE link AND clear the slot's NVS deviceName key so the
+    // slot won't auto-reconnect on next boot. Host's "Forget" action in
+    // Vernier > Settings.
     uint8_t dev = root["dev"] | (uint8_t)0;
     if (!slotInRange(dev))
     {

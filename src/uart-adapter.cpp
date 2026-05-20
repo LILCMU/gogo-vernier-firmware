@@ -1,12 +1,5 @@
 #include "uart-adapter.h"
 
-namespace {
-// Length-prefix is uint16_t big-endian. Cap on payload size + size of
-// the prefix itself so callers can read either constant by name.
-constexpr size_t  MAX_FRAME_PAYLOAD = 0xFFFF;
-constexpr uint8_t FRAME_PREFIX_SIZE = 2;
-}  // namespace
-
 UartAdapter::UartAdapter(Print &out)
     : _out(out)
 {

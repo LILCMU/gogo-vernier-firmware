@@ -100,15 +100,10 @@ constexpr uint32_t DEVFIELDS_REPUSH_EVERY   = 50;
 Preferences preferences;
 
 HardwareSerial gogoSerial(0);
-// #undef Serial
-// #define Serial gogoSerial
 
-// Phase 4 step 3.1: introduce per-slot adapters. Keeping `vernier` as
-// a reference to slots[0] preserves the existing single-slot code
-// paths verbatim while we migrate uartHandler / connectAndReport /
-// vernierHandler to be slot-aware in the following sub-commits
-// (3.2 .. 3.5). Slots 1..N exist but stay idle until 3.4 lands the
-// first-free slot allocator.
+// `vernier` aliases slots[0] for the debug per-channel value dump in
+// loop() — it's the only caller that still wants the "first slot" as
+// a singleton handle. All other paths iterate slots[] explicitly.
 VernierAdapter slots[VERNIER_MAX_SLOTS];
 VernierAdapter &vernier = slots[0];
 UartAdapter uart(gogoSerial);
@@ -394,14 +389,11 @@ void loop()
     if (vernier.isStreaming() && (millis() - startDebugTime) > vernier.samplingPeriod())
     {
         uint32_t availableMask = vernier.enabledChannelMask();
-        for (uint32_t i = 0; i < 32; i++)
+        for (uint32_t i = 0; i < gogo_vernier::MAX_CHANNELS; i++)
         {
-            if (availableMask & (1 << i))
+            if (availableMask & (1u << i))
             {
                 log_i("%s: %f %s", vernier.sensorName(i), vernier.readMeasurement(i), vernier.sensorUnit(i));
-
-                // const char *unit = vernier.sensorUnit().c_str();
-                // log_i("%s: %f %s", name, vernier.readMeasurement(i), unit);
             }
         }
         log_i("");

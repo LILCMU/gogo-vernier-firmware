@@ -7,19 +7,28 @@
 
 // Length-prefixed MsgPack framing: [uint16_be length][MsgPack payload]
 //
+// Frame layout:
+//   byte 0..1  uint16_t length (big-endian)  — payload byte count,
+//              0..MAX_FRAME_PAYLOAD inclusive. 0 = empty frame, ignored.
+//   byte 2..N  MsgPack-encoded payload, exactly `length` bytes.
+//
 // Protocol version — bump on any breaking change to message layout
 // (field removal, type change, message-type reuse). Host compares this
 // against its own compiled-in constant on every T_HELLO and warns on
 // mismatch. Non-breaking additions (new optional keys, new message
 // types) do NOT require a bump.
 //
-// v2 (Phase 4 step 2): per-device frames (T_DEVINFO, T_DEVSTATS,
-// T_FIELDS, T_SENS_VALUES) gain optional `dev` (u8) field naming
-// the slot the frame belongs to. Absent → treat as 0 (back-compat
-// with v1 firmware on either side). T_HELLO gains `max_slots`
-// reporting compile-time slot capacity. New T_DEV_LIST (msg 9)
-// enumerates occupied slots. See .claude/plans/multi-device-design.md.
-constexpr uint8_t VERNIER_PROTOCOL_VERSION = 2;
+// v2: per-device frames (T_DEVINFO, T_DEVSTATS, T_FIELDS, T_SENS_VALUES)
+// gain optional `dev` (u8) field naming the slot the frame belongs to.
+// Absent → treat as 0 (back-compat with v1 firmware on either side).
+// T_HELLO gains `max_slots` reporting compile-time slot capacity. New
+// T_DEV_LIST (msg 9) enumerates occupied slots.
+constexpr uint8_t  VERNIER_PROTOCOL_VERSION = 2;
+
+// Wire-protocol framing constants. Single source of truth for both the
+// receiver (framed-msgpack-receiver.h) and the sender (uart-adapter.cpp).
+constexpr uint8_t  FRAME_PREFIX_SIZE  = 2;       // bytes of big-endian length header
+constexpr size_t   MAX_FRAME_PAYLOAD  = 0xFFFF;  // cap dictated by uint16_t length prefix
 
 // Compile-time cap on concurrent BLE peers per vernier MCU. Bounded
 // by CONFIG_NIMBLE_MAX_CONNECTIONS in the bundled NimBLE host (default
