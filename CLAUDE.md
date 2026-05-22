@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-ESP32-C3 firmware (PlatformIO + Arduino framework) that runs as a **co-processor** for GoGo Board 7. It bridges Vernier Go Direct BLE sensors (via `GDXLib` over `ArduinoBLE`) to the host GoGo MCU through a length-prefixed MsgPack protocol on UART0.
+ESP32-C3 firmware (PlatformIO + Arduino framework) that runs as a **co-processor** for GoGo Board 7. It bridges Vernier Go Direct (D2PIO) BLE sensors — through the in-tree `lib/GoGoVernier` driver over `h2zero/NimBLE-Arduino` — to the host GoGo MCU via a length-prefixed MsgPack protocol on UART0.
 
 Target board: `esp32-c3-devkitm-1`. C++17 (`-std=gnu++17`). USB CDC-on-boot is enabled.
 
@@ -61,7 +61,9 @@ For a new outbound message type: add to `UartAdapter::MsgType`, add a `sendXxx()
 
 ### Vernier layer
 
-`VernierAdapter` (`include/vernier-adapter.h`, `src/vernier-adapter.cpp`) wraps `GDXLib`. It caches device identity, battery/charge/rssi, and per-channel name/unit behind its own accessors (so `main.cpp` never calls `GDXLib` directly for that metadata). `enabledChannelMask()` is a 32-bit mask; iterate bits 0..31 to walk active channels. `copySample(out, count)` is the single-producer/single-consumer handoff from the GDX poll into the UART sender — it drains `_sample_ready` once per frame.
+`VernierAdapter` (`include/vernier-adapter.h`, `src/vernier-adapter.cpp`) wraps `gogo_vernier::GoGoVernier` (in-tree at `lib/GoGoVernier/`). It caches device identity, battery/charge/rssi, and per-channel name/unit behind its own accessors (so `main.cpp` never calls into the driver directly for that metadata). `enabledChannelMask()` is a 32-bit mask; iterate bits 0..31 to walk active channels. The sample handoff is push-style — `_gv.onSample(cb)` fires on the NimBLE notify task and the callback enqueues into a depth-2 FreeRTOS queue that the `vernierHandler` task drains via `dev.waitForSample()`.
+
+The driver itself lives in `lib/GoGoVernier/` (BSD-3, ported from `VernierST/godirect-py` + `Vernier-Science-Education/GDXLib`). See `lib/GoGoVernier/README.md` for the public API and `lib/GoGoVernier/src/D2PIOProtocol.h` for the wire-protocol constants. Protocol details (opcodes, frame envelope, GET_STATUS layout) are in `.claude/specs/d2pio-protocol.md` and `.claude/knowledges/vernier-mcu-internals.md`.
 
 ### Persistence
 
@@ -79,9 +81,27 @@ At boot, each slot whose NVS key holds a non-default name is flagged via `slotHa
 
 ## Dependencies
 
-Pulled via `lib_deps` in `platformio.ini`:
+Declared in `platformio.ini` `lib_deps`:
 - `bblanchon/ArduinoJson@^7` — MsgPack codec.
-- `https://github.com/MomePP/GDXLib#develop` — forked Vernier Go Direct driver.
-- `https://github.com/MomePP/ArduinoBLE` — forked BLE stack required by the GDXLib fork.
+
+The Vernier driver lives in-tree at `lib/GoGoVernier/`. Its own `library.json` pulls in `h2zero/NimBLE-Arduino@^2.0.0` transitively, so PlatformIO sees it on every build without an explicit entry. The previous external `MomePP/GDXLib` + `MomePP/ArduinoBLE` pair has been removed — `gogo_vernier::GoGoVernier` replaces both.
 
 The platform is pinned to `pioarduino/platform-espressif32#develop`, not the upstream Espressif platform.
+
+## Code Quality Rules
+
+These rules apply to **all** code changes in this repo, including the in-tree `lib/GoGoVernier/` driver. Follow them without exception:
+
+- **No magic numbers.** Every literal used for sizing, offsets, thresholds, timeouts, or configuration must be a named constant (`constexpr` or `#define`) in the appropriate header. If a value appears in logic, give it a name. Local-only file-scope `constexpr` in an anonymous namespace is acceptable for values that genuinely have no consumer outside the TU — but layout/protocol/wire constants always go in a header.
+- **Document packet/protocol formats.** When adding or modifying a wire frame, update the registry comment block beside the relevant enum and describe the byte layout next to the constant:
+  - Host ↔ co-processor frames: `UartAdapter::MsgType` / `UartAdapter::CmdType` in `include/uart-adapter.h`.
+  - D2PIO frames over BLE: `CmdId` / `MeasurementType` / `RESPONSE_*` in `lib/GoGoVernier/src/D2PIOProtocol.h`.
+  - Numeric values are part of the wire contract — never renumber. Add new entries at the end of the enum, and bump `VERNIER_PROTOCOL_VERSION` (or the D2PIO equivalent) only on breaking changes.
+- **Keep headers as the single source of truth.** Buffer sizes, frame offsets, sub-command selector bytes, timing values, and threshold constants live in `.h` files — never hard-coded inline in `.cpp` files. Each constant should have a one-line comment explaining the *unit* and *why* the value was chosen.
+- **Cross-task shared state.** When a variable is written by one FreeRTOS task and read by another:
+  - Mark it `volatile` to prevent the compiler hoisting the read out of the polling loop.
+  - Fill data buffers BEFORE setting the flag the reader polls.
+  - Insert a compiler barrier (`__asm__ volatile("" ::: "memory")`) between the buffer writes and the flag store. ESP32-C3 is single-core RISC-V — the Xtensa `memw` fence is not needed (and would not assemble); the compiler barrier alone is sufficient.
+  - For higher-level handoffs (FreeRTOS queues, semaphores, mutexes), the kernel primitive already covers ordering — no extra barrier required.
+- **Clean up before committing.** Remove unused constants, dead code, and stale comments (especially phase / refactor commentary that refers to code that no longer exists). Rename identifiers when their purpose changes. `pio check -e check_medium_or_high_defects` should stay clean.
+- **Update knowledge before committing.** When adding or changing features, update the relevant `.claude/knowledges/` file BEFORE creating the commit. If no knowledge file exists for the topic, create one. Include: what changed, why, protocol details, opcode numbers, and any backward-compatibility notes. Also verify that existing knowledge files touched by the change are still accurate — fix stale descriptions, outdated constants, wrong file paths, or incorrect API names. Knowledge must always reflect the committed code.
