@@ -33,6 +33,27 @@ constexpr UBaseType_t VERNIER_SAMPLE_QUEUE_DEPTH = 2;
 class VernierAdapter
 {
 public:
+    // Per-slot connection lifecycle. Drives the bleWorker state
+    // machine that will land in release-2.1.0 (.claude/plans/
+    // release-2.1.0.md §Design). Today the field is additive only
+    // — no caller writes it yet. The cutover (G007) will:
+    //   - cmdConnect / button / autoConnect → setState(REQUESTED)
+    //   - bleWorker on dequeue → setState(CONNECTING)
+    //   - publishConnectResult(ok=true)  → setState(READY)
+    //   - publishConnectResult(ok=false) → setState(FAILED) then IDLE
+    //   - disconnect()                   → setState(IDLE)
+    // Numeric values are part of the wire contract once §Protocol
+    // exposes `state` as an optional T_DEV_LIST field (G008), so
+    // don't renumber — append new entries at the end.
+    enum class ConnState : uint8_t
+    {
+        IDLE       = 0,
+        REQUESTED  = 1,
+        CONNECTING = 2,
+        READY      = 3,
+        FAILED     = 4,
+    };
+
     VernierAdapter();
     ~VernierAdapter();
 
@@ -51,8 +72,21 @@ public:
     // — not isConnected() — anywhere a caller needs to know "the device
     // is ready to start streaming". isConnected() flips at BLE link-up,
     // before the channel mask is populated.
+    //
+    // Will switch to `state() == ConnState::READY` after the bleWorker
+    // cutover (G007) puts the adapter in charge of the lifecycle. For
+    // now it still reads through to the GDX driver so callers behave
+    // identically to pre-G004.
     bool isReady() const { return _gv.isReady(); }
     bool isStreaming() const { return _gv.isStreaming(); }
+
+    // Connection-lifecycle accessors. No-op for current callers (no
+    // one writes _conn_state yet); plumbed for bleWorker / cmdConnect
+    // in G006 / G007. memory_order_relaxed because transitions are
+    // independent scalar publishes — readers don't depend on any
+    // other write happening-before this one.
+    ConnState state() const { return _conn_state.load(std::memory_order_relaxed); }
+    void setState(ConnState s) { _conn_state.store(s, std::memory_order_relaxed); }
     uint16_t samplingPeriod() const { return _period_ms.load(std::memory_order_relaxed); }
 
     // Total dropped sample count: GoGoVernier's internal "previous
@@ -131,4 +165,12 @@ private:
     // pattern that side-stepped C++20's -Wdeprecated-volatile on the
     // compound ++. Same single-core RV32 free-load characteristics.
     std::atomic<uint32_t> _push_dropped{0};
+
+    // Cross-task connection lifecycle. Writer set will be cmdConnect /
+    // bleWorker / disconnect() once the bleWorker cutover (G006/G007)
+    // lands. Reader set will be the host-protocol layer that emits
+    // T_DEV_LIST entries (G008) and any cancel / busy guards in
+    // cmdConnect. memory_order_relaxed because transitions don't carry
+    // ordering w.r.t. other adapter state.
+    std::atomic<ConnState> _conn_state{ConnState::IDLE};
 };
