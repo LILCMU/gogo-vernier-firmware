@@ -82,13 +82,39 @@ public:
     bool isReady() const { return state() == ConnState::READY; }
     bool isStreaming() const { return _gv.isStreaming(); }
 
-    // Connection-lifecycle accessors. No-op for current callers (no
-    // one writes _conn_state yet); plumbed for bleWorker / cmdConnect
-    // in G006 / G007. memory_order_relaxed because transitions are
-    // independent scalar publishes — readers don't depend on any
-    // other write happening-before this one.
+    // Connection-lifecycle accessors. memory_order_relaxed because
+    // transitions are independent scalar publishes — readers don't
+    // depend on any other write happening-before this one. Producers:
+    // bleWorker (CONNECTING via tryAcquireConnecting, READY/IDLE via
+    // setState from publishConnectResult), cmdCancelConnect
+    // (REQUESTED→IDLE via tryCancelConnect), disconnect (IDLE).
     ConnState state() const { return _conn_state.load(std::memory_order_relaxed); }
     void setState(ConnState s) { _conn_state.store(s, std::memory_order_relaxed); }
+
+    // CAS REQUESTED → CONNECTING for the bleWorker dequeue path. Closes
+    // the race window between xQueueReceive and a concurrent
+    // cmdCancelConnect: if cancel landed first the state is IDLE, the
+    // CAS fails, and the worker skips the connect. Atomic on RV32 by
+    // construction.
+    bool tryAcquireConnecting()
+    {
+        ConnState expected = ConnState::REQUESTED;
+        return _conn_state.compare_exchange_strong(
+            expected, ConnState::CONNECTING, std::memory_order_relaxed);
+    }
+
+    // CAS REQUESTED → IDLE for cmdCancelConnect. Loses cleanly if
+    // bleWorker already moved the slot to CONNECTING (worker won the
+    // race; cancel is "too late"). Without the CAS, cmdCancelConnect's
+    // read-state-then-store-IDLE could clobber a worker-set CONNECTING
+    // and leave the worker dispatching dev.connect() on a slot the
+    // host believes is idle.
+    bool tryCancelConnect()
+    {
+        ConnState expected = ConnState::REQUESTED;
+        return _conn_state.compare_exchange_strong(
+            expected, ConnState::IDLE, std::memory_order_relaxed);
+    }
 
     // H6: per-slot mutex protecting the cached status struct (battery,
     // charge, rssi, RSSI etc. served by the *Percent / *State / rssi()

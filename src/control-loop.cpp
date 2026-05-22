@@ -80,10 +80,20 @@ static void publishConnectResult(uint8_t slot, bool ok);
 //   enqueue time, host learns outcome via T_DEV_LIST piggyback).
 static bool enqueueConnect(uint8_t slot, bool force, uint32_t req_seq)
 {
+    // Precondition: caller has validated slotInRange. configASSERT is
+    // a no-op under NDEBUG so this costs nothing in release builds
+    // but catches future bypasses at QA time.
+    configASSERT(slotInRange(slot));
     slots[slot].setState(VernierAdapter::ConnState::REQUESTED);
     ConnectRequest req{slot, force, req_seq};
     if (!bleWorkQueue || xQueueSend(bleWorkQueue, &req, 0) != pdTRUE)
     {
+        // Rollback. The slot briefly flickered IDLE→REQUESTED→IDLE.
+        // No T_DEV_LIST was emitted during the REQUESTED window so
+        // the slot-table invariant "every state visible via
+        // T_DEV_LIST is the latest committed state" still holds; a
+        // host snapshotting the wire stream sees IDLE both before
+        // and after the rollback.
         slots[slot].setState(VernierAdapter::ConnState::IDLE);
         return false;
     }
@@ -152,9 +162,20 @@ static void publishConnectResult(uint8_t slot, bool ok)
         }
     }
 
+    // Terminal state transition AFTER all uart.send* calls so a
+    // concurrent vernierHandler can't see state==READY before T_FIELDS
+    // has shipped. Compiler barrier forces the sends to commit before
+    // the state publish; same single-core RV32 reordering discipline
+    // documented in CLAUDE.md §Code Quality Rules.
+    __asm__ volatile("" ::: "memory");
+    slots[slot].setState(ok ? VernierAdapter::ConnState::READY
+                            : VernierAdapter::ConnState::IDLE);
+
     // Per design D4: T_DEV_LIST auto-pushed after every connect attempt
     // (success OR failure — the failure case still tells the host that
     // its connect didn't take, so the slot table stays accurate).
+    // Runs after the state publish so the entry's `connected` flag
+    // reflects the post-attempt truth.
     emitDevList();
 }
 
@@ -190,35 +211,32 @@ static void bleWorkerEntry(void *)
             continue;
         }
 
-        // C_CANCEL_CONNECT (G007 §Decisions Q4) flips the slot back to
-        // IDLE while the request is still queued. We dequeue but skip
-        // the connect — cmdCancelConnect has already pushed the IDLE
-        // transition out via T_DEV_LIST, so no further wire activity
-        // needed here.
-        if (slots[req.slot].state() != VernierAdapter::ConnState::REQUESTED)
+        // CAS REQUESTED → CONNECTING. If cmdCancelConnect won the race
+        // and already flipped the slot to IDLE, the CAS fails and we
+        // skip — cmdCancelConnect already emitted the IDLE T_DEV_LIST
+        // so no further wire activity is needed.
+        if (!slots[req.slot].tryAcquireConnecting())
         {
             log_i("bleWorker: slot %u cancelled, skipping connect",
                   (unsigned)req.slot);
             continue;
         }
-
-        slots[req.slot].setState(VernierAdapter::ConnState::CONNECTING);
+        // Push the CONNECTING transition so the host renders the
+        // spinner while the BLE handshake settles.
         emitDevList();
 
         const bool ok = slots[req.slot].connect(req.force);
 
-        slots[req.slot].setState(ok ? VernierAdapter::ConnState::READY
-                                    : VernierAdapter::ConnState::FAILED);
-        // publishConnectResult no longer dispatches the host ACK —
-        // cmdConnect's early-ACK ("queued") covers it and the host
-        // correlates outcome via the T_DEV_LIST emit at the tail
-        // (Q3 piggyback). req.req_seq survives in the ConnectRequest
+        // publishConnectResult handles the terminal state transition
+        // (READY on success, IDLE on failure) at its tail — that
+        // ordering is what closes the T_SENS_VALUES-before-T_FIELDS
+        // window vernierHandler would otherwise hit. cmdConnect's
+        // early-ACK ("queued") covers the host's "did my request
+        // take?" question; outcome rides out via the emitDevList
+        // publishConnectResult emits after the state publish (Q3
+        // piggyback). req.req_seq survives in the ConnectRequest
         // struct for future log/trace correlation but is unused here.
         publishConnectResult(req.slot, ok);
-
-        // FAILED is transient — drop back to IDLE so the next
-        // C_CONNECT on this slot isn't blocked by the busy-guard.
-        if (!ok) slots[req.slot].setState(VernierAdapter::ConnState::IDLE);
     }
 }
 
@@ -519,19 +537,16 @@ static void cmdCancelConnect(JsonVariantConst root, uint32_t req)
         return;
     }
     const uint8_t dev = static_cast<uint8_t>(dev_raw);
-    const auto st = slots[dev].state();
-    if (st != VernierAdapter::ConnState::REQUESTED)
+    // CAS REQUESTED → IDLE. Loses cleanly if bleWorker already CAS'd
+    // REQUESTED → CONNECTING — without the atomic transition a stale
+    // state read could clobber the worker's CONNECTING and leave it
+    // dispatching dev.connect() on a slot the host believes is idle.
+    if (!slots[dev].tryCancelConnect())
     {
         uart.sendAck(req, false, "not pending",
                      static_cast<int16_t>(dev));
         return;
     }
-    // Flip to IDLE. bleWorker will eventually dequeue the queued
-    // ConnectRequest, see state != REQUESTED, and skip the connect.
-    // The queue slot is briefly held until that drain runs but the
-    // user-visible state — and the busy-guard a follow-up C_CONNECT
-    // sees — flips immediately.
-    slots[dev].setState(VernierAdapter::ConnState::IDLE);
     log_i("C_CANCEL_CONNECT: slot %u cancelled", (unsigned)dev);
     uart.sendAck(req, true, "cancelled", static_cast<int16_t>(dev));
     emitDevList();
