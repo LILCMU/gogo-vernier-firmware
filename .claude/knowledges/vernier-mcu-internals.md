@@ -148,24 +148,27 @@ arrives ~7 seconds after slot 0 itself reports "streaming
 started" — the host UI sees `connected=true, has_sample=false`
 for ~7 sec.
 
-**Cause:** `vernierHandler` is a single FreeRTOS task that
-round-robins `vernier.poll()` across slots and also drives
-`autoConnectDevice` sequentially. While slot N is in BLE
-handshake (synchronous calls into ArduinoBLE that block ~3 sec
-each), already-connected slots can't be polled. After all 3
-slots finish handshake, polling resumes for all of them and
-samples flow.
+**Cause:** `connectAndReport` runs on whichever task fired it —
+the `uartHandler` task on a host `C_CONNECT`, or `loop()` on
+auto-connect / button. Each `dev.connect()` call dives through
+GoGoVernier's NimBLE-Arduino transport and blocks ~5–7 sec
+while the BLE scan + GATT discovery + D2PIO handshake settles.
+Whichever task issued the connect can't poll its own work
+queue during that window — for `uartHandler` that means host
+commands stack up in the 1 KB RX FIFO and dispatch in a burst
+once the connect resolves.
 
 **UI mitigation (host side):** `vernierSlotListView` shows
 "connecting..." when `e.is_connecting` OR
 (`e.connected && e.field_count == 0`). Kid sees activity
 instead of a blank row.
 
-**Architectural fix (deferred):** parallelize connect off the
-poll task. ArduinoBLE/NimBLE supports async scan callbacks; one
-approach is to launch handshakes from a background `ble_task`
-and let `vernierHandler` keep polling whichever slots are in
-the streaming state. Out of scope for kid-UX redesign.
+**Architectural fix (planned for v2.1.0):** offload
+`dev.connect()` to a dedicated `bleWorker` task fed by a
+`ConnectRequest` queue. `cmdConnect` becomes enqueue + early-ACK
+so the UART task stays responsive; the worker becomes the
+single producer of `dev.connect()` and `dev.disconnect()`.
+Full design in `.claude/plans/release-2.1.0.md` §Design.
 
 ---
 
@@ -185,10 +188,12 @@ If a key formatter overruns 15 chars Preferences silently
 truncates and you get key collisions (every slot writes to the
 same truncated key). **Always test with the maximum slot index.**
 
-The vernier-firmware namespace `"vennierSetting"` (typo
-intentional — changing it orphans existing devices) holds only
+The vernier-firmware namespace `"vernierSetting"` (defined as
+`NVS_NAMESPACE_SETTING` in `include/main.h`) holds only
 `deviceName{slot}` keys today. All other Vernier-related NVS
-keys live on the host side.
+keys live on the host side. Renaming this constant would orphan
+existing paired devices on installed boards, so keep it stable
+unless you ship a migration step.
 
 ---
 
@@ -218,20 +223,26 @@ Host side (post-fix):
 
 ## Cross-task discipline (FreeRTOS task hand-off)
 
-Single-core RISC-V (ESP32-C3) means single-byte writes are atomic and
-no Xtensa `memw` instruction exists (it would not assemble). What we
-still need:
+Single-core RISC-V (ESP32-C3) means aligned word loads/stores are
+atomic and no Xtensa `memw` instruction exists (it would not
+assemble). Two patterns in use, depending on the shape of the data:
 
-- `volatile` on every cross-task flag/state so the compiler can't
-  hoist or reorder its load. Today this covers the boot-time
-  hand-off triple (`startAutoConnect`, `foundSavedDevice`,
-  `slotHasSavedDevice[]`) and the protocol-version flags inside
-  `UartAdapter`.
-- A compiler reordering barrier (`__asm__ volatile("" ::: "memory")`)
-  at the publish point of any fill-then-flag pattern. The
-  `C_SET_PERIOD` handler issues one before flipping
+- **`std::atomic<T>` with `memory_order_relaxed`** for standalone
+  scalars with no ordering dependency on other writes. After H2
+  (v2.0.0 → v2.1.0), this covers `VernierAdapter::_period_ms` and
+  `VernierAdapter::_push_dropped`. Preferred for new cross-task
+  scalars — the type itself documents the contract and the codegen
+  is identical to `volatile uint32_t` on RV32.
+- **`volatile` + compiler barrier** for the fill-then-flag publish
+  pattern, where a writer fills a buffer / array and then flips a
+  flag the reader polls. Today this covers the boot-time hand-off
+  triple `startAutoConnect`, `foundSavedDevice`,
+  `slotHasSavedDevice[]`. The `C_SET_PERIOD` handler issues
+  `__asm__ volatile("" ::: "memory")` before flipping
   `startAutoConnect` so the loop reader sees a fully-populated
-  `slotHasSavedDevice[]`.
+  `slotHasSavedDevice[]`. Sweeping these to `std::atomic` is
+  deferred to a separate design pass — see
+  `.claude/plans/release-2.1.0.md` §Out-of-scope.
 
 Tasks at play:
 - `setup()` → fills NVS + per-slot saved-device flags.
@@ -303,8 +314,9 @@ When adding a new wire frame:
   ~7 sec during the BLE handshake. C_DISCONNECT for the same slot
   arriving in that window queues until the handshake finishes. If
   the connect succeeds, NVS gets written for a slot the user just
-  asked to forget. Architectural fix: hand off connectAndReport to
-  a worker task (the existing TODO in main.cpp acknowledges this).
+  asked to forget. Architectural fix planned for v2.1.0 — see
+  `.claude/plans/release-2.1.0.md` (`bleWorker` design); the TODO
+  in `main.cpp` still acknowledges this until the cutover lands.
 - **Per-slot auto-connect failure cap.** A slot whose saved device
   vanished burns ~7 sec at every boot retrying. Add a per-slot
   `_autoConnectFailures` counter; clear `slotHasSavedDevice[slot]`
