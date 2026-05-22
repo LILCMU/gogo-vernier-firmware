@@ -27,8 +27,17 @@ int serial_log_vprintf(const char *fmt, va_list args)
     int n = vsnprintf(buf, sizeof(buf), fmt, args);
     if (n > 0)
     {
-        size_t to_write = (n < (int)sizeof(buf)) ? (size_t)n : sizeof(buf);
-        Serial.write(reinterpret_cast<const uint8_t *>(buf), to_write);
+        if (n < (int)sizeof(buf))
+        {
+            Serial.write(reinterpret_cast<const uint8_t *>(buf), (size_t)n);
+        }
+        else
+        {
+            // Truncated. Force the last byte to '\n' so a long NimBLE
+            // format string can't run into the next log line.
+            buf[sizeof(buf) - 1] = '\n';
+            Serial.write(reinterpret_cast<const uint8_t *>(buf), sizeof(buf));
+        }
     }
     return n;
 }
