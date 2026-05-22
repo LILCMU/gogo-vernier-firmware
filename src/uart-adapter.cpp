@@ -25,6 +25,8 @@ void UartAdapter::send()
     if (len > MAX_FRAME_PAYLOAD)
     {
         log_e("UART send skip — payload too large len=%u", (unsigned)len);
+        // Clear so the next sendXxx doesn't append onto a stale doc.
+        _doc.clear();
         return; // guard: too large for 16-bit framing
     }
 
