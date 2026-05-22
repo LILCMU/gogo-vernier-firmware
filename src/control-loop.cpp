@@ -286,11 +286,15 @@ static void emitDevList()
         // Empty / disconnected slots return "" for name + order so the
         // host doesn't read a stale device name from a previous session
         // (VernierAdapter::deviceName/orderCode survive disconnect).
-        const bool live = slots[i].isReady();
+        const auto st = slots[i].state();
+        const bool live = (st == VernierAdapter::ConnState::READY);
         entries[i].dev       = i;
         entries[i].name      = live ? slots[i].deviceName() : "";
         entries[i].order     = live ? slots[i].orderCode() : "";
         entries[i].connected = live;
+        // G008 wire surface — ConnState numeric value. Host distinguishes
+        // CONNECTING / FAILED from IDLE for kid-UX spinner rendering.
+        entries[i].state     = static_cast<uint8_t>(st);
     }
     uart.sendDevList(entries, VERNIER_MAX_SLOTS);
 }
