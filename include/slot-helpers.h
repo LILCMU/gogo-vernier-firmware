@@ -43,11 +43,13 @@ private:
 extern VernierAdapter slots[VERNIER_MAX_SLOTS];
 
 // "Occupied" = any non-IDLE state on the bleWorker state machine.
-// REQUESTED / CONNECTING / READY / FAILED all block a new C_CONNECT
-// from being routed to this slot via the first-free fallback. IDLE
-// is the only state firstFreeSlot() picks. FAILED is transient
-// (bleWorker drops to IDLE immediately after publishConnectResult);
-// treating it as occupied is harmless and keeps the guard simple.
+// REQUESTED / CONNECTING / READY all block a new C_CONNECT from
+// being routed to this slot via the first-free path. IDLE is the
+// only state firstFreeSlot() picks. ConnState::FAILED is reserved
+// on the enum but currently unreachable — publishConnectResult
+// goes IDLE-on-failure post-da5e19c — so the test catches it as
+// "occupied" defensively against a future producer reintroducing
+// a transient FAILED window.
 inline bool isSlotOccupied(uint8_t slot)
 {
     return slots[slot].state() != VernierAdapter::ConnState::IDLE;
