@@ -116,6 +116,13 @@ void VernierAdapter::disconnect()
 
 void VernierAdapter::setSamplingRate(uint16_t period_ms)
 {
+    // Defence-in-depth: cmdSetPeriod also NACKs sub-min requests at the
+    // wire boundary (H4), but the adapter is the single sink for
+    // _period_ms, so re-asserting the floor here keeps the invariant
+    // holding for future writers (bleWorker, hardware-button paths,
+    // direct test calls). Floor rather than reject — by the time we're
+    // here the caller has already committed to setting a rate.
+    if (period_ms < VERNIER_MIN_PERIOD_MS) period_ms = VERNIER_MIN_PERIOD_MS;
     _period_ms.store(period_ms, std::memory_order_relaxed);
     log_i("Set sampling period to %u ms", (unsigned)period_ms);
     if (_gv.isStreaming())
@@ -133,7 +140,11 @@ void VernierAdapter::startReading(uint16_t period_ms)
     // session_mutex inside GoGoVernier::start() also catches it, but
     // failing fast here keeps the contract consistent with connect().
     if (!_gv.isReady()) return;
-    if (period_ms) _period_ms.store(period_ms, std::memory_order_relaxed);
+    if (period_ms)
+    {
+        if (period_ms < VERNIER_MIN_PERIOD_MS) period_ms = VERNIER_MIN_PERIOD_MS;
+        _period_ms.store(period_ms, std::memory_order_relaxed);
+    }
     const uint16_t p = _period_ms.load(std::memory_order_relaxed);
     log_i("Start reading at %u ms period", (unsigned)p);
     _gv.start(p);
