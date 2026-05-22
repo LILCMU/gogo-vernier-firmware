@@ -242,7 +242,7 @@ assemble). Two patterns in use, depending on the shape of the data:
   `startAutoConnect` so the loop reader sees a fully-populated
   `slotHasSavedDevice[]`. Sweeping these to `std::atomic` is
   deferred to a separate design pass — see
-  `.claude/plans/release-2.1.0.md` §Out-of-scope.
+  `.claude/plans/release-2.1.0.md` under "Out of scope for 2.1.0".
 
 Tasks at play:
 - `setup()` → fills NVS + per-slot saved-device flags.

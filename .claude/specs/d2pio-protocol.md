@@ -181,8 +181,9 @@ where the answers live in the codebase:
 
 - **`CMD_GET_SENSOR_INFO` response byte offsets** — captured in
   `lib/GoGoVernier/src/D2PIOProtocol.h` as `SENSOR_INFO_OFF_*` and
-  `SENSOR_INFO_BODY_SIZE` (commit `ec0adeb` lifted them out of inline
-  literals into named constants with byte-layout comments).
+  `SENSOR_INFO_BODY_SIZE` (commit `ec0adeb` in `lib/GoGoVernier`
+  lifted them out of inline literals into named constants with
+  byte-layout comments).
 - **`CMD_GET_DEVICE_INFO` response byte offsets** — same file,
   `DEV_INFO_OFF_*` and `DEV_INFO_BODY_*`.
 - **MTU negotiation** — h2zero/NimBLE-Arduino now does
