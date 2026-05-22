@@ -83,7 +83,7 @@ bool VernierAdapter::connect(bool forceConnect)
 
         // Reset push-side drop counter and drain any stale samples
         // left in the queue from a previous session.
-        _push_dropped = 0;
+        _push_dropped.store(0, std::memory_order_relaxed);
         if (_sample_queue) xQueueReset(_sample_queue);
 
         // Wire the push path. Lambda runs on the NimBLE notify task —
@@ -91,14 +91,11 @@ bool VernierAdapter::connect(bool forceConnect)
         // full and bumps the counter; the host MCU sees the count
         // via the next DEVSTATS push.
         QueueHandle_t q = _sample_queue;
-        volatile uint32_t* drop_counter = &_push_dropped;
+        std::atomic<uint32_t>* drop_counter = &_push_dropped;
         _gv.onSample([q, drop_counter](const gogo_vernier::Sample& s) {
             if (!q) return;
             if (xQueueSend(q, &s, 0) != pdTRUE) {
-                // Explicit load+store sidesteps C++20 -Wdeprecated-volatile
-                // on the compound `++`. _push_dropped is volatile by
-                // design — see vernier-adapter.h.
-                *drop_counter = static_cast<uint32_t>(*drop_counter) + 1;
+                drop_counter->fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
@@ -119,12 +116,12 @@ void VernierAdapter::disconnect()
 
 void VernierAdapter::setSamplingRate(uint16_t period_ms)
 {
-    _period_ms = period_ms;
-    log_i("Set sampling period to %u ms", _period_ms);
+    _period_ms.store(period_ms, std::memory_order_relaxed);
+    log_i("Set sampling period to %u ms", (unsigned)period_ms);
     if (_gv.isStreaming())
     {
         _gv.stop();
-        _gv.start(_period_ms);
+        _gv.start(period_ms);
     }
 }
 
@@ -136,9 +133,10 @@ void VernierAdapter::startReading(uint16_t period_ms)
     // session_mutex inside GoGoVernier::start() also catches it, but
     // failing fast here keeps the contract consistent with connect().
     if (!_gv.isReady()) return;
-    if (period_ms) _period_ms = period_ms;
-    log_i("Start reading at %u ms period", _period_ms);
-    _gv.start(_period_ms);
+    if (period_ms) _period_ms.store(period_ms, std::memory_order_relaxed);
+    const uint16_t p = _period_ms.load(std::memory_order_relaxed);
+    log_i("Start reading at %u ms period", (unsigned)p);
+    _gv.start(p);
 }
 
 void VernierAdapter::stopReading()
@@ -153,7 +151,7 @@ void VernierAdapter::getDeviceInfo(bool force)
     _gv.refreshStatus();
 }
 
-uint32_t VernierAdapter::droppedSamples() const  { return _gv.droppedSamples() + _push_dropped; }
+uint32_t VernierAdapter::droppedSamples() const  { return _gv.droppedSamples() + _push_dropped.load(std::memory_order_relaxed); }
 uint8_t  VernierAdapter::channelCount() const    { return _gv.channelCount(); }
 
 bool VernierAdapter::waitForSample(float *out, size_t &count, uint32_t timeout_ms)

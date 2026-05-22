@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -43,7 +45,7 @@ public:
     // before the channel mask is populated.
     bool isReady() const { return _gv.isReady(); }
     bool isStreaming() const { return _gv.isStreaming(); }
-    uint16_t samplingPeriod() const { return _period_ms; }
+    uint16_t samplingPeriod() const { return _period_ms.load(std::memory_order_relaxed); }
 
     // Total dropped sample count: GoGoVernier's internal "previous
     // sample wasn't drained" + device-reported MEAS_DROPPED frames
@@ -104,7 +106,12 @@ private:
     gogo_vernier::GoGoVernier _gv;
 
     String _open_device = VERNIER_DEFAULT_DEVICE_NAME;
-    uint16_t _period_ms = VERNIER_DEFAULT_PERIOD_MS;
+    // Cross-task: written by cmdSetPeriod / startReading (UART task),
+    // read by vernierHandler (vernier task) via samplingPeriod() and
+    // again by startReading() itself. std::atomic<uint16_t> documents
+    // the contract; on RV32 the loads/stores are single-instruction
+    // and free, so memory_order_relaxed is the right ordering.
+    std::atomic<uint16_t> _period_ms{VERNIER_DEFAULT_PERIOD_MS};
 
     // Push-mode plumbing. Created in the ctor (process-lifetime),
     // drained by waitForSample(), filled by an onSample lambda
@@ -112,8 +119,8 @@ private:
     QueueHandle_t _sample_queue = nullptr;
     // queue-full drops. Written by the NimBLE notify task (push lambda
     // installed in connect()), read by vernierHandler via droppedSamples().
-    // volatile per CLAUDE.md cross-task rule — the lambda captures a
-    // `volatile uint32_t*` so the increment can't be hoisted across
-    // FreeRTOS task boundaries.
-    volatile uint32_t _push_dropped = 0;
+    // std::atomic<uint32_t> replaces the prior volatile+manual-load-store
+    // pattern that side-stepped C++20's -Wdeprecated-volatile on the
+    // compound ++. Same single-core RV32 free-load characteristics.
+    std::atomic<uint32_t> _push_dropped{0};
 };
