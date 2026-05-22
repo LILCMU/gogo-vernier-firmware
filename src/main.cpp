@@ -69,15 +69,13 @@ constexpr uint32_t USB_CDC_BAUD             = 115200;  // baud is a no-op on
                                                        // HWCDC/USBCDC; kept
                                                        // for convention only
 
-// FreeRTOS task config.
-constexpr uint16_t   UART_TASK_STACK        = 6144;    // 6 KB — call depth of
-                                                       // vernier.connect() →
-                                                       // NimBLEScan + NimBLEClient
-                                                       // discovery can hit ~4 KB
-                                                       // on its own.
+// FreeRTOS task config. HANDLER_TASK_PRIO + TASK_STACK_BLE_HEAVY
+// live in include/main.h so control-loop.cpp's bleWorker stays in
+// sync. uartHandler uses TASK_STACK_BLE_HEAVY because it still
+// dispatches dev.disconnect() (via cmdDisconnect / cmdForget / button
+// long-press), which dives through NimBLE close() at the same call
+// depth that connect() does.
 constexpr uint16_t   VERNIER_TASK_STACK     = 8192;
-constexpr UBaseType_t HANDLER_TASK_PRIO     = 1;       // both background
-                                                       // tasks at idle prio + 1
 
 // vernierHandler cadence.
 constexpr uint32_t IDLE_SLEEP_MS            =  250;    // no device open yet
@@ -371,12 +369,13 @@ void setup()
     xTaskCreate(
         uartHandler,
         "UartTask",
-        // UART_TASK_STACK absorbs the call depth of vernier.connect(),
-        // which dives through GoGoVernier::open → NimBLEScan +
-        // NimBLEClient discovery and can come close to 4 KB on its
-        // own. Until connect is offloaded to a worker (TODO:
-        // pendingConnect flag pattern), keep the headroom.
-        UART_TASK_STACK,
+        // Shared TASK_STACK_BLE_HEAVY (main.h) — uartHandler still
+        // dispatches dev.disconnect() through NimBLE close(), which
+        // dives the same ~4 KB call depth as dev.connect() did
+        // pre-G007. The slot now lives on bleWorker but disconnects
+        // stay on the UART task because they're cheap and don't
+        // benefit from offload.
+        TASK_STACK_BLE_HEAVY,
         NULL,
         HANDLER_TASK_PRIO,
         &uartProcessTask);

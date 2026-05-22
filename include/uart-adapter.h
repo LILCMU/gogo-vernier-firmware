@@ -71,11 +71,12 @@ public:
     // in the comment so the host registry stays in sync.
     enum CmdType : uint8_t
     {
-        C_CONNECT    = 1,  // {c, seq, dev?:u8}. dev opt = host-targeted slot.
-        C_DISCONNECT = 2,  // {c, seq, dev:u8}.
-        C_SET_PERIOD = 3,  // {c, seq, dev:u8, period_ms:u32 (capped at MAX_PERIOD_MS)}.
-        C_DEV_LIST   = 4,  // {c, seq}. Triggers a T_DEV_LIST push.
-        C_FORGET     = 5,  // {c, seq, dev:u8}. Disconnect + clear NVS deviceName{dev}.
+        C_CONNECT        = 1,  // {c, seq, dev?:u8}. dev opt = host-targeted slot. Early-ACK ok=true msg="queued" on enqueue (G007). T_DEV_LIST carries outcome.
+        C_DISCONNECT     = 2,  // {c, seq, dev:u8}.
+        C_SET_PERIOD     = 3,  // {c, seq, dev:u8, period_ms:u32 (capped at MAX_PERIOD_MS)}.
+        C_DEV_LIST       = 4,  // {c, seq}. Triggers a T_DEV_LIST push.
+        C_FORGET         = 5,  // {c, seq, dev:u8}. Disconnect + clear NVS deviceName{dev}.
+        C_CANCEL_CONNECT = 6,  // {c, seq, dev:u8}. Abort a queued C_CONNECT for slot `dev`. NACK if slot isn't REQUESTED. Added in 2.1.0.
     };
 
     // T_STATUS.core_state values — peer-health enum carried by the

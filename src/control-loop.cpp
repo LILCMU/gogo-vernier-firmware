@@ -41,21 +41,15 @@ constexpr uint32_t NO_HOST_REQUEST = 0xFFFFFFFFu;
 unsigned long startPressTime  = 0;
 ButtonEvent   prevButtonEvent = BUTTON_RELEASE;
 
-// bleWorker queue + task config (G006). Queue depth matches the
-// per-slot natural bound — one in-flight connect per slot. The
-// stack size mirrors UART_TASK_STACK in main.cpp because the worker
-// inherits the same call depth (GoGoVernier::open → NimBLEScan +
-// NimBLEClient discovery dives ~4 KB on its own).
+// bleWorker queue config (G006). Queue depth matches the per-slot
+// natural bound — one in-flight connect per slot at most. Stack +
+// priority come from main.h (TASK_STACK_BLE_HEAVY, HANDLER_TASK_PRIO)
+// so they stay in sync with uartHandler's matching values; see the
+// G006 review note.
 constexpr UBaseType_t BLE_WORKER_QUEUE_DEPTH = VERNIER_MAX_SLOTS;
-constexpr uint16_t    BLE_WORKER_STACK       = 6144;
-// Same priority as uart/vernier handlers — same-priority round-robin
-// keeps sample-stream throughput predictable; the plan's "priority
-// between" suggestion was conditional on uart being bumped up, which
-// isn't part of G006.
-constexpr UBaseType_t BLE_WORKER_PRIO        = 1;
 
 // ConnectRequest queued by enqueueConnect, drained by bleWorkerEntry.
-// 12 bytes per item with natural alignment on RV32.
+// Layout on RV32: u8 slot + bool force + 2 B pad + u32 req_seq = 8 B.
 struct ConnectRequest {
     uint8_t  slot;
     bool     force;
@@ -68,52 +62,48 @@ TaskHandle_t  bleWorkerTaskHandle = nullptr;
 }  // namespace
 
 static void emitDevList();           // forward decl — defined below for grouping
-static void publishConnectResult(uint8_t slot, bool ok, uint32_t req_seq);
+static void publishConnectResult(uint8_t slot, bool ok);
 
-// connectAndReport(slot, req_seq, force):
-//   slot     — target slot in slots[].
-//   req_seq  — host's C_CONNECT seq for the terminal T_ACK; pass
-//              NO_HOST_REQUEST when not driven by a host command
-//              (autoConnect, button) so we skip the ack send.
-//   force    — when true, scan for the highest-RSSI nearby GDX device
-//              regardless of the slot's saved _open_device. Used by
-//              host C_CONNECT (probe for new pairing) and the BOOT
-//              button. Auto-connect path passes false so it scans for
-//              the slot's NVS-saved name.
+// enqueueConnect(slot, force, req_seq):
+//   Single producer-side helper used by cmdConnect, buttonHandler
+//   and autoConnectDevice. Caller has already validated
+//   slotInRange(slot) and that slots[slot].state() is IDLE or
+//   FAILED (the busy-guard from §Decisions Q1). Flips the slot to
+//   REQUESTED so a concurrent C_CONNECT for the same slot finds it
+//   busy, then xQueueSends a ConnectRequest. Rolls the slot state
+//   back to IDLE if the queue is full or unavailable. Returns true
+//   on successful enqueue.
 //
-// The body splits at dev.connect() — everything that runs after the
-// connect call lives in publishConnectResult so a future bleWorker
-// task (see .claude/plans/release-2.1.0.md §Design phase 1) can call
-// it with a pre-computed result from a different task context. Today
-// the call stays inline.
-static bool connectAndReport(uint8_t slot,
-                             uint32_t req_seq = NO_HOST_REQUEST,
-                             bool force = false)
+//   req_seq is carried through to the worker for log/trace
+//   correlation; bleWorker no longer dispatches an ACK from
+//   publishConnectResult (early-ACK happens in cmdConnect at
+//   enqueue time, host learns outcome via T_DEV_LIST piggyback).
+static bool enqueueConnect(uint8_t slot, bool force, uint32_t req_seq)
 {
-    if (!slotInRange(slot))
+    slots[slot].setState(VernierAdapter::ConnState::REQUESTED);
+    ConnectRequest req{slot, force, req_seq};
+    if (!bleWorkQueue || xQueueSend(bleWorkQueue, &req, 0) != pdTRUE)
     {
-        if (req_seq != NO_HOST_REQUEST)
-            uart.sendAck(req_seq, false, "slot out of range");
+        slots[slot].setState(VernierAdapter::ConnState::IDLE);
         return false;
     }
-    bool ok = slots[slot].connect(force);
-    publishConnectResult(slot, ok, req_seq);
-    return ok;
+    return true;
 }
 
-// publishConnectResult(slot, ok, req_seq):
+// publishConnectResult(slot, ok):
 //   Side-effect block that runs after dev.connect() resolves.
 //   - On success: refresh status, kick off streaming, emit the
 //     5-frame burst (T_HELLO, T_STATUS, T_DEVINFO, T_DEVSTATS,
 //     T_FIELDS), persist the slot's device name in NVS, and flag
 //     the slot for auto-connect on the next boot.
-//   - On any outcome: emit T_ACK if req_seq is a real host
-//     request, then push T_DEV_LIST so the host's slot table
-//     stays in sync (D4).
+//   - On any outcome: push T_DEV_LIST so the host's slot table
+//     stays in sync (D4). The host's terminal ACK is no longer
+//     emitted here — cmdConnect ACKs at enqueue time (early-ACK,
+//     §Decisions Q3 piggyback); outcome correlates via T_DEV_LIST.
 // Caller is responsible for the dev.connect() call itself + the
 // slot-range guard. Safe to call from any task that owns access
 // to the shared globals (uart's send mutex, nvsMutex via NvsScope).
-static void publishConnectResult(uint8_t slot, bool ok, uint32_t req_seq)
+static void publishConnectResult(uint8_t slot, bool ok)
 {
     VernierAdapter &dev = slots[slot];
     if (ok)
@@ -162,9 +152,6 @@ static void publishConnectResult(uint8_t slot, bool ok, uint32_t req_seq)
         }
     }
 
-    if (req_seq != NO_HOST_REQUEST)
-        uart.sendAck(req_seq, ok, ok ? nullptr : "connect failed", static_cast<int16_t>(slot));
-
     // Per design D4: T_DEV_LIST auto-pushed after every connect attempt
     // (success OR failure — the failure case still tells the host that
     // its connect didn't take, so the slot table stays accurate).
@@ -195,10 +182,23 @@ static void bleWorkerEntry(void *)
         if (xQueueReceive(bleWorkQueue, &req, portMAX_DELAY) != pdTRUE)
             continue;
 
+        // Defensive — producers validate slotInRange before enqueueing.
         if (!slotInRange(req.slot))
         {
-            if (req.req_seq != NO_HOST_REQUEST)
-                uart.sendAck(req.req_seq, false, "slot out of range");
+            log_e("bleWorker: dropped out-of-range slot=%u",
+                  (unsigned)req.slot);
+            continue;
+        }
+
+        // C_CANCEL_CONNECT (G007 §Decisions Q4) flips the slot back to
+        // IDLE while the request is still queued. We dequeue but skip
+        // the connect — cmdCancelConnect has already pushed the IDLE
+        // transition out via T_DEV_LIST, so no further wire activity
+        // needed here.
+        if (slots[req.slot].state() != VernierAdapter::ConnState::REQUESTED)
+        {
+            log_i("bleWorker: slot %u cancelled, skipping connect",
+                  (unsigned)req.slot);
             continue;
         }
 
@@ -209,21 +209,47 @@ static void bleWorkerEntry(void *)
 
         slots[req.slot].setState(ok ? VernierAdapter::ConnState::READY
                                     : VernierAdapter::ConnState::FAILED);
-        publishConnectResult(req.slot, ok, req.req_seq);
+        // publishConnectResult no longer dispatches the host ACK —
+        // cmdConnect's early-ACK ("queued") covers it and the host
+        // correlates outcome via the T_DEV_LIST emit at the tail
+        // (Q3 piggyback). req.req_seq survives in the ConnectRequest
+        // struct for future log/trace correlation but is unused here.
+        publishConnectResult(req.slot, ok);
 
-        // FAILED is a transient signal — once publishConnectResult has
-        // NACKed the host, drop back to IDLE so the next C_CONNECT on
-        // this slot isn't blocked by the busy-guard in cmdConnect.
+        // FAILED is transient — drop back to IDLE so the next
+        // C_CONNECT on this slot isn't blocked by the busy-guard.
         if (!ok) slots[req.slot].setState(VernierAdapter::ConnState::IDLE);
     }
 }
 
 void bleWorkerStart()
 {
-    if (bleWorkerTaskHandle) return;  // idempotent
-    bleWorkQueue = xQueueCreate(BLE_WORKER_QUEUE_DEPTH, sizeof(ConnectRequest));
-    xTaskCreate(bleWorkerEntry, "BleWorker", BLE_WORKER_STACK,
-                nullptr, BLE_WORKER_PRIO, &bleWorkerTaskHandle);
+    // Idempotent against repeated calls AND against partial-failure
+    // restart. Order: queue first, then task. If the task create
+    // fails after the queue is up, free the queue so the next
+    // bleWorkerStart() rebuilds from scratch.
+    if (bleWorkerTaskHandle) return;
+    if (!bleWorkQueue)
+    {
+        bleWorkQueue = xQueueCreate(BLE_WORKER_QUEUE_DEPTH,
+                                    sizeof(ConnectRequest));
+        if (!bleWorkQueue)
+        {
+            log_e("bleWorkerStart: xQueueCreate failed");
+            return;
+        }
+    }
+    const BaseType_t ok = xTaskCreate(bleWorkerEntry, "BleWorker",
+                                      TASK_STACK_BLE_HEAVY, nullptr,
+                                      HANDLER_TASK_PRIO,
+                                      &bleWorkerTaskHandle);
+    if (ok != pdPASS)
+    {
+        log_e("bleWorkerStart: xTaskCreate failed");
+        vQueueDelete(bleWorkQueue);
+        bleWorkQueue = nullptr;
+        bleWorkerTaskHandle = nullptr;
+    }
 }
 
 // Marshal slot table from slots[] into UartAdapter::DevListEntry[]
@@ -257,19 +283,22 @@ void autoConnectDevice()
         return;
     startAutoConnect = false;
 
-    // Per design D6: walk slots in order, attempt connect on each one
-    // that has a saved name in NVS. Sequential rather than parallel —
-    // each handshake monopolises the BLE controller's scan + connect
-    // path. With NimBLE max 3 conns this is at most ~3×7s = ~21s
-    // total worst case to settle the slot table on boot. The host
-    // can drive a faster reconnect by sending C_CONNECT explicitly
-    // after boot if it doesn't want to wait.
+    // Per design D6: walk slots in order, queue a connect for each
+    // slot with a saved NVS name. bleWorker drains them sequentially
+    // (one in-flight at a time — BLE controller serialises connects
+    // anyway). force=false so the worker scans for the slot's
+    // saved name rather than the highest-RSSI nearby device.
     for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
     {
         if (slotHasSavedDevice[i])
         {
-            log_i("Auto-connecting slot %u to saved device ...", (unsigned)i);
-            connectAndReport(i); // no request sequence
+            log_i("auto-connect: queueing slot %u (saved device)",
+                  (unsigned)i);
+            if (!enqueueConnect(i, /*force=*/false, NO_HOST_REQUEST))
+            {
+                log_w("auto-connect: queue full, slot %u skipped",
+                      (unsigned)i);
+            }
         }
     }
 }
@@ -307,29 +336,28 @@ void buttonHandler()
             prevButtonEvent = BUTTON_PRESS;
             startPressTime = millis();
 
-            // Short-press: connect the lowest free slot via proximity
-            // scan. Same first-free allocation as C_CONNECT, plus
+            // Short-press: queue a proximity connect on the lowest
+            // free slot. Same first-free allocation as C_CONNECT,
             // force=true so we probe nearby instead of re-using the
-            // slot's saved name.
+            // slot's saved name. Goes through bleWorker so the
+            // ~5–7 s BLE handshake doesn't stall loop(); bleWorker
+            // pushes T_DEVINFO/T_FIELDS/etc. + T_DEV_LIST when the
+            // connect resolves.
             int8_t target_slot = firstFreeSlot();
             if (target_slot < 0)
             {
                 log_w("button: all slots full, ignoring connect press");
             }
+            else if (!enqueueConnect(static_cast<uint8_t>(target_slot),
+                                     /*force=*/true, NO_HOST_REQUEST))
+            {
+                log_w("button: queue full, slot %u",
+                      (unsigned)target_slot);
+            }
             else
             {
                 log_i("button: connecting nearby device → slot %u",
                       (unsigned)target_slot);
-                // No req_seq — button is a local trigger, no host ack.
-                // connectAndReport still emits T_DEVINFO/T_FIELDS/etc.
-                // and T_DEV_LIST so the host UI catches the new
-                // session.
-                if (!connectAndReport(static_cast<uint8_t>(target_slot),
-                                      NO_HOST_REQUEST, /*force=*/true))
-                {
-                    log_i("button: connect failed (slot %u)",
-                          (unsigned)target_slot);
-                }
             }
         }
     }
@@ -350,22 +378,19 @@ void buttonHandler()
 
 static void cmdConnect(JsonVariantConst root, uint32_t req)
 {
-    // Slot allocation:
-    //   - If host specifies `dev` (kid pressed an empty slot card on
-    //     the multi-device main view), target THAT slot so the UI's
-    //     CONNECTING animation lines up with the slot the kid pressed.
-    //   - Otherwise (legacy host, auto-detect path) fall back to
-    //     first-free per design D2.
-    // MsgPack picks any integer width for "dev" depending on the value
-    // (0..127 → int8, 128..255 → uint8, etc.). Check presence via
-    // !isNull() — a typed is<uint8_t>() would miss alternative widths.
+    // Slot allocation (unchanged from pre-G007):
+    //   - If host specifies `dev`, target THAT slot.
+    //   - Otherwise fall back to first-free per design D2.
+    // The G007 cutover moves the actual dev.connect() onto bleWorker
+    // and replaces the synchronous terminal ACK with an early-ACK
+    // ("queued") here at enqueue time. Host correlates outcome via
+    // the auto-pushed T_DEV_LIST (§Decisions Q3 piggyback).
     int8_t target_slot = -1;
     const bool hasDev = !root["dev"].isNull();
     if (hasDev)
     {
         // Echo `dev` on every NACK so the host can roll back the
-        // per-slot CONNECTING animation against the right card instead
-        // of guessing from `req` alone.
+        // per-slot CONNECTING animation against the right card.
         const int requestedRaw = root["dev"].as<int>();
         if (!slotInRange(requestedRaw))
         {
@@ -390,18 +415,25 @@ static void cmdConnect(JsonVariantConst root, uint32_t req)
     }
     if (target_slot < 0)
     {
-        // Per design D9: respond with ok=false + diagnostic msg.
-        // Host UI surfaces this to the user.
         uart.sendAck(req, false, "all slots full");
         return;
     }
-    // force=true: probe nearby for a NEW pairing rather than re-attempting
-    // the slot's saved name. Host C_CONNECT semantics = "connect to
-    // whatever's around".
-    log_i("C_CONNECT: target slot=%u (%s)",
+
+    // force=true: probe nearby for a NEW pairing rather than the slot's
+    // saved name. Host C_CONNECT semantics = "connect to whatever's
+    // around" (or the host-specified slot's nearby device).
+    if (!enqueueConnect(static_cast<uint8_t>(target_slot), /*force=*/true, req))
+    {
+        log_w("C_CONNECT NACK: queue full, slot=%u", (unsigned)target_slot);
+        uart.sendAck(req, false, "queue full",
+                     static_cast<int16_t>(target_slot));
+        return;
+    }
+    log_i("C_CONNECT: slot %u queued (%s)",
           (unsigned)target_slot,
           hasDev ? "host-specified" : "first-free");
-    connectAndReport(static_cast<uint8_t>(target_slot), req, /*force=*/true);
+    // Early-ACK per §Decisions Q3 / §Wire protocol additions.
+    uart.sendAck(req, true, "queued", static_cast<int16_t>(target_slot));
 }
 
 static void cmdDisconnect(JsonVariantConst root, uint32_t req)
@@ -468,6 +500,43 @@ static void cmdDevList(JsonVariantConst /*root*/, uint32_t req)
     emitDevList();
 }
 
+static void cmdCancelConnect(JsonVariantConst root, uint32_t req)
+{
+    // C_CANCEL_CONNECT (G007 §Decisions Q4). Aborts a queued C_CONNECT
+    // for `dev` — e.g. the kid pressed the wrong slot card and wants
+    // to cancel before bleWorker picks the request up.
+    //
+    // Only effective in REQUESTED state. CONNECTING means bleWorker
+    // is mid-handshake (NimBLE has no in-flight cancel; cooperative
+    // cancel during scan is in §Out of scope for 2.1.0). READY /
+    // IDLE / FAILED mean there's nothing to cancel — use
+    // C_DISCONNECT for an established link.
+    int dev_raw = root["dev"] | -1;
+    if (!slotInRange(dev_raw))
+    {
+        uart.sendAck(req, false, "dev out of range",
+                     static_cast<int16_t>(dev_raw));
+        return;
+    }
+    const uint8_t dev = static_cast<uint8_t>(dev_raw);
+    const auto st = slots[dev].state();
+    if (st != VernierAdapter::ConnState::REQUESTED)
+    {
+        uart.sendAck(req, false, "not pending",
+                     static_cast<int16_t>(dev));
+        return;
+    }
+    // Flip to IDLE. bleWorker will eventually dequeue the queued
+    // ConnectRequest, see state != REQUESTED, and skip the connect.
+    // The queue slot is briefly held until that drain runs but the
+    // user-visible state — and the busy-guard a follow-up C_CONNECT
+    // sees — flips immediately.
+    slots[dev].setState(VernierAdapter::ConnState::IDLE);
+    log_i("C_CANCEL_CONNECT: slot %u cancelled", (unsigned)dev);
+    uart.sendAck(req, true, "cancelled", static_cast<int16_t>(dev));
+    emitDevList();
+}
+
 static void cmdSetPeriod(JsonVariantConst root, uint32_t req)
 {
     // v2 wire (per D5 A): `dev` selects which slot's period to set —
@@ -522,11 +591,12 @@ void dispatchHostCommand(JsonVariantConst root)
 
     switch (c)
     {
-    case UartAdapter::C_CONNECT:    cmdConnect(root, req);    break;
-    case UartAdapter::C_DISCONNECT: cmdDisconnect(root, req); break;
-    case UartAdapter::C_FORGET:     cmdForget(root, req);     break;
-    case UartAdapter::C_DEV_LIST:   cmdDevList(root, req);    break;
-    case UartAdapter::C_SET_PERIOD: cmdSetPeriod(root, req);  break;
+    case UartAdapter::C_CONNECT:        cmdConnect(root, req);        break;
+    case UartAdapter::C_DISCONNECT:     cmdDisconnect(root, req);     break;
+    case UartAdapter::C_FORGET:         cmdForget(root, req);         break;
+    case UartAdapter::C_DEV_LIST:       cmdDevList(root, req);        break;
+    case UartAdapter::C_SET_PERIOD:     cmdSetPeriod(root, req);      break;
+    case UartAdapter::C_CANCEL_CONNECT: cmdCancelConnect(root, req);  break;
     default:                        uart.sendAck(req, false, "unknown command"); break;
     }
 }

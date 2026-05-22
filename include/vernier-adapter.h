@@ -69,16 +69,17 @@ public:
     void getDeviceInfo(bool force = false);
 
     bool isConnected() const { return _gv.isConnected(); }
-    // True only after open() finished the full D2PIO handshake. Use this
-    // — not isConnected() — anywhere a caller needs to know "the device
-    // is ready to start streaming". isConnected() flips at BLE link-up,
-    // before the channel mask is populated.
-    //
-    // Will switch to `state() == ConnState::READY` after the bleWorker
-    // cutover (G007) puts the adapter in charge of the lifecycle. For
-    // now it still reads through to the GDX driver so callers behave
-    // identically to pre-G004.
-    bool isReady() const { return _gv.isReady(); }
+    // True only when this adapter has been put in the READY state by
+    // bleWorker (i.e. dev.connect() returned true and publishConnectResult
+    // ran successfully). Pre-G007 this routed through `_gv.isReady()`
+    // (the GDX driver's own ready flag); the G007 cutover puts the
+    // adapter in charge of the lifecycle, so vernierHandler and
+    // emitDevList both consult `_conn_state` directly. The tiny lag
+    // between `_gv.isReady()` flipping true and the worker writing
+    // READY is intentional — it ensures all the host-protocol side-
+    // effects (T_HELLO, T_DEVINFO, T_FIELDS, etc.) have shipped before
+    // any reader treats the slot as live.
+    bool isReady() const { return state() == ConnState::READY; }
     bool isStreaming() const { return _gv.isStreaming(); }
 
     // Connection-lifecycle accessors. No-op for current callers (no

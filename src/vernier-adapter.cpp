@@ -132,6 +132,11 @@ void VernierAdapter::disconnect()
     if (_gv.isStreaming()) _gv.stop();
     if (_gv.isConnected()) _gv.close();
     if (_sample_queue) xQueueReset(_sample_queue);
+    // Surface the slot as IDLE to vernierHandler / emitDevList /
+    // cmdConnect's busy-guard. Without this the slot would still
+    // report READY (via state()) until the next connect attempt,
+    // even though the BLE link is down.
+    setState(ConnState::IDLE);
 }
 
 void VernierAdapter::setSamplingRate(uint16_t period_ms)
