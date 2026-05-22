@@ -35,23 +35,35 @@ class VernierAdapter
 {
 public:
     // Per-slot connection lifecycle. Drives the bleWorker state
-    // machine that will land in release-2.1.0 (.claude/plans/
-    // release-2.1.0.md §Design). Today the field is additive only
-    // — no caller writes it yet. The cutover (G007) will:
-    //   - cmdConnect / button / autoConnect → setState(REQUESTED)
-    //   - bleWorker on dequeue → setState(CONNECTING)
-    //   - publishConnectResult(ok=true)  → setState(READY)
-    //   - publishConnectResult(ok=false) → setState(FAILED) then IDLE
-    //   - disconnect()                   → setState(IDLE)
-    // Numeric values are part of the wire contract once §Protocol
-    // exposes `state` as an optional T_DEV_LIST field (G008), so
-    // don't renumber — append new entries at the end.
+    // machine wired in across G004 (this enum + atomic _conn_state)
+    // → G006 (bleWorker scaffolding + CAS helpers) → G007 (cutover
+    // + ordering fix in da5e19c). Producer set:
+    //   - cmdConnect / button / autoConnect → enqueueConnect(),
+    //     which setState(REQUESTED).
+    //   - bleWorker dequeue → tryAcquireConnecting() (CAS
+    //     REQUESTED → CONNECTING). Cancel-race-safe.
+    //   - publishConnectResult tail → setState(READY) on success,
+    //     setState(IDLE) on failure. Ordering: AFTER every
+    //     uart.send*, with a compiler barrier between the last
+    //     send and the state publish so vernierHandler can't see
+    //     READY before T_FIELDS shipped.
+    //   - cmdCancelConnect → tryCancelConnect() (CAS REQUESTED →
+    //     IDLE). Loses cleanly if bleWorker already CAS'd into
+    //     CONNECTING.
+    //   - disconnect() → setState(IDLE).
+    // Numeric values are part of the wire contract (T_DEV_LIST's
+    // optional `state` field, G008). Don't renumber — append at
+    // the end.
     enum class ConnState : uint8_t
     {
         IDLE       = 0,
         REQUESTED  = 1,
         CONNECTING = 2,
         READY      = 3,
+        // FAILED is reserved on the wire but currently unreachable
+        // (no producer writes it post-da5e19c — failure goes
+        // straight to IDLE). Kept so a future host-UX iteration
+        // can re-expose a brief FAILED window without renumbering.
         FAILED     = 4,
     };
 

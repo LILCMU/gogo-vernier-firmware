@@ -67,12 +67,12 @@ static void publishConnectResult(uint8_t slot, bool ok);
 // enqueueConnect(slot, force, req_seq):
 //   Single producer-side helper used by cmdConnect, buttonHandler
 //   and autoConnectDevice. Caller has already validated
-//   slotInRange(slot) and that slots[slot].state() is IDLE or
-//   FAILED (the busy-guard from §Decisions Q1). Flips the slot to
-//   REQUESTED so a concurrent C_CONNECT for the same slot finds it
-//   busy, then xQueueSends a ConnectRequest. Rolls the slot state
-//   back to IDLE if the queue is full or unavailable. Returns true
-//   on successful enqueue.
+//   slotInRange(slot) and that slots[slot].state() is IDLE — the
+//   busy-guard from §Decisions Q1. Flips the slot to REQUESTED so
+//   a concurrent C_CONNECT for the same slot finds it busy, then
+//   xQueueSends a ConnectRequest. Rolls the slot state back to
+//   IDLE if the queue is full or unavailable. Returns true on
+//   successful enqueue.
 //
 //   req_seq is carried through to the worker for log/trace
 //   correlation; bleWorker no longer dispatches an ACK from
@@ -182,19 +182,21 @@ static void publishConnectResult(uint8_t slot, bool ok)
 // bleWorker entry — drains ConnectRequest items from bleWorkQueue
 // one at a time and runs the full connect resolution on its own
 // task. Producer set (G007): cmdConnect, buttonHandler,
-// autoConnectDevice. In G006 the queue stays empty so the task
-// just parks on the receive.
+// autoConnectDevice.
 //
 // Per §Decisions Q1: a request for a slot already in REQUESTED /
-// CONNECTING is rejected at the enqueue site (cmdConnect's busy
-// guard), so the worker is the SOLE state-machine driver from
-// CONNECTING → READY / FAILED → IDLE.
+// CONNECTING / READY is rejected at the enqueue site
+// (cmdConnect's busy guard). The worker only ever observes a slot
+// it can CAS from REQUESTED → CONNECTING via
+// tryAcquireConnecting(); cmdCancelConnect can race-win that CAS
+// (REQUESTED → IDLE) in which case the worker dequeues a stale
+// request and skips.
 //
 // Per §Decisions Q3: state transitions piggyback on T_DEV_LIST.
-// We emit it once before dev.connect() (CONNECTING transition) so
-// the host can render a "connecting" affordance while the BLE
-// handshake settles; publishConnectResult emits it again at the
-// tail (READY / FAILED transition).
+// We emit it once after the CONNECTING CAS so the host can render
+// a "connecting" affordance while the BLE handshake settles;
+// publishConnectResult emits it again at the tail (READY on ok,
+// IDLE on failure — FAILED is reserved but currently unreached).
 static void bleWorkerEntry(void *)
 {
     for (;;)
@@ -528,11 +530,13 @@ static void cmdCancelConnect(JsonVariantConst root, uint32_t req)
     // for `dev` — e.g. the kid pressed the wrong slot card and wants
     // to cancel before bleWorker picks the request up.
     //
-    // Only effective in REQUESTED state. CONNECTING means bleWorker
-    // is mid-handshake (NimBLE has no in-flight cancel; cooperative
-    // cancel during scan is in §Out of scope for 2.1.0). READY /
-    // IDLE / FAILED mean there's nothing to cancel — use
-    // C_DISCONNECT for an established link.
+    // Only effective in REQUESTED state (tryCancelConnect CAS
+    // REQUESTED → IDLE). CONNECTING means bleWorker is mid-handshake
+    // (NimBLE has no in-flight cancel; cooperative cancel during
+    // scan is out of scope for 2.1.0). READY / IDLE mean there's
+    // nothing to cancel — use C_DISCONNECT for an established link.
+    // FAILED is reserved on the enum but currently unreachable, so
+    // it'd also fail the CAS; treated identically to "not pending".
     int dev_raw = root["dev"] | -1;
     if (!slotInRange(dev_raw))
     {
