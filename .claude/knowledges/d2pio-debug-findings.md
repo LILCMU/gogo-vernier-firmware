@@ -4,134 +4,40 @@ Captured during the Phase 1 / Phase 2 GoGoVernier debug saga. Each entry
 is a non-obvious fact that cost real time to discover. Future maintainers
 should read this before tweaking BLE / log / Serial config.
 
-## Session-end snapshot — pick up here
+## Status: shipped in 2.0.0
 
-Phase 4 multi-device backend complete on both sides. Wire is v2,
-vernier owns a 3-slot pool with first-free allocation + per-slot
-NVS persistence + slot-aware command routing, host has the slot
-table backend (per-slot dispatch, liveness, enumeration accessors).
+This file's protocol + BLE + logging + corruption sections are the
+durable findings from the Phase 1 → Phase 4 GoGoVernier bring-up
+saga. All of the architectural work referenced in the original
+"session-end snapshot" has shipped in v2.0.0:
 
-What's left for full multi-device: **step 4b** (host UI slot
-list + drill-down per design D8 Option C — touches gogo-display
-+ gogo-firmware UI cases) and **step 5** (multi-device hardware
-smoke with 2-3 GDX devices simultaneously).
+- Notification-driven sample path (`onSample` lambda → depth-2
+  FreeRTOS queue → `waitForSample`).
+- Per-instance `UartAdapter` send mutex closes the shared-`_doc`
+  race.
+- `fclose(stdout)` + `esp_log_set_vprintf(serial_log_vprintf)`
+  silence ESP-IDF / NimBLE-host stdio bleed onto UART0.
+- Slot pool (3-slot `slots[]` array, first-free allocation,
+  per-slot NVS `deviceName{0..N}` persistence).
+- Per-frame `dev` byte on every per-slot wire frame; T_DEV_LIST
+  carries the slot table.
+- Host-side liveness watchdog + boot-noise RX drain + implausible-
+  length reset (in gogo-firmware repo).
+- Hardware smoke pass with two GDX sensors paired concurrently.
 
-Single-device behaviour preserved end-to-end at every step:
-legacy callers and v1 peers all transparently land on slot 0
-with identical wire bytes (modulo the optional `dev` field that
-v1 ignores).
+What's coming in v2.1.0 — see `.claude/plans/release-2.1.0.md`:
 
-Key recent work (this session):
-- Step 2: protocol v2 bump — non-breaking in either direction.
-  Both firmwares now declare VERNIER_PROTOCOL_VERSION=2 and
-  VERNIER_MAX_SLOTS=3.
-- Step 3: vernier slot pool — 8 sub-commits, see plan doc for
-  the SHA list and per-commit scope.
-- Step 4a: host backend slot table — 5 sub-commits. UI still
-  renders slot 0 only via the legacy accessors that route
-  through `_slots[_primary_slot=0]`. cyclePrimarySlot() and
-  slot-indexed accessors ready for step 4b's UI to consume.
+- Offload `dev.connect()` from `uartHandler` to a dedicated
+  `bleWorker` task so the 5–7 s BLE handshake doesn't stall
+  host-command parsing (closes the "mid-handshake C_DISCONNECT
+  race" called out in vernier-mcu-internals.md).
+- Hygiene sweep (H1–H6) for code-quality cleanup that surfaced
+  during the 2.0.0 ship review.
+- Hardware validation against 3-way concurrent C_CONNECT.
 
-Working-tree state: clean on both sides (all step-3 + step-4a
-commits committed; vernier pushed to develop; host on
-feature/co-mcu-auto-detect branch, not yet pushed).
-
-Key wins from the corruption-debug saga (full detail below in
-"UART corruption saga"):
-- Per-task UartAdapter mutex closes a shared-`_doc` race that was
-  silent in polling mode but produced length/body mismatches as
-  soon as push mode started concurrent sends.
-- `fclose(stdout)` + custom `esp_log_set_vprintf` silence
-  ESP-IDF / NimBLE-host raw printf bleed onto UART0 = our
-  `gogoSerial`. NimBLE init log strings were the wire garbage.
-- Host-side: drain RX at boot (kills ESP32-C3 ROM bootloader
-  noise), reset receiver state on implausible length (instead
-  of `SKIP_PAYLOAD` for thousands of fake bytes), liveness
-  watchdog in `GoGoVernier::poll()` for self-healing against
-  silent peer death.
-
-State on disk (uncommitted at cleanup time):
-
-**Submodule `lib/GoGoVernier`** (5 files):
-- `src/GoGoVernier.cpp` — Phase 4 step 1: `decodeMeasurement`
-  skips `sample_ready=true` when `on_sample` is bound. Plus
-  k* → SCREAMING_SNAKE rename + new constants extraction.
-- `src/{GoGoVernier.h, D2PIOProtocol.h, transport/BleTransport.h,
-  transport/NimBleXport.cpp}` — k* → SCREAMING_SNAKE renames
-  (no logic change) + extracted MTU/scan/disconnect timing
-  constants in NimBleXport.
-
-**Parent `vernier-firmware`** (mine):
-- `include/uart-adapter.h` — `_send_mutex` member + dtor.
-- `src/uart-adapter.cpp` — mutex-protected sendXxx, namespace
-  constants for frame layout, SendLock RAII.
-- `include/vernier-adapter.h` — push queue plumbing
-  (`_sample_queue`, `_push_dropped`), `waitForSample`,
-  `isReady()`, queue-depth + period constants.
-- `src/vernier-adapter.cpp` — ctor creates queue, connect()
-  installs onSample lambda + resets push counter, disconnect()
-  clears cb then resets queue, waitForSample impl.
-- `src/main.cpp` — Phase 4 vernierHandler rewrite (block on
-  `waitForSample`), `serial_log_vprintf` custom hook,
-  `esp_log_set_vprintf` install, `fclose(stdout/stderr)`,
-  magic-number cleanup constants block.
-
-**Host `gogo-firmware`** (mine):
-- `include/peripherals/gogo-vernier.h` — `_lastFrameMs` member.
-- `include/utils/framed-msgpack-receiver.h` — `_len > _bufSize`
-  → `reset()` (was `SKIP_PAYLOAD` for N bytes); rate-limited
-  desync warn.
-- `src/peripherals/gogo-vernier.cpp` — `poll()` drains 8 frames
-  per call + liveness watchdog; `_handleFrame` updates
-  `_lastFrameMs`; T_HELLO calls `_resetConnectionState()`;
-  T_ACK match relaxed for C_DISCONNECT.
-- `src/gogo-firmware.cpp` — `extSerial` RX drained at boot
-  (50 ms after begin) to discard ESP32-C3 ROM bootloader noise.
-
-Untouched in user's working tree (don't commit as part of this
-session): `.gitignore`, `CLAUDE.md`, `platformio.ini`,
-`include/display/gogo-display.h`, `src/display/gogo-display.cpp`.
-
-Latest committed parent-branch HEAD before this session's batch:
-`d126a45` (docs Phase 3 snapshot + race-window note). Submodule
-pointer in that commit: `c85a1b7`.
-
-Pinned platform: `pioarduino/...stable...` (NimBLE-Arduino backend, no
-55.03.34 pin needed any more — the 55.03.34 workaround was for the old
-ArduinoBLE stack).
-
-Local-only: both submodule + parent are ahead of origin. Push order
-matters — submodule first, then parent, otherwise origin parent
-points at unreachable submodule SHA.
-
-Not yet hardware-verified (code paths landed but not exercised in
-real-world conditions):
-
-- Mut-ex enforce in `enableSensor()` and `open()` default — needs
-  GDX-3MG or GDX-ACC. GDX-LC has no conflicts so default-enable
-  produced full mask (no `ch* skipped` lines).
-- `MEAS_DROPPED` decode — needs sustained period overrun. GDX-LC
-  at 1 Hz never drops.
-- `isReady()` second-connect path — needs two host C_CONNECT
-  commands after handshake completes. The boot-time race was
-  absorbed by session_mutex in this trace.
-
-To resume in the next session:
-
-1. Read `.claude/plans/gdxlib-rewrite.md` Phase 4 section — items
-   listed in execution order.
-2. Phase 4 step 1 (notification-driven sample path) is the
-   uncommitted change above; smoke + commit before moving on.
-3. Next Phase 4 item: drop `g_ble_mutex` during the 500 ms
-   async-disconnect wait in `NimBleXport::disconnect`. Pathological
-   for multi-device throughput as-is — three instances each holding
-   the mutex up to 500 ms during teardown serialises all of them.
-4. Then: slot table in `vernier-adapter` + per-frame `dev` byte in
-   the host UART protocol. Requires coordinating with the GoGo MCU
-   side.
-5. Don't re-derive protocol details from godirect-py; they're all
-   here. Re-read this file's "Protocol" section if any wire-level
-   question surfaces.
+The protocol / BLE / corruption findings below remain canonical
+references — read them first before tweaking any wire, BLE, or
+log config.
 
 ## Protocol
 
@@ -497,35 +403,31 @@ Document so a future debugger doesn't chase them as "new bugs":
 - **`_impl->dropped` increment.** Single-writer (notify task) +
   aligned u32 read from caller via `droppedSamples()`. Not
   actually a race on RV32 — atomic load + atomic increment from
-  the only writer. Reviewer flagged it as one; documented here
-  so the same flag doesn't reappear next review.
+  the only writer. The vernier-firmware-side counter
+  `VernierAdapter::_push_dropped` was promoted to
+  `std::atomic<uint32_t>` in H2 (v2.1.0 hygiene sweep) to
+  document the contract; the GoGoVernier-side `dropped` counter
+  is still a plain u32 because the access pattern is single-
+  writer single-reader and the read is aligned.
 
-## Multi-device readiness (Phase 4 prep)
+## Multi-device readiness — shipped in 2.0.0
 
-Done:
-- ✅ `g_active_impl` removed. `NimBleXport::subscribe` passes
-  h2zero a `std::function` lambda capturing `Impl*` directly.
-  Per-instance routing — two GoGoVernier instances no longer
-  steal each other's notifications. Lambda indirects through
-  `Impl::on_notify` so `unsubscribe()` nulling it makes the
-  callback no-op cleanly during teardown.
-- ✅ dtor UAF surface reduced. `NimBLEDevice::deleteClient` inside
-  `disconnect()` clears the subscription before `~NimBleXport`
-  deletes `_impl`. A late notify dispatched from the host task
-  hits a nulled `on_notify` and returns.
+All three blockers called out during the Phase 4 prep are
+resolved on the develop / 2.0.0 tag:
 
-Still single-instance because of:
-- `disconnect()` holds `g_ble_mutex` for up to 500 ms during the
-  async-disconnect wait. Multi-device throughput would suffer;
-  drop the mutex during the wait and retake before `deleteClient`.
-- `vernier-adapter` is a single global, not a slot table. Needs
-  `VernierAdapter[CONFIG_NIMBLE_MAX_CONNECTIONS]` keyed by a
-  device id.
-- Host UART protocol (`include/uart-adapter.h`) has no per-device
-  field. Frames need a `dev` (u8) byte on `T_DEVINFO` /
-  `T_DEVSTATS` / `T_FIELDS` / `T_SENS_VALUES`. Add `T_DEV_LIST`
-  for the host to enumerate occupied slots. `T_HELLO` stays
-  device-agnostic.
+- Per-instance notify routing via `NimBleXport::subscribe`'s
+  `std::function` lambda capturing `Impl*` (no global
+  `g_active_impl`).
+- `disconnect()` releases `g_ble_mutex` during the 500 ms
+  async-disconnect wait so the controller isn't serialised
+  across slot teardowns.
+- `vernier-adapter` is a `VernierAdapter slots[VERNIER_MAX_SLOTS]`
+  array; protocol v2 carries an optional `dev` byte on every
+  per-slot frame and T_DEV_LIST enumerates the table.
+
+Open follow-up tracked separately: the `uartHandler` task still
+blocks on `dev.connect()`. See `.claude/plans/release-2.1.0.md`
+for the bleWorker design.
 
 ## Reference implementations cross-checked
 
