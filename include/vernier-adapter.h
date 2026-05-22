@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 #include "GoGoVernier.h"
 
@@ -87,6 +88,18 @@ public:
     // other write happening-before this one.
     ConnState state() const { return _conn_state.load(std::memory_order_relaxed); }
     void setState(ConnState s) { _conn_state.store(s, std::memory_order_relaxed); }
+
+    // H6: per-slot mutex protecting the cached status struct (battery,
+    // charge, rssi, RSSI etc. served by the *Percent / *State / rssi()
+    // accessors) against torn multi-field reads. getDeviceInfo() —
+    // which calls _gv.refreshStatus() and writes those fields —
+    // takes the mutex internally. Callers that need an atomic snapshot
+    // across the three status fields (publishConnectResult's
+    // sendDeviceStats, vernierHandler's 10 s refresh push) wrap their
+    // read block in lockStatus()/unlockStatus(). timeout_ms == 0 means
+    // try-lock (non-blocking). Returns false on contention.
+    bool lockStatus(uint32_t timeout_ms = portMAX_DELAY);
+    void unlockStatus();
     uint16_t samplingPeriod() const { return _period_ms.load(std::memory_order_relaxed); }
 
     // Total dropped sample count: GoGoVernier's internal "previous
@@ -173,4 +186,13 @@ private:
     // cmdConnect. memory_order_relaxed because transitions don't carry
     // ordering w.r.t. other adapter state.
     std::atomic<ConnState> _conn_state{ConnState::IDLE};
+
+    // H6 per-slot status mutex. Created in ctor (process-lifetime),
+    // taken inside getDeviceInfo() and by external callers via
+    // lockStatus() / unlockStatus(). Guards the (refreshStatus + read)
+    // window against vernierHandler's 10 s wall-clock refresh racing
+    // bleWorker's end-of-publishConnectResult getDeviceInfo on the
+    // same slot. Per-slot rather than global so concurrent connects on
+    // different slots don't serialise on each other's status reads.
+    SemaphoreHandle_t _status_mutex = nullptr;
 };

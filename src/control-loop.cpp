@@ -41,6 +41,30 @@ constexpr uint32_t NO_HOST_REQUEST = 0xFFFFFFFFu;
 unsigned long startPressTime  = 0;
 ButtonEvent   prevButtonEvent = BUTTON_RELEASE;
 
+// bleWorker queue + task config (G006). Queue depth matches the
+// per-slot natural bound — one in-flight connect per slot. The
+// stack size mirrors UART_TASK_STACK in main.cpp because the worker
+// inherits the same call depth (GoGoVernier::open → NimBLEScan +
+// NimBLEClient discovery dives ~4 KB on its own).
+constexpr UBaseType_t BLE_WORKER_QUEUE_DEPTH = VERNIER_MAX_SLOTS;
+constexpr uint16_t    BLE_WORKER_STACK       = 6144;
+// Same priority as uart/vernier handlers — same-priority round-robin
+// keeps sample-stream throughput predictable; the plan's "priority
+// between" suggestion was conditional on uart being bumped up, which
+// isn't part of G006.
+constexpr UBaseType_t BLE_WORKER_PRIO        = 1;
+
+// ConnectRequest queued by enqueueConnect, drained by bleWorkerEntry.
+// 12 bytes per item with natural alignment on RV32.
+struct ConnectRequest {
+    uint8_t  slot;
+    bool     force;
+    uint32_t req_seq;   // NO_HOST_REQUEST when not host-driven.
+};
+
+QueueHandle_t bleWorkQueue = nullptr;
+TaskHandle_t  bleWorkerTaskHandle = nullptr;
+
 }  // namespace
 
 static void emitDevList();           // forward decl — defined below for grouping
@@ -105,7 +129,13 @@ static void publishConnectResult(uint8_t slot, bool ok, uint32_t req_seq)
         uart.sendHello();                                     // global — no dev
         uart.sendStatus(true, UartAdapter::CORE_STATE_READY); // global — no dev (per protocol-v2 spec)
         uart.sendDeviceInfo(dev.deviceName(), dev.orderCode(), dev.serialNumber(), slot);
+        // H6: hold the per-slot status mutex across the multi-field
+        // read so vernierHandler's 10 s refresh can't tear the
+        // battery/charge/rssi triple mid-evaluation. Recursive mutex
+        // means the getDeviceInfo() above re-entered cleanly.
+        dev.lockStatus();
         uart.sendDeviceStats(dev.batteryPercent(), dev.chargeState(), dev.rssi(), dev.droppedSamples(), slot);
+        dev.unlockStatus();
         sendDeviceFieldsFor(uart, dev, slot);
 
         // Persist last connected device name to NVS under the per-slot
@@ -139,6 +169,61 @@ static void publishConnectResult(uint8_t slot, bool ok, uint32_t req_seq)
     // (success OR failure — the failure case still tells the host that
     // its connect didn't take, so the slot table stays accurate).
     emitDevList();
+}
+
+// bleWorker entry — drains ConnectRequest items from bleWorkQueue
+// one at a time and runs the full connect resolution on its own
+// task. Producer set (G007): cmdConnect, buttonHandler,
+// autoConnectDevice. In G006 the queue stays empty so the task
+// just parks on the receive.
+//
+// Per §Decisions Q1: a request for a slot already in REQUESTED /
+// CONNECTING is rejected at the enqueue site (cmdConnect's busy
+// guard), so the worker is the SOLE state-machine driver from
+// CONNECTING → READY / FAILED → IDLE.
+//
+// Per §Decisions Q3: state transitions piggyback on T_DEV_LIST.
+// We emit it once before dev.connect() (CONNECTING transition) so
+// the host can render a "connecting" affordance while the BLE
+// handshake settles; publishConnectResult emits it again at the
+// tail (READY / FAILED transition).
+static void bleWorkerEntry(void *)
+{
+    for (;;)
+    {
+        ConnectRequest req{};
+        if (xQueueReceive(bleWorkQueue, &req, portMAX_DELAY) != pdTRUE)
+            continue;
+
+        if (!slotInRange(req.slot))
+        {
+            if (req.req_seq != NO_HOST_REQUEST)
+                uart.sendAck(req.req_seq, false, "slot out of range");
+            continue;
+        }
+
+        slots[req.slot].setState(VernierAdapter::ConnState::CONNECTING);
+        emitDevList();
+
+        const bool ok = slots[req.slot].connect(req.force);
+
+        slots[req.slot].setState(ok ? VernierAdapter::ConnState::READY
+                                    : VernierAdapter::ConnState::FAILED);
+        publishConnectResult(req.slot, ok, req.req_seq);
+
+        // FAILED is a transient signal — once publishConnectResult has
+        // NACKed the host, drop back to IDLE so the next C_CONNECT on
+        // this slot isn't blocked by the busy-guard in cmdConnect.
+        if (!ok) slots[req.slot].setState(VernierAdapter::ConnState::IDLE);
+    }
+}
+
+void bleWorkerStart()
+{
+    if (bleWorkerTaskHandle) return;  // idempotent
+    bleWorkQueue = xQueueCreate(BLE_WORKER_QUEUE_DEPTH, sizeof(ConnectRequest));
+    xTaskCreate(bleWorkerEntry, "BleWorker", BLE_WORKER_STACK,
+                nullptr, BLE_WORKER_PRIO, &bleWorkerTaskHandle);
 }
 
 // Marshal slot table from slots[] into UartAdapter::DevListEntry[]

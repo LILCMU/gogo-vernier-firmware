@@ -29,11 +29,31 @@ VernierAdapter::VernierAdapter()
     // ~300 KB free DRAM.
     _sample_queue = xQueueCreate(VERNIER_SAMPLE_QUEUE_DEPTH,
                                  sizeof(gogo_vernier::Sample));
+    // H6 per-slot status mutex. Held during refreshStatus + the
+    // multi-field status read at the call sites; see header doc.
+    // Recursive so callers can wrap (getDeviceInfo + accessor reads)
+    // in one lockStatus block — getDeviceInfo takes the mutex too.
+    _status_mutex = xSemaphoreCreateRecursiveMutex();
 }
 
 VernierAdapter::~VernierAdapter()
 {
     if (_sample_queue) vQueueDelete(_sample_queue);
+    if (_status_mutex) vSemaphoreDelete(_status_mutex);
+}
+
+bool VernierAdapter::lockStatus(uint32_t timeout_ms)
+{
+    if (!_status_mutex) return false;
+    const TickType_t ticks = (timeout_ms == portMAX_DELAY)
+                                 ? portMAX_DELAY
+                                 : pdMS_TO_TICKS(timeout_ms);
+    return xSemaphoreTakeRecursive(_status_mutex, ticks) == pdTRUE;
+}
+
+void VernierAdapter::unlockStatus()
+{
+    if (_status_mutex) xSemaphoreGiveRecursive(_status_mutex);
 }
 
 bool VernierAdapter::connect(bool forceConnect)
@@ -159,7 +179,11 @@ void VernierAdapter::stopReading()
 void VernierAdapter::getDeviceInfo(bool force)
 {
     if (!_gv.isConnected() && !force) return;
+    // H6: hold _status_mutex across refreshStatus so a concurrent
+    // multi-field read via lockStatus() can't tear across the write.
+    lockStatus();
     _gv.refreshStatus();
+    unlockStatus();
 }
 
 uint32_t VernierAdapter::droppedSamples() const  { return _gv.droppedSamples() + _push_dropped.load(std::memory_order_relaxed); }

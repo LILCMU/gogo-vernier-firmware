@@ -210,10 +210,16 @@ void vernierHandler(void *parameter)
             // on a fixed wall-clock interval and push to the host only when
             // something actually changed (RSSI needs a small threshold since
             // it naturally jitters by 1 dBm on a quiet link).
+            //
+            // H6: refresh + read happen under lockStatus() so a concurrent
+            // bleWorker / publishConnectResult getDeviceInfo on the same
+            // slot can't tear the battery/charge/rssi triple. Recursive
+            // mutex makes the nested getDeviceInfo lock safe.
             {
                 uint32_t now = millis();
                 if (now - slotState[i].lastRefreshMs >= DEVSTATS_REFRESH_MS)
                 {
+                    dev.lockStatus();
                     dev.getDeviceInfo(true);
                     slotState[i].lastRefreshMs = now;
 
@@ -221,6 +227,8 @@ void vernierHandler(void *parameter)
                     int charge   = dev.chargeState();
                     int rssi     = dev.rssi();
                     uint32_t drop = dev.droppedSamples();
+                    dev.unlockStatus();
+
                     bool changed = (batt != slotState[i].lastPushedBatt)
                                 || (charge != slotState[i].lastPushedCharge)
                                 || (abs(rssi - slotState[i].lastPushedRssi) >= RSSI_CHANGE_THRESHOLD)
@@ -380,6 +388,13 @@ void setup()
         NULL,
         HANDLER_TASK_PRIO,
         &vernierProcessTask);
+
+    // bleWorker task (G006) — drains the ConnectRequest queue and
+    // runs dev.connect() off the uartHandler critical path. No
+    // producer in G006; cmdConnect / buttonHandler / autoConnectDevice
+    // are cut over to enqueueConnect in G007. The worker just parks
+    // on its queue until then.
+    bleWorkerStart();
 }
 
 void loop()
