@@ -29,22 +29,23 @@ VernierAdapter::VernierAdapter()
     // ~300 KB free DRAM.
     _sample_queue = xQueueCreate(VERNIER_SAMPLE_QUEUE_DEPTH,
                                  sizeof(gogo_vernier::Sample));
+    configASSERT(_sample_queue);
     // H6 per-slot status mutex. Held during refreshStatus + the
     // multi-field status read at the call sites; see header doc.
     // Recursive so callers can wrap (getDeviceInfo + accessor reads)
     // in one lockStatus block — getDeviceInfo takes the mutex too.
     _status_mutex = xSemaphoreCreateRecursiveMutex();
+    configASSERT(_status_mutex);
 }
 
 VernierAdapter::~VernierAdapter()
 {
-    if (_sample_queue) vQueueDelete(_sample_queue);
-    if (_status_mutex) vSemaphoreDelete(_status_mutex);
+    vQueueDelete(_sample_queue);
+    vSemaphoreDelete(_status_mutex);
 }
 
 bool VernierAdapter::lockStatus(uint32_t timeout_ms)
 {
-    if (!_status_mutex) return false;
     const TickType_t ticks = (timeout_ms == portMAX_DELAY)
                                  ? portMAX_DELAY
                                  : pdMS_TO_TICKS(timeout_ms);
@@ -53,7 +54,7 @@ bool VernierAdapter::lockStatus(uint32_t timeout_ms)
 
 void VernierAdapter::unlockStatus()
 {
-    if (_status_mutex) xSemaphoreGiveRecursive(_status_mutex);
+    xSemaphoreGiveRecursive(_status_mutex);
 }
 
 bool VernierAdapter::connect(bool forceConnect)
@@ -104,7 +105,7 @@ bool VernierAdapter::connect(bool forceConnect)
         // Reset push-side drop counter and drain any stale samples
         // left in the queue from a previous session.
         _push_dropped.store(0, std::memory_order_relaxed);
-        if (_sample_queue) xQueueReset(_sample_queue);
+        xQueueReset(_sample_queue);
 
         // Wire the push path. Lambda runs on the NimBLE notify task —
         // must be non-blocking. xQueueSend with timeout=0 drops on
@@ -197,8 +198,6 @@ uint8_t  VernierAdapter::channelCount() const    { return _gv.channelCount(); }
 bool VernierAdapter::waitForSample(float *out, size_t &count, uint32_t timeout_ms)
 {
     count = 0;
-    if (!_sample_queue) return false;
-
     gogo_vernier::Sample s;
     if (xQueueReceive(_sample_queue, &s, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
         return false;

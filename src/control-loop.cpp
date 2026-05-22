@@ -41,13 +41,6 @@ constexpr uint32_t NO_HOST_REQUEST = 0xFFFFFFFFu;
 unsigned long startPressTime  = 0;
 ButtonEvent   prevButtonEvent = BUTTON_RELEASE;
 
-// bleWorker queue config (G006). Queue depth matches the per-slot
-// natural bound — one in-flight connect per slot at most. Stack +
-// priority come from main.h (TASK_STACK_BLE_HEAVY, HANDLER_TASK_PRIO)
-// so they stay in sync with uartHandler's matching values; see the
-// G006 review note.
-constexpr UBaseType_t BLE_WORKER_QUEUE_DEPTH = VERNIER_MAX_SLOTS;
-
 // ConnectRequest queued by enqueueConnect, drained by bleWorkerEntry.
 // Layout on RV32: u8 slot + bool force + 2 B pad + u32 req_seq = 8 B.
 struct ConnectRequest {
@@ -86,7 +79,7 @@ static bool enqueueConnect(uint8_t slot, bool force, uint32_t req_seq)
     configASSERT(slotInRange(slot));
     slots[slot].setState(VernierAdapter::ConnState::REQUESTED);
     ConnectRequest req{slot, force, req_seq};
-    if (!bleWorkQueue || xQueueSend(bleWorkQueue, &req, 0) != pdTRUE)
+    if (xQueueSend(bleWorkQueue, &req, 0) != pdTRUE)
     {
         // Rollback. The slot briefly flickered IDLE→REQUESTED→IDLE.
         // No T_DEV_LIST was emitted during the REQUESTED window so
@@ -205,14 +198,6 @@ static void bleWorkerEntry(void *)
         if (xQueueReceive(bleWorkQueue, &req, portMAX_DELAY) != pdTRUE)
             continue;
 
-        // Defensive — producers validate slotInRange before enqueueing.
-        if (!slotInRange(req.slot))
-        {
-            log_e("bleWorker: dropped out-of-range slot=%u",
-                  (unsigned)req.slot);
-            continue;
-        }
-
         // CAS REQUESTED → CONNECTING. If cmdCancelConnect won the race
         // and already flipped the slot to IDLE, the CAS fails and we
         // skip — cmdCancelConnect already emitted the IDLE T_DEV_LIST
@@ -223,53 +208,20 @@ static void bleWorkerEntry(void *)
                   (unsigned)req.slot);
             continue;
         }
-        // Push the CONNECTING transition so the host renders the
-        // spinner while the BLE handshake settles.
         emitDevList();
-
-        const bool ok = slots[req.slot].connect(req.force);
-
-        // publishConnectResult handles the terminal state transition
-        // (READY on success, IDLE on failure) at its tail — that
-        // ordering is what closes the T_SENS_VALUES-before-T_FIELDS
-        // window vernierHandler would otherwise hit. cmdConnect's
-        // early-ACK ("queued") covers the host's "did my request
-        // take?" question; outcome rides out via the emitDevList
-        // publishConnectResult emits after the state publish (Q3
-        // piggyback). req.req_seq survives in the ConnectRequest
-        // struct for future log/trace correlation but is unused here.
-        publishConnectResult(req.slot, ok);
+        publishConnectResult(req.slot, slots[req.slot].connect(req.force));
     }
 }
 
 void bleWorkerStart()
 {
-    // Idempotent against repeated calls AND against partial-failure
-    // restart. Order: queue first, then task. If the task create
-    // fails after the queue is up, free the queue so the next
-    // bleWorkerStart() rebuilds from scratch.
-    if (bleWorkerTaskHandle) return;
-    if (!bleWorkQueue)
-    {
-        bleWorkQueue = xQueueCreate(BLE_WORKER_QUEUE_DEPTH,
-                                    sizeof(ConnectRequest));
-        if (!bleWorkQueue)
-        {
-            log_e("bleWorkerStart: xQueueCreate failed");
-            return;
-        }
-    }
+    bleWorkQueue = xQueueCreate(VERNIER_MAX_SLOTS, sizeof(ConnectRequest));
+    configASSERT(bleWorkQueue);
     const BaseType_t ok = xTaskCreate(bleWorkerEntry, "BleWorker",
                                       TASK_STACK_BLE_HEAVY, nullptr,
                                       HANDLER_TASK_PRIO,
                                       &bleWorkerTaskHandle);
-    if (ok != pdPASS)
-    {
-        log_e("bleWorkerStart: xTaskCreate failed");
-        vQueueDelete(bleWorkQueue);
-        bleWorkQueue = nullptr;
-        bleWorkerTaskHandle = nullptr;
-    }
+    configASSERT(ok == pdPASS);
 }
 
 // Marshal slot table from slots[] into UartAdapter::DevListEntry[]
