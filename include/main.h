@@ -1,9 +1,16 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
-#define BOOT_BUTTON_PIN 9
-#define BUTTON_LONG_PRESS_THRESHOLD 2000
+// Boot button GPIO on the esp32-c3-devkitm-1 — the only physical input
+// the firmware reads. Active-low (internal pull-up assumed by reader).
+constexpr uint8_t  BOOT_BUTTON_PIN              = 9;
+// Press duration that distinguishes "short tap" from "long hold" in
+// buttonHandler(). Short → connect first-free slot via proximity scan;
+// long → disconnect every active slot. 2 s is comfortably above
+// accidental-touch territory and short enough to not feel sluggish.
+constexpr uint32_t BUTTON_LONG_PRESS_MS         = 2000;
 
 enum ButtonEvent {
     BUTTON_RELEASE,

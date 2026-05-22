@@ -21,6 +21,5 @@ void autoConnectDevice();
 
 // Poll the BOOT button and dispatch press / long-press semantics.
 // Short press → connect first-free slot via proximity scan.
-// Long press (≥ BUTTON_LONG_PRESS_THRESHOLD) → disconnect every
-// active slot.
+// Long press (≥ BUTTON_LONG_PRESS_MS) → disconnect every active slot.
 void buttonHandler();

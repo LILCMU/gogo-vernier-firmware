@@ -110,5 +110,10 @@ private:
     // drained by waitForSample(), filled by an onSample lambda
     // installed on connect() success and cleared on disconnect().
     QueueHandle_t _sample_queue = nullptr;
-    uint32_t      _push_dropped = 0;  // queue-full drops
+    // queue-full drops. Written by the NimBLE notify task (push lambda
+    // installed in connect()), read by vernierHandler via droppedSamples().
+    // volatile per CLAUDE.md cross-task rule — the lambda captures a
+    // `volatile uint32_t*` so the increment can't be hoisted across
+    // FreeRTOS task boundaries.
+    volatile uint32_t _push_dropped = 0;
 };

@@ -75,11 +75,14 @@ bool VernierAdapter::connect(bool forceConnect)
         // full and bumps the counter; the host MCU sees the count
         // via the next DEVSTATS push.
         QueueHandle_t q = _sample_queue;
-        uint32_t* drop_counter = &_push_dropped;
+        volatile uint32_t* drop_counter = &_push_dropped;
         _gv.onSample([q, drop_counter](const gogo_vernier::Sample& s) {
             if (!q) return;
             if (xQueueSend(q, &s, 0) != pdTRUE) {
-                ++(*drop_counter);
+                // Explicit load+store sidesteps C++20 -Wdeprecated-volatile
+                // on the compound `++`. _push_dropped is volatile by
+                // design — see vernier-adapter.h.
+                *drop_counter = static_cast<uint32_t>(*drop_counter) + 1;
             }
         });
     }

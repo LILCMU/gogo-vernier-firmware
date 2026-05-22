@@ -8,6 +8,12 @@ using OnMsgPackMessage = void (*)(JsonVariantConst root, void *user);
 class FramedMsgPackReceiver
 {
 public:
+    // Stack-buffer size used to drain oversized frame payloads in
+    // SKIP_PAYLOAD chunks. Sized to absorb a typical UART burst in one
+    // readBytes() without inflating the per-call stack frame — UART0
+    // RX FIFO is 128 B on ESP32-C3, half that is plenty per pump tick.
+    static constexpr size_t kSkipScratchSize = 64;
+
     FramedMsgPackReceiver(Stream &in, uint8_t *buffer, size_t bufferSize)
         : _in(in), _buf(buffer), _bufSize(bufferSize)
     {
@@ -133,7 +139,7 @@ private:
             // FIFO drained between available() and the read, and the old
             // byte-by-byte loop would silently skip non-existent bytes,
             // de-syncing the next length parse.
-            uint8_t scratch[64];
+            uint8_t scratch[kSkipScratchSize];
             size_t want = (size_t)avail < _skip ? (size_t)avail : _skip;
             if (want > sizeof(scratch))
                 want = sizeof(scratch);

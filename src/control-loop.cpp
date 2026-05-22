@@ -97,7 +97,12 @@ static bool connectAndReport(uint8_t slot,
             // Mark this slot as eligible for future auto-connect on
             // boot — even though we won't reach autoConnectDevice
             // again until the next reboot + C_SET_PERIOD trigger.
+            // Cross-task publish (see CLAUDE.md Code Quality Rules):
+            // fill the per-slot flag, fence, then flip the global
+            // "any saved?" flag the readers (cmdSetPeriod /
+            // autoConnectDevice) poll.
             slotHasSavedDevice[slot] = true;
+            __asm__ volatile("" ::: "memory");
             foundSavedDevice = true;
         }
     }
@@ -167,7 +172,7 @@ void buttonHandler()
     {
         if (prevButtonEvent == BUTTON_PRESS)
         {
-            if ((millis() - startPressTime) > BUTTON_LONG_PRESS_THRESHOLD)
+            if ((millis() - startPressTime) > BUTTON_LONG_PRESS_MS)
             {
                 prevButtonEvent = BUTTON_LONG_PRESS;
 
@@ -284,7 +289,7 @@ static void cmdConnect(JsonVariantConst root, uint32_t req)
     }
     // force=true: probe nearby for a NEW pairing rather than re-attempting
     // the slot's saved name. Host C_CONNECT semantics = "connect to
-    // whatever's around", matching pre-Phase-4 behaviour.
+    // whatever's around".
     log_i("C_CONNECT: target slot=%u (%s)",
           (unsigned)target_slot,
           hasDev ? "host-specified" : "first-free");

@@ -101,11 +101,7 @@ Preferences preferences;
 
 HardwareSerial gogoSerial(0);
 
-// `vernier` aliases slots[0] for the debug per-channel value dump in
-// loop() — it's the only caller that still wants the "first slot" as
-// a singleton handle. All other paths iterate slots[] explicitly.
 VernierAdapter slots[VERNIER_MAX_SLOTS];
-VernierAdapter &vernier = slots[0];
 UartAdapter uart(gogoSerial);
 
 TaskHandle_t uartProcessTask, vernierProcessTask;
@@ -321,18 +317,19 @@ void setup()
         }
         else
         {
-            // One-shot migration: if legacy "deviceName" exists but new
-            // "deviceName0" doesn't, copy across. Won't run again on
-            // subsequent boots because deviceName0 will then exist.
-            if (preferences.isKey(NVS_KEY_DEVICE_NAME)
-                && !preferences.isKey("deviceName0"))
+            // One-shot migration: if legacy "deviceName" exists but the
+            // slot-0 key doesn't, copy across. Won't run again on
+            // subsequent boots because the slot-0 key will then exist.
+            char slot0_key[NVS_KEY_MAX_LEN];
+            snprintf(slot0_key, sizeof(slot0_key), NVS_KEY_DEVICE_NAME_FMT, 0u);
+            if (preferences.isKey(NVS_KEY_DEVICE_NAME) && !preferences.isKey(slot0_key))
             {
                 String legacy = preferences.getString(NVS_KEY_DEVICE_NAME, "");
                 if (legacy.length() > 0 && legacy != VERNIER_DEFAULT_DEVICE_NAME)
                 {
-                    preferences.putString("deviceName0", legacy.c_str());
-                    log_i("NVS migration: %s -> deviceName0 (%s)",
-                          NVS_KEY_DEVICE_NAME, legacy.c_str());
+                    preferences.putString(slot0_key, legacy.c_str());
+                    log_i("NVS migration: %s -> %s (%s)",
+                          NVS_KEY_DEVICE_NAME, slot0_key, legacy.c_str());
                 }
             }
 
@@ -384,6 +381,11 @@ void loop()
 
 #if CHECK_LOGGING_FLAG(ENABLE_LOGGING_DEBUG)
     static unsigned long startDebugTime = 0;
+    // slots[0] alias — the per-channel dump below is the only consumer
+    // and only in debug builds, so the reference lives inline rather
+    // than as a file-scope global the release build would carry as an
+    // unused symbol.
+    VernierAdapter &vernier = slots[0];
 
     // INFO: dynamic debug output of all available channels, this depends on the sampling period
     if (vernier.isStreaming() && (millis() - startDebugTime) > vernier.samplingPeriod())
