@@ -383,6 +383,16 @@ static void cmdSetPeriod(JsonVariantConst root, uint32_t req)
                      static_cast<int16_t>(dev));
         return;
     }
+    // Reject sub-min periods. GoGoVernier would forward them to the
+    // device which then either rejects with an error frame or thrashes
+    // start/stop trying to honour them — neither helps the host. Surface
+    // it as a NACK so a misbehaving host learns about its own bug.
+    if (period32 < VERNIER_MIN_PERIOD_MS)
+    {
+        uart.sendAck(req, false, "period below min",
+                     static_cast<int16_t>(dev));
+        return;
+    }
     uint16_t period = static_cast<uint16_t>(period32);
     slots[dev].setSamplingRate(period);
     uart.sendAck(req, true, "rate set", static_cast<int16_t>(dev));

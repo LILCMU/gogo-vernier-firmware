@@ -15,6 +15,14 @@ const constexpr char *VERNIER_DEFAULT_DEVICE_NAME = "proximity";
 // "no surprises" landing value on a fresh boot.
 constexpr uint16_t VERNIER_DEFAULT_PERIOD_MS = 1000;
 
+// Lower bound on the sampling period the host may request via
+// C_SET_PERIOD. 10 ms is well above the FreeRTOS tick floor and
+// matches the fastest period any documented GDX sensor accepts;
+// anything below this is treated as a host bug rather than passed
+// through to GoGoVernier (which would happily spin start/stop on
+// sub-ms values).
+constexpr uint16_t VERNIER_MIN_PERIOD_MS = 10;
+
 // Push-mode sample queue depth — see VernierAdapter() ctor for sizing
 // rationale.
 constexpr UBaseType_t VERNIER_SAMPLE_QUEUE_DEPTH = 2;
