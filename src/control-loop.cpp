@@ -43,7 +43,8 @@ ButtonEvent   prevButtonEvent = BUTTON_RELEASE;
 
 }  // namespace
 
-static void emitDevList();  // forward decl — defined below connectAndReport for grouping
+static void emitDevList();           // forward decl — defined below for grouping
+static void publishConnectResult(uint8_t slot, bool ok, uint32_t req_seq);
 
 // connectAndReport(slot, req_seq, force):
 //   slot     — target slot in slots[].
@@ -55,6 +56,12 @@ static void emitDevList();  // forward decl — defined below connectAndReport f
 //              host C_CONNECT (probe for new pairing) and the BOOT
 //              button. Auto-connect path passes false so it scans for
 //              the slot's NVS-saved name.
+//
+// The body splits at dev.connect() — everything that runs after the
+// connect call lives in publishConnectResult so a future bleWorker
+// task (see .claude/plans/release-2.1.0.md §Design phase 1) can call
+// it with a pre-computed result from a different task context. Today
+// the call stays inline.
 static bool connectAndReport(uint8_t slot,
                              uint32_t req_seq = NO_HOST_REQUEST,
                              bool force = false)
@@ -65,8 +72,26 @@ static bool connectAndReport(uint8_t slot,
             uart.sendAck(req_seq, false, "slot out of range");
         return false;
     }
+    bool ok = slots[slot].connect(force);
+    publishConnectResult(slot, ok, req_seq);
+    return ok;
+}
+
+// publishConnectResult(slot, ok, req_seq):
+//   Side-effect block that runs after dev.connect() resolves.
+//   - On success: refresh status, kick off streaming, emit the
+//     5-frame burst (T_HELLO, T_STATUS, T_DEVINFO, T_DEVSTATS,
+//     T_FIELDS), persist the slot's device name in NVS, and flag
+//     the slot for auto-connect on the next boot.
+//   - On any outcome: emit T_ACK if req_seq is a real host
+//     request, then push T_DEV_LIST so the host's slot table
+//     stays in sync (D4).
+// Caller is responsible for the dev.connect() call itself + the
+// slot-range guard. Safe to call from any task that owns access
+// to the shared globals (uart's send mutex, nvsMutex via NvsScope).
+static void publishConnectResult(uint8_t slot, bool ok, uint32_t req_seq)
+{
     VernierAdapter &dev = slots[slot];
-    bool ok = dev.connect(force);
     if (ok)
     {
         dev.getDeviceInfo();
@@ -114,8 +139,6 @@ static bool connectAndReport(uint8_t slot,
     // (success OR failure — the failure case still tells the host that
     // its connect didn't take, so the slot table stays accurate).
     emitDevList();
-
-    return ok;
 }
 
 // Marshal slot table from slots[] into UartAdapter::DevListEntry[]
