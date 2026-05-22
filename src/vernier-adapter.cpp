@@ -2,6 +2,22 @@
 
 #include <string.h>
 
+#include "uart-adapter.h"  // VERNIER_MAX_SLOTS
+
+// VERNIER_MAX_SLOTS sizes the slots[] array and is advertised to the
+// host via T_HELLO.max_slots. The NimBLE controller can only host as
+// many concurrent peripheral connections as CONFIG_BT_NIMBLE_MAX_CONNECTIONS
+// allows; bumping VERNIER_MAX_SLOTS past that ceiling would silently
+// fail to connect the extra slots at the BLE layer instead of failing
+// loudly at compile time. The static_assert lives in this TU (rather
+// than the slot-count header) because including <nimconfig.h> from
+// uart-adapter.h would couple the wire-protocol layer to the BLE
+// stack; vernier-adapter.cpp already pulls NimBLE in via GoGoVernier.
+static_assert(VERNIER_MAX_SLOTS <= CONFIG_BT_NIMBLE_MAX_CONNECTIONS,
+              "VERNIER_MAX_SLOTS exceeds the NimBLE controller's "
+              "max concurrent connections — bump "
+              "CONFIG_BT_NIMBLE_MAX_CONNECTIONS in nimconfig first.");
+
 VernierAdapter::VernierAdapter()
 {
     // VERNIER_SAMPLE_QUEUE_DEPTH (=2) lets the NimBLE notify task push
