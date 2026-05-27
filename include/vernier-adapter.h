@@ -120,6 +120,21 @@ public:
             expected, ConnState::IDLE, std::memory_order_relaxed);
     }
 
+    // CAS IDLE → REQUESTED for the producer enqueue path
+    // (enqueueConnect). Fails if the slot is already
+    // REQUESTED / CONNECTING / READY, so a duplicate enqueue — e.g. a
+    // second autoConnectDevice pass after the host re-arms
+    // startAutoConnect with another C_SET_PERIOD — becomes a no-op
+    // instead of clobbering the in-flight state or double-queueing
+    // the slot. The atomic claim is what lets enqueueConnect avoid a
+    // rollback-to-IDLE that would corrupt a slot already queued.
+    bool tryRequestConnect()
+    {
+        ConnState expected = ConnState::IDLE;
+        return _conn_state.compare_exchange_strong(
+            expected, ConnState::REQUESTED, std::memory_order_relaxed);
+    }
+
     // H6: per-slot mutex protecting the cached status struct (battery,
     // charge, rssi, RSSI etc. served by the *Percent / *State / rssi()
     // accessors) against torn multi-field reads. getDeviceInfo() —

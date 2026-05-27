@@ -59,13 +59,13 @@ static void publishConnectResult(uint8_t slot, bool ok);
 
 // enqueueConnect(slot, force, req_seq):
 //   Single producer-side helper used by cmdConnect, buttonHandler
-//   and autoConnectDevice. Caller has already validated
-//   slotInRange(slot) and that slots[slot].state() is IDLE — the
-//   busy-guard from §Decisions Q1. Flips the slot to REQUESTED so
-//   a concurrent C_CONNECT for the same slot finds it busy, then
-//   xQueueSends a ConnectRequest. Rolls the slot state back to
-//   IDLE if the queue is full or unavailable. Returns true on
-//   successful enqueue.
+//   and autoConnectDevice. Atomically claims the slot (CAS IDLE →
+//   REQUESTED) and queues a ConnectRequest. Returns false — a no-op,
+//   leaving state untouched — if the slot is already
+//   REQUESTED / CONNECTING / READY, so callers can fire-and-forget
+//   without their own busy-guard and duplicate enqueues (a re-armed
+//   autoConnectDevice pass) don't clobber an in-flight request.
+//   Returns true once the request is queued.
 //
 //   req_seq is carried through to the worker for log/trace
 //   correlation; bleWorker no longer dispatches an ACK from
@@ -77,19 +77,27 @@ static bool enqueueConnect(uint8_t slot, bool force, uint32_t req_seq)
     // a no-op under NDEBUG so this costs nothing in release builds
     // but catches future bypasses at QA time.
     configASSERT(slotInRange(slot));
-    slots[slot].setState(VernierAdapter::ConnState::REQUESTED);
-    ConnectRequest req{slot, force, req_seq};
-    if (xQueueSend(bleWorkQueue, &req, 0) != pdTRUE)
-    {
-        // Rollback. The slot briefly flickered IDLE→REQUESTED→IDLE.
-        // No T_DEV_LIST was emitted during the REQUESTED window so
-        // the slot-table invariant "every state visible via
-        // T_DEV_LIST is the latest committed state" still holds; a
-        // host snapshotting the wire stream sees IDLE both before
-        // and after the rollback.
-        slots[slot].setState(VernierAdapter::ConnState::IDLE);
+
+    // Claim the slot atomically: CAS IDLE → REQUESTED. Fails if the
+    // slot is already REQUESTED / CONNECTING / READY, in which case a
+    // duplicate enqueue (e.g. a second autoConnectDevice pass after
+    // the host re-arms startAutoConnect) is a no-op — we must NOT
+    // touch the state of a slot that already has a live queued
+    // request, or its worker-side CAS REQUESTED→CONNECTING will fail
+    // and the connect gets silently skipped.
+    if (!slots[slot].tryRequestConnect())
         return false;
-    }
+
+    // The queue is sized at VERNIER_MAX_SLOTS and a slot stays
+    // non-IDLE for the whole time its request is queued (claim sets
+    // REQUESTED, worker CASes to CONNECTING on dequeue). So at most
+    // VERNIER_MAX_SLOTS requests are ever in flight — once we've won
+    // the claim above, the queue is guaranteed to have room. Evaluate
+    // the send outside configASSERT (a no-op macro under NDEBUG must
+    // not swallow the call) and assert the invariant.
+    ConnectRequest req{slot, force, req_seq};
+    const BaseType_t sent = xQueueSend(bleWorkQueue, &req, 0);
+    configASSERT(sent == pdTRUE);
     return true;
 }
 
@@ -262,15 +270,19 @@ void autoConnectDevice()
     // (one in-flight at a time — BLE controller serialises connects
     // anyway). force=false so the worker scans for the slot's
     // saved name rather than the highest-RSSI nearby device.
+    //
+    // The host sends C_SET_PERIOD once per slot at boot, each
+    // re-arming startAutoConnect, so this can run several times. A
+    // slot already claimed by an earlier pass fails enqueueConnect's
+    // CAS and is skipped silently — that's the expected idempotent
+    // no-op, not an error.
     for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
     {
         if (slotHasSavedDevice[i].load(std::memory_order_relaxed))
         {
-            log_i("auto-connect: queueing slot %u (saved device)",
-                  (unsigned)i);
-            if (!enqueueConnect(i, /*force=*/false, NO_HOST_REQUEST))
+            if (enqueueConnect(i, /*force=*/false, NO_HOST_REQUEST))
             {
-                log_w("auto-connect: queue full, slot %u skipped",
+                log_i("auto-connect: queued slot %u (saved device)",
                       (unsigned)i);
             }
         }
@@ -325,7 +337,10 @@ void buttonHandler()
             else if (!enqueueConnect(static_cast<uint8_t>(target_slot),
                                      /*force=*/true, NO_HOST_REQUEST))
             {
-                log_w("button: queue full, slot %u",
+                // firstFreeSlot returned an IDLE slot but another
+                // producer claimed it before our CAS — rare race,
+                // benign: the slot is already being connected.
+                log_i("button: slot %u already claimed, skipping",
                       (unsigned)target_slot);
             }
             else
@@ -398,8 +413,12 @@ static void cmdConnect(JsonVariantConst root, uint32_t req)
     // around" (or the host-specified slot's nearby device).
     if (!enqueueConnect(static_cast<uint8_t>(target_slot), /*force=*/true, req))
     {
-        log_w("C_CONNECT NACK: queue full, slot=%u", (unsigned)target_slot);
-        uart.sendAck(req, false, "queue full",
+        // enqueueConnect's CAS lost to a racing producer (auto-connect
+        // / button) that claimed the slot between the busy-guard above
+        // and the claim. The slot is already being connected — NACK
+        // busy so the host rolls back its CONNECTING animation.
+        log_w("C_CONNECT NACK: slot %u busy (claim race)", (unsigned)target_slot);
+        uart.sendAck(req, false, "slot busy",
                      static_cast<int16_t>(target_slot));
         return;
     }
