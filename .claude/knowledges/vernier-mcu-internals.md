@@ -202,13 +202,24 @@ unless you ship a migration step.
 Vernier MCU side:
 1. Boot reads NVS `deviceName0..N`. Sets `slotHasSavedDevice[i]`
    per slot and the global `foundSavedDevice` if any are saved.
-2. Host sends `C_SET_PERIOD` per slot at boot. The first one with
+2. Host's first command triggers the one-shot boot handshake in
+   `dispatchHostCommand`: T_HELLO (peer identity + proto version)
+   then T_STATUS(true) (peer up). Sent **once per co-MCU session**,
+   never per connect.
+3. Host sends `C_SET_PERIOD` per slot at boot. The first one with
    `foundSavedDevice == true` flips `startAutoConnect = true`.
-3. Next loop tick, `autoConnectDevice` walks slots; for each
-   with `slotHasSavedDevice[i]` it calls `connectAndReport(i)`.
-4. Each `connectAndReport(slot)` emits T_HELLO, T_STATUS(true,1)
-   (global), T_DEVINFO/T_DEVSTATS/T_FIELDS (per-slot), then
-   T_DEV_LIST. Host learns the slot's identity.
+4. Next loop tick, `autoConnectDevice` walks slots; for each with
+   `slotHasSavedDevice[i]` it `enqueueConnect(i)` (CAS IDLE→REQUESTED;
+   a duplicate pass after another `C_SET_PERIOD` re-arm is a no-op).
+   bleWorker drains the queue, connecting one slot at a time.
+5. For each successful connect, `publishConnectResult(slot)` emits
+   only the per-slot frames — T_DEVINFO / T_DEVSTATS / T_FIELDS —
+   then T_DEV_LIST. **No T_HELLO/T_STATUS here**: emitting T_HELLO
+   per connect made the host's T_HELLO handler
+   (`_resetConnectionState`) wipe every already-connected slot back
+   to "connecting" on each new slot's connect, so only the last slot
+   of a multi-slot reconnect kept its fields. The handshake moved to
+   step 2 (once) to fix this.
 
 Host side (post-fix):
 - The auto-detect-co-MCU path on the host **no longer** issues an
