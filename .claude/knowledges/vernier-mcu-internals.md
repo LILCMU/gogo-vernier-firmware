@@ -233,16 +233,21 @@ assemble). Two patterns in use, depending on the shape of the data:
   `VernierAdapter::_push_dropped`. Preferred for new cross-task
   scalars — the type itself documents the contract and the codegen
   is identical to `volatile uint32_t` on RV32.
-- **`volatile` + compiler barrier** for the fill-then-flag publish
-  pattern, where a writer fills a buffer / array and then flips a
-  flag the reader polls. Today this covers the boot-time hand-off
-  triple `startAutoConnect`, `foundSavedDevice`,
-  `slotHasSavedDevice[]`. The `C_SET_PERIOD` handler issues
-  `__asm__ volatile("" ::: "memory")` before flipping
-  `startAutoConnect` so the loop reader sees a fully-populated
-  `slotHasSavedDevice[]`. Sweeping these to `std::atomic` is
-  deferred to a separate design pass — see
-  `.claude/plans/release-2.1.0.md` under "Out of scope for 2.1.0".
+- **`std::atomic<T>` release/acquire** for the fill-then-flag publish
+  pattern, where a writer fills a buffer / array then flips a flag the
+  reader polls. The boot-time hand-off triple `startAutoConnect`,
+  `foundSavedDevice`, `slotHasSavedDevice[]` uses this (promoted off
+  `volatile` + `__asm__` barrier when the 2.2.0 backlog folded into
+  2.1.0). The array is relaxed; the two gate flags carry the ordering:
+  `setup()` / `publishConnectResult` fill `slotHasSavedDevice[]`
+  (relaxed) then store `foundSavedDevice` release; `C_SET_PERIOD`
+  acquire-loads `foundSavedDevice`, then release-stores
+  `startAutoConnect`; `autoConnectDevice` acquire-loads
+  `startAutoConnect` and reads the array. Each release→acquire edge
+  makes the fills visible without an explicit barrier. The legacy
+  `volatile` + `__asm__ volatile("" ::: "memory")` form is equivalent
+  on single-core ESP32-C3 but release/acquire documents the ordering
+  portably and is preferred for new code.
 
 Tasks at play:
 - `setup()` → fills NVS + per-slot saved-device flags.

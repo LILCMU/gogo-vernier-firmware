@@ -23,9 +23,9 @@ extern SemaphoreHandle_t nvsMutex;
 // definition in main.cpp for the cross-task volatile / memory-barrier
 // rationale. The publish in cmdSetPeriod must pair with a `volatile`
 // read in autoConnectDevice.
-extern volatile bool startAutoConnect;
-extern volatile bool foundSavedDevice;
-extern volatile bool slotHasSavedDevice[VERNIER_MAX_SLOTS];
+extern std::atomic<bool> startAutoConnect;
+extern std::atomic<bool> foundSavedDevice;
+extern std::atomic<bool> slotHasSavedDevice[VERNIER_MAX_SLOTS];
 
 namespace {
 
@@ -145,13 +145,11 @@ static void publishConnectResult(uint8_t slot, bool ok)
             // Mark this slot as eligible for future auto-connect on
             // boot — even though we won't reach autoConnectDevice
             // again until the next reboot + C_SET_PERIOD trigger.
-            // Cross-task publish (see CLAUDE.md Code Quality Rules):
-            // fill the per-slot flag, fence, then flip the global
-            // "any saved?" flag the readers (cmdSetPeriod /
-            // autoConnectDevice) poll.
-            slotHasSavedDevice[slot] = true;
-            __asm__ volatile("" ::: "memory");
-            foundSavedDevice = true;
+            // Fill-then-flag publish: store the per-slot data flag
+            // relaxed, then release the "any saved?" gate so a reader
+            // that acquire-loads foundSavedDevice sees this write.
+            slotHasSavedDevice[slot].store(true, std::memory_order_relaxed);
+            foundSavedDevice.store(true, std::memory_order_release);
         }
     }
 
@@ -255,9 +253,9 @@ static void emitDevList()
 
 void autoConnectDevice()
 {
-    if (!startAutoConnect)
+    if (!startAutoConnect.load(std::memory_order_acquire))
         return;
-    startAutoConnect = false;
+    startAutoConnect.store(false, std::memory_order_relaxed);
 
     // Per design D6: walk slots in order, queue a connect for each
     // slot with a saved NVS name. bleWorker drains them sequentially
@@ -266,7 +264,7 @@ void autoConnectDevice()
     // saved name rather than the highest-RSSI nearby device.
     for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
     {
-        if (slotHasSavedDevice[i])
+        if (slotHasSavedDevice[i].load(std::memory_order_relaxed))
         {
             log_i("auto-connect: queueing slot %u (saved device)",
                   (unsigned)i);
@@ -442,7 +440,7 @@ static void cmdForget(JsonVariantConst root, uint32_t req)
                      static_cast<int16_t>(dev));
         return;
     }
-    if (!slotHasSavedDevice[dev] && !isSlotOccupied(dev))
+    if (!slotHasSavedDevice[dev].load(std::memory_order_relaxed) && !isSlotOccupied(dev))
     {
         // No persistent state and no live link — Forget is a no-op.
         // Reply ok so the host can still bounce the kid back to the
@@ -462,7 +460,7 @@ static void cmdForget(JsonVariantConst root, uint32_t req)
         NvsScope nvs(nvsMutex, preferences, NVS_NAMESPACE_SETTING, false);
         if (nvs) preferences.remove(key);
     }
-    slotHasSavedDevice[dev] = false;
+    slotHasSavedDevice[dev].store(false, std::memory_order_relaxed);
     uart.sendAck(req, true, "forgotten", static_cast<int16_t>(dev));
     emitDevList();
 }
@@ -548,13 +546,14 @@ static void cmdSetPeriod(JsonVariantConst root, uint32_t req)
     slots[dev].setSamplingRate(period);
     uart.sendAck(req, true, "rate set", static_cast<int16_t>(dev));
 
-    // INFO: start auto-connect after gogo set sampling rate at boot.
-    // Memory barrier so autoConnectDevice's reader sees a fully-
-    // populated slotHasSavedDevice[] before the trigger flips.
-    if (foundSavedDevice)
+    // Start auto-connect after the host sets sampling rate at boot.
+    // acquire-load foundSavedDevice so we see the slotHasSavedDevice[]
+    // fills that preceded its release-store; then release-store
+    // startAutoConnect so autoConnectDevice's acquire-load sees the
+    // same fully-populated array.
+    if (foundSavedDevice.load(std::memory_order_acquire))
     {
-        __asm__ volatile("" ::: "memory");
-        startAutoConnect = true;
+        startAutoConnect.store(true, std::memory_order_release);
     }
 }
 

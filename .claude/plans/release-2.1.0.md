@@ -192,9 +192,11 @@ point. **H6 ships with phase 3 of the connect refactor** because the
 locking discipline only makes sense once `bleWorker` exists.
 
 The atomic promotion in H2 obviates the `volatile`-plus-barrier
-pattern for those two fields specifically; the rest of the cross-task
-flags (`startAutoConnect`, `foundSavedDevice`, `slotHasSavedDevice[]`)
-stay `volatile` for now — see the §Out-of-scope note below.
+pattern for those two `VernierAdapter` scalars. The boot hand-off
+triple (`startAutoConnect`, `foundSavedDevice`, `slotHasSavedDevice[]`)
+was swept the same way when the 2.2.0 backlog was folded into this
+release: data array relaxed, the two gate flags carry release/acquire
+— see §Backlog folded in.
 
 ## Documentation refresh {#docs}
 
@@ -241,17 +243,37 @@ path).
   validation; T_DEV_LIST piggyback already covers every state
   transition.
 
-## Out of scope for 2.1.0 (recorded for 2.2.0 backlog)
+## Backlog folded in {#backlog-folded-in}
 
-- Watchdog supervision of `bleWorker`.
-- Cooperative cancel during in-flight NimBLE scan (controller
-  constraint — needs a NimBLE upstream feature).
-- Replacing the `volatile` cross-task flags with `std::atomic` on
-  the connect-related globals (`startAutoConnect`,
-  `foundSavedDevice`, `slotHasSavedDevice[]`). H2 only handles the
-  two `VernierAdapter` scalars where the change is purely local;
-  sweeping the globals touches every publish site and earns a
-  separate design pass.
+The 2.2.0 backlog (the critic's deferred findings + the original
+out-of-scope list) was pulled into this release. Landed:
+
+- **Round-2 deslop** — the four directly-objectionable critic
+  findings (`bleWorker` slotInRange branch, `bleWorkerStart`
+  partial-failure theatre, `VernierAdapter` ctor null-guards,
+  `BLE_WORKER_QUEUE_DEPTH` alias) removed in the first deslop
+  commit; then `ConnState::FAILED` deleted and the history-narration
+  comments trimmed in the second.
+- **Global cross-task flags → `std::atomic`** — `startAutoConnect`,
+  `foundSavedDevice`, `slotHasSavedDevice[]` promoted off
+  `volatile` + `__asm__` barrier. The array is relaxed; the two
+  gate flags carry release/acquire so the publish ordering the
+  barriers used to enforce on single-core is now expressed
+  portably. This was the "separate design pass" the earlier
+  out-of-scope note called for.
+
+## Still deferred (with rationale)
+
+- **Watchdog supervision of `bleWorker`** — intentionally NOT added.
+  `dev.connect()` has internal timeouts (~10 s) so the worker can't
+  truly hang in normal operation; adding watchdog infra would
+  defend a can't-happen scenario, the same slop pattern the deslop
+  pass removed. The host already runs its own liveness watchdog
+  (`GoGoVernier::poll`).
+- **Cooperative cancel during in-flight NimBLE scan** — blocked on
+  h2zero/NimBLE-Arduino exposing a clean mid-scan abort. `C_CANCEL_
+  CONNECT` covers the REQUESTED window via CAS; extending it into
+  CONNECTING needs upstream support. Revisit if NimBLE adds it.
 
 ## Risks
 

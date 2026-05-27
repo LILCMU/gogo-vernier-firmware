@@ -2,6 +2,7 @@
 #include <HardwareSerial.h>
 #include <Preferences.h>
 #include <esp_log.h>
+#include <atomic>
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -114,24 +115,28 @@ UartAdapter uart(gogoSerial);
 TaskHandle_t uartProcessTask, vernierProcessTask;
 SemaphoreHandle_t nvsMutex;
 
-// Cross-task FreeRTOS hand-off flags. cmdSetPeriod writes
-// startAutoConnect (uart task); loop() reads it and dispatches
-// autoConnectDevice. foundSavedDevice / slotHasSavedDevice are
-// written by setup + connectAndReport (loop/uart contexts) and read
-// in autoConnectDevice (loop) + cmdSetPeriod (uart).
-// Per host CLAUDE.md cross-task rule: mark volatile to prevent
-// compiler hoisting. ESP32-C3 is single-core RISC-V — single-byte
-// writes are atomic, so a compiler reordering barrier
-// (`__asm__ volatile("" ::: "memory")`) at the publish point is
-// sufficient; no Xtensa `memw` is needed (and would not assemble).
-// External linkage so control-loop.cpp can extern them.
-volatile bool startAutoConnect = false;
-volatile bool foundSavedDevice = false;
+// Cross-task FreeRTOS hand-off flags — a fill-then-flag publish:
+// writers fill slotHasSavedDevice[] (the data), then flip a flag the
+// reader polls. The flags are the synchronisation variables and carry
+// release/acquire ordering so the data fills are visible before the
+// flag is observed:
+//   - setup() / publishConnectResult fill slotHasSavedDevice[]
+//     (relaxed) then store foundSavedDevice with release.
+//   - cmdSetPeriod loads foundSavedDevice with acquire; if set,
+//     stores startAutoConnect with release.
+//   - autoConnectDevice loads startAutoConnect with acquire; if set,
+//     reads slotHasSavedDevice[] (relaxed) — transitively visible.
+// std::atomic replaces the prior volatile + __asm__ compiler barrier:
+// the release/acquire edges express the ordering portably instead of
+// relying on the single-core context-switch barrier. External linkage
+// so control-loop.cpp can extern them.
+std::atomic<bool> startAutoConnect{false};
+std::atomic<bool> foundSavedDevice{false};
 // Per-slot "has a saved device name in NVS, eligible for auto-connect"
-// flag. Populated at boot from NVS keys deviceName0..N. Used by
-// autoConnectDevice to know which slots to attempt on the
-// startAutoConnect trigger from cmdSetPeriod.
-volatile bool slotHasSavedDevice[VERNIER_MAX_SLOTS] = {false};
+// flag. Populated at boot from NVS keys deviceName0..N. Read by
+// autoConnectDevice on the startAutoConnect trigger; the data half of
+// the publish above, so accessed relaxed.
+std::atomic<bool> slotHasSavedDevice[VERNIER_MAX_SLOTS] = {};
 
 // Per-slot housekeeping state used by vernierHandler. Lives static so
 // state persists across loop iterations without polluting global
@@ -359,8 +364,10 @@ void setup()
                     log_i("Slot %u: loaded saved name from NVS: %s",
                           (unsigned)i, name.c_str());
                     slots[i].setOpenDevice(name.c_str());
-                    slotHasSavedDevice[i] = true;
-                    foundSavedDevice = true;
+                    // Data fill (relaxed) then release the gate flag so
+                    // cmdSetPeriod's acquire-load sees the populated array.
+                    slotHasSavedDevice[i].store(true, std::memory_order_relaxed);
+                    foundSavedDevice.store(true, std::memory_order_release);
                 }
             }
         }
