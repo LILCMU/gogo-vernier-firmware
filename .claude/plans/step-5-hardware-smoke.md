@@ -197,11 +197,11 @@ documentation. Plan for a 2-hour slot.
 
 ## After step 5
 
-If green: file phase 4 as complete. Open a follow-up issue for
-each deferred item flagged in
-`multi-device-ui-step-4b4.md::Deferred / known issues`
-(multi-slot connect serialization, lambda fat,
-wire-protocol enum drift).
+If green: file phase 4 as complete. The deferred items it flagged
+(multi-slot connect serialization, lambda fat, wire-protocol enum
+drift) were addressed in the v2.1.0 cycle — see
+`.claude/plans/release-2.1.0.md` and the "bleWorker connect
+lifecycle" section of `.claude/knowledges/vernier-mcu-internals.md`.
 
 If red: triage by severity. UI bugs → polish on
 `feature/co-mcu-auto-detect`. Backend bugs → phase 4 cannot

@@ -413,13 +413,6 @@ When adding a new wire frame:
 
 ## Deferred / known issues (do before architecture lands)
 
-- **D2 design-doc amendment.** `multi-device-design.md` D2 still
-  reads "host never specifies dev on connect; vernier picks". Code
-  now accepts an optional `dev` (kid-pressed empty slot) — the doc
-  needs a v2.1 amendment so a reviewer reading the spec doesn't
-  assume the implementation is wrong. Spec'd-but-unimplemented
-  `name` field on C_CONNECT should also be either implemented or
-  struck.
 - **Mid-handshake C_DISCONNECT race — RESOLVED in v2.1.0.** Connect
   no longer blocks uartHandler (it's on `bleWorker`), and a
   C_DISCONNECT/C_FORGET arriving while the slot is CONNECTING is
@@ -438,9 +431,12 @@ When adding a new wire frame:
 
 ## Cross-references
 
-- Plans: `.claude/plans/multi-device-ui-step-4b4.md`,
-  `.claude/plans/multi-device-design.md` (D-decisions),
-  `.claude/plans/step-5-hardware-smoke.md` (verification plan).
+- Plans: `.claude/plans/multi-device-design.md` (D-decisions),
+  `.claude/plans/step-5-hardware-smoke.md` (Phase 4 verification
+  baseline), `.claude/plans/release-2.1.0.md` +
+  `.claude/plans/2-1-0-hardware-smoke.md` (v2.1.0 cycle). The
+  host-side `multi-device-ui-step-4b4.md` UI plan was removed —
+  it belonged in `gogo-firmware`, not here, and shipped long ago.
 - Earlier knowledge:
   - `.claude/knowledges/d2pio-debug-findings.md` — protocol-level
     debugging session notes (preserved as-is, captures pre-Phase-4

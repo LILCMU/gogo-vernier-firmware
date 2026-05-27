@@ -332,11 +332,10 @@ This gives multi-slot UX (see which slots occupied via cycle,
 disconnect a specific slot by cycling first) without redesigning
 the display state machine.
 
-**4b.4 deferred** — full slot list view + drill-down per design
-D8 (Option C). Detailed plan in
-`.claude/plans/multi-device-ui-step-4b4.md`. Sequenced after
-step 5 hardware smoke so display work doesn't pile on top of
-backend bugs.
+**4b.4** — full slot list view + drill-down per design D8
+(Option C). Shipped on the host side (`gogo-firmware`); its
+detailed plan lived in the vernier repo by mistake and was
+removed during the v2.1.0 cleanup.
 
 ### Phase 4 step 5 — multi-device smoke
 - Hardware test: 1× GDX-LC + 1× GDX-TMP + 1× GDX-ACC simultaneously.
@@ -365,8 +364,6 @@ All ACCEPTED with these specifics:
 
 ## After ratification
 
-- Update `gdxlib-rewrite.md` Phase 4 section to point at this doc
-  for design rationale.
 - Implement step 2 (wire protocol bump only — no slot pool yet).
 - Smoke single-device against current host firmware to confirm
   back-compat.
