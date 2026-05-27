@@ -163,12 +163,105 @@ once the connect resolves.
 (`e.connected && e.field_count == 0`). Kid sees activity
 instead of a blank row.
 
-**Architectural fix (planned for v2.1.0):** offload
-`dev.connect()` to a dedicated `bleWorker` task fed by a
-`ConnectRequest` queue. `cmdConnect` becomes enqueue + early-ACK
-so the UART task stays responsive; the worker becomes the
-single producer of `dev.connect()` and `dev.disconnect()`.
-Full design in `.claude/plans/release-2.1.0.md` §Design.
+**Architectural fix (shipped v2.1.0):** `dev.connect()` was
+offloaded to a dedicated `bleWorker` task fed by a `ConnectRequest`
+queue. `cmdConnect` enqueues + early-ACKs (`msg="queued"`) so the
+UART task stays responsive; `bleWorker` is the single producer of
+`dev.connect()`. See the next section for the state machine and the
+three latent bugs the v2.1.0 hardware smoke exposed.
+
+---
+
+## bleWorker connect lifecycle + the v2.1.0 multi-device bug class
+
+The non-blocking-connect refactor (v2.1.0) introduced a per-slot
+`VernierAdapter::ConnState` state machine driven by `bleWorker`.
+Multi-device reconnect had **never been hardware-smoked before
+v2.1.0** — the smoke immediately surfaced three latent bugs (two were
+present since v2.0.0). If you touch the connect path, read this
+first; every bug here is a "looks fine in code review, fails on three
+real sensors" trap.
+
+### The state machine (all transitions are atomic CAS, on purpose)
+
+`ConnState`: `IDLE(0) → REQUESTED(1) → CONNECTING(2) → READY(3)`.
+The four transition helpers on `VernierAdapter` are each a
+`compare_exchange_strong`, not a plain store, because every one of
+them races another task:
+
+- **`tryRequestConnect()` — IDLE→REQUESTED** (producer:
+  `enqueueConnect`, called from cmdConnect / button / autoConnect).
+  CAS so a duplicate enqueue for an already-claimed slot is a clean
+  no-op. **Bug #1 (since v2.0.0):** the original `enqueueConnect` did
+  an *unconditional* `setState(REQUESTED)` then rolled back to IDLE
+  if the queue was full. The host sends one `C_SET_PERIOD` per slot
+  at boot, each re-arming `startAutoConnect`, so `autoConnectDevice`
+  runs several times; a later pass's rollback clobbered slots that
+  already had a valid queued request → only slot 0 reconnected.
+- **`tryAcquireConnecting()` — REQUESTED→CONNECTING** (bleWorker on
+  dequeue). CAS so a `cmdCancelConnect` that flipped the slot to IDLE
+  while it sat queued makes the worker skip it.
+- **`tryFinishConnecting()` — CONNECTING→READY**
+  (`publishConnectResult` success tail, AFTER all the per-slot
+  sends). **Bug #3 (CRITICAL, found by a pre-tag audit):** a
+  C_DISCONNECT/C_FORGET landing during the ~7 s handshake runs
+  `disconnect()` on the UART task; its `_gv.stop()/close()` block on
+  GoGoVernier's `session_mutex` behind the worker's `open()`, then it
+  stores IDLE. Meanwhile the worker stored READY unconditionally —
+  the two stores raced with no ordering, leaving the slot either
+  shown-connected-but-gone or stuck-READY-never-streaming. The CAS
+  abandons the connect (tears the link back down) if a disconnect
+  won the race.
+- **`tryCancelConnect()` — REQUESTED→IDLE** (`cmdCancelConnect`).
+  CAS so it loses cleanly if the worker already moved the slot to
+  CONNECTING.
+
+`disconnect()` sets IDLE unconditionally (teardown is always
+allowed); `publishConnectResult`'s READY is the only success publish
+and it's gated by the CAS above.
+
+### Bug #2 (since v2.0.0): T_HELLO per-connect is a host-reset storm
+
+T_HELLO is the GLOBAL boot handshake; the host's T_HELLO handler
+calls `_resetConnectionState()` (it reads T_HELLO as "peer
+rebooted"). The old `connectAndReport` emitted T_HELLO on **every**
+connect, so during a sequential 3-slot reconnect each new connect
+wiped the previously-connected slots back to "connecting" — only the
+last slot kept its fields, the earlier two recovered ~30 s later via
+the periodic T_FIELDS re-emit. **Rule: T_HELLO + T_STATUS are sent
+exactly once per session**, lazily on the first host command
+(`dispatchHostCommand`), NEVER per connect. `publishConnectResult`
+emits only per-slot frames (T_DEVINFO / T_DEVSTATS / T_FIELDS) +
+T_DEV_LIST. If you add a frame to the connect path, do NOT add a
+global/reset-bearing one.
+
+### Ordering invariant (T_FIELDS before T_SENS_VALUES)
+
+`publishConnectResult` sends T_DEVINFO/T_DEVSTATS/T_FIELDS, then a
+compiler barrier, then the CONNECTING→READY CAS. `vernierHandler`
+gates streaming on `isReady() == (state()==READY)`, so it cannot emit
+T_SENS_VALUES before T_FIELDS shipped. Don't move the state publish
+above the sends (that was a real bug, fixed in `da5e19c`).
+
+### Known gap (deferred): stale queued request + same-slot re-connect
+
+If a slot is REQUESTED (queued, not yet drained) and a
+forget/disconnect flips it to IDLE, the stale queue entry remains. A
+new C_CONNECT for the same slot within the ~7–14 s drain window
+re-sets REQUESTED and queues a second request; the worker dequeues
+the STALE entry first, its REQUESTED→CONNECTING CAS now succeeds, and
+it connects with the stale request's `force` flag. Low probability;
+the clean fix is a per-slot generation counter packed with
+`_conn_state` into one atomic word so the claim CAS validates both.
+Documented in `.claude/plans/release-2.1.0.md` §Still deferred.
+
+### Meta-lesson
+
+Three concurrency bugs in one path, none caught by code review,
+all caught by running three real sensors through a power-cycle.
+**Hardware-smoke the multi-device path on every release that touches
+connect/disconnect** — single-sensor testing exercises none of the
+cross-slot races.
 
 ---
 
@@ -285,10 +378,12 @@ Wire layout: `T_ACK = {t, req:u32, ok:bool, msg?:str, dev?:i16}`.
 `dev = -1` (the default in `sendAck`) means "no slot context",
 typical for global commands like C_DEV_LIST.
 
-The C_CONNECT ok-path also echoes `dev` (via `connectAndReport`'s
-trailing ack). On the failure paths the host gets enough info to
-clear the CONNECTING animation immediately instead of waiting on
-the slot's CONNECTING handshake timeout.
+The C_CONNECT ok-path echoes `dev` on its early-ACK
+(`msg="queued"`, sent by `cmdConnect` at enqueue time — v2.1.0;
+there is no trailing completion ACK, the outcome rides out on the
+auto-pushed T_DEV_LIST). On the failure paths the host gets enough
+info to clear the CONNECTING animation immediately instead of
+waiting on the slot's CONNECTING handshake timeout.
 
 ---
 
@@ -325,14 +420,15 @@ When adding a new wire frame:
   assume the implementation is wrong. Spec'd-but-unimplemented
   `name` field on C_CONNECT should also be either implemented or
   struck.
-- **Mid-handshake C_DISCONNECT race.** `connectAndReport` is called
-  synchronously from the command dispatch, blocking uartHandler for
-  ~7 sec during the BLE handshake. C_DISCONNECT for the same slot
-  arriving in that window queues until the handshake finishes. If
-  the connect succeeds, NVS gets written for a slot the user just
-  asked to forget. Architectural fix planned for v2.1.0 — see
-  `.claude/plans/release-2.1.0.md` (`bleWorker` design); the TODO
-  in `main.cpp` still acknowledges this until the cutover lands.
+- **Mid-handshake C_DISCONNECT race — RESOLVED in v2.1.0.** Connect
+  no longer blocks uartHandler (it's on `bleWorker`), and a
+  C_DISCONNECT/C_FORGET arriving while the slot is CONNECTING is
+  handled by the `tryFinishConnecting()` CAS in `publishConnectResult`:
+  if the disconnect won, the worker abandons the connect and tears the
+  link down instead of leaving the slot READY. See the "bleWorker
+  connect lifecycle" section above. (Residual low-probability gap —
+  stale queued request + same-slot re-connect — is the only piece
+  still deferred; see that section.)
 - **Per-slot auto-connect failure cap.** A slot whose saved device
   vanished burns ~7 sec at every boot retrying. Add a per-slot
   `_autoConnectFailures` counter; clear `slotHasSavedDevice[slot]`
