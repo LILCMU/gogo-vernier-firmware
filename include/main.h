@@ -45,18 +45,14 @@ constexpr size_t NVS_KEY_MAX_LEN = 16;
 // ESP-IDF; using plain `unsigned` here keeps main.h free of any
 // FreeRTOS include dependency.
 
-// All three background tasks (uartHandler, vernierHandler, bleWorker)
-// run at the same priority. Same-priority round-robin keeps sample
-// throughput predictable; bumping bleWorker above the others isn't
-// useful because the BLE controller serialises connects anyway.
+// uartHandler, vernierHandler and bleWorker all run at the same
+// priority — bumping bleWorker above the others buys nothing because
+// the BLE controller serialises connects anyway.
 constexpr unsigned HANDLER_TASK_PRIO = 1;
 
-// Stack budget for any task that owns a dev.connect() call.
-// GoGoVernier::open dives through NimBLEScan + NimBLEClient discovery
-// and can reach ~4 KB on its own; 6 KB leaves comfortable headroom.
-// Pre-G007 both uartHandler and bleWorker sized themselves for this;
-// post-G007 only bleWorker dispatches connects, but uartHandler still
-// drives disconnects (slot.disconnect → _gv.close) which dive through
-// the same NimBLE path, so the shared value applies to both.
+// Stack budget for any task that drives a NimBLE connect/disconnect.
+// GoGoVernier::open / _gv.close dive through NimBLEScan + NimBLEClient
+// discovery, ~4 KB on their own; 6 KB leaves headroom. Shared by
+// bleWorker (connects) and uartHandler (disconnects).
 constexpr uint16_t TASK_STACK_BLE_HEAVY = 6144;
 

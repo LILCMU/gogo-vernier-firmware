@@ -63,7 +63,7 @@ public:
         T_SENS_VALUES = 5,  // per-slot. {t, dev, ts, sensors:[float, ...], seq}.
         T_ACK         = 7,  // {t, req:u32, ok:bool, msg?:str, dev?:i16}. dev echoed when slot-scoped.
         T_HELLO       = 8,  // global. {t, proto_version, firmware_id, version_*, max_slots}.
-        T_DEV_LIST    = 9,  // global. {t, slots:[{dev, name, order, connected, state:u8}, ...]}. `state` added in 2.1.0 (G008) — VernierAdapter::ConnState numeric values (0=IDLE, 1=REQUESTED, 2=CONNECTING, 3=READY, 4=FAILED). Optional key — pre-2.1.0 hosts ignore it.
+        T_DEV_LIST    = 9,  // global. {t, slots:[{dev, name, order, connected, state:u8}, ...]}. `state` added in 2.1.0 (G008) — VernierAdapter::ConnState numeric values (0=IDLE, 1=REQUESTED, 2=CONNECTING, 3=READY). Optional key — pre-2.1.0 hosts ignore it.
     };
 
     // Wire-protocol command codes (host → vernier). Numeric values
@@ -111,8 +111,8 @@ public:
     // connected=false, state=ConnState::IDLE (=0).
     //
     // `state` carries VernierAdapter::ConnState's numeric value so
-    // the host can render CONNECTING / FAILED distinctly from IDLE
-    // — `connected` alone collapses all non-READY states into false.
+    // the host can render CONNECTING distinctly from IDLE —
+    // `connected` alone collapses all non-READY states into false.
     // Added in 2.1.0 (G008); kept as a plain uint8_t so this header
     // doesn't have to include vernier-adapter.h for the enum type.
     //

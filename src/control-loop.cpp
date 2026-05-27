@@ -189,7 +189,7 @@ static void publishConnectResult(uint8_t slot, bool ok)
 // We emit it once after the CONNECTING CAS so the host can render
 // a "connecting" affordance while the BLE handshake settles;
 // publishConnectResult emits it again at the tail (READY on ok,
-// IDLE on failure — FAILED is reserved but currently unreached).
+// IDLE on failure).
 static void bleWorkerEntry(void *)
 {
     for (;;)
@@ -247,7 +247,7 @@ static void emitDevList()
         entries[i].order     = live ? slots[i].orderCode() : "";
         entries[i].connected = live;
         // G008 wire surface — ConnState numeric value. Host distinguishes
-        // CONNECTING / FAILED from IDLE for kid-UX spinner rendering.
+        // CONNECTING from IDLE for kid-UX spinner rendering.
         entries[i].state     = static_cast<uint8_t>(st);
     }
     uart.sendDevList(entries, VERNIER_MAX_SLOTS);
@@ -485,10 +485,9 @@ static void cmdCancelConnect(JsonVariantConst root, uint32_t req)
     // Only effective in REQUESTED state (tryCancelConnect CAS
     // REQUESTED → IDLE). CONNECTING means bleWorker is mid-handshake
     // (NimBLE has no in-flight cancel; cooperative cancel during
-    // scan is out of scope for 2.1.0). READY / IDLE mean there's
-    // nothing to cancel — use C_DISCONNECT for an established link.
-    // FAILED is reserved on the enum but currently unreachable, so
-    // it'd also fail the CAS; treated identically to "not pending".
+    // scan is out of scope — see release-2.1.0.md §Out of scope).
+    // READY / IDLE mean there's nothing to cancel — use
+    // C_DISCONNECT for an established link.
     int dev_raw = root["dev"] | -1;
     if (!slotInRange(dev_raw))
     {

@@ -60,11 +60,6 @@ public:
         REQUESTED  = 1,
         CONNECTING = 2,
         READY      = 3,
-        // FAILED is reserved on the wire but currently unreachable
-        // (no producer writes it post-da5e19c — failure goes
-        // straight to IDLE). Kept so a future host-UX iteration
-        // can re-expose a brief FAILED window without renumbering.
-        FAILED     = 4,
     };
 
     VernierAdapter();
@@ -81,16 +76,13 @@ public:
     void getDeviceInfo(bool force = false);
 
     bool isConnected() const { return _gv.isConnected(); }
-    // True only when this adapter has been put in the READY state by
-    // bleWorker (i.e. dev.connect() returned true and publishConnectResult
-    // ran successfully). Pre-G007 this routed through `_gv.isReady()`
-    // (the GDX driver's own ready flag); the G007 cutover puts the
-    // adapter in charge of the lifecycle, so vernierHandler and
-    // emitDevList both consult `_conn_state` directly. The tiny lag
-    // between `_gv.isReady()` flipping true and the worker writing
-    // READY is intentional — it ensures all the host-protocol side-
-    // effects (T_HELLO, T_DEVINFO, T_FIELDS, etc.) have shipped before
-    // any reader treats the slot as live.
+    // READY is published by publishConnectResult AFTER the full
+    // side-effect burst (T_HELLO/T_DEVINFO/T_FIELDS/…) has shipped,
+    // not when _gv's handshake completes. The lag is deliberate: it
+    // guarantees a reader (vernierHandler, emitDevList) never treats
+    // the slot as live before T_FIELDS reached the host. Don't
+    // "optimise" this back to _gv.isReady() — that reopens the
+    // T_SENS_VALUES-before-T_FIELDS race fixed in da5e19c.
     bool isReady() const { return state() == ConnState::READY; }
     bool isStreaming() const { return _gv.isStreaming(); }
 

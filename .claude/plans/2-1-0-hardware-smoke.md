@@ -87,7 +87,7 @@ the CAS didn't close.
 | # | Action | Expected |
 |---|--------|----------|
 | H4.1 | Capture a `T_DEV_LIST` frame at each transition during H1.3: IDLE → REQUESTED → CONNECTING → READY. Decode MsgPack. | Each entry has a `state` key with the matching ConnState numeric value (0/1/2/3). `connected` is true iff `state == 3`. |
-| H4.2 | Capture `T_DEV_LIST` after a failed connect (turn the GDX off mid-handshake — sensor disappears). | Slot transitions to `state=0` (IDLE). No `state=4` (FAILED) frames observed in this build — that value is reserved on the wire but unreached today (see `vernier-adapter.h` ConnState comment). |
+| H4.2 | Capture `T_DEV_LIST` after a failed connect (turn the GDX off mid-handshake — sensor disappears). | Slot transitions straight to `state=0` (IDLE) — there is no distinct FAILED state on the wire (the ConnState enum tops out at 3=READY). The host distinguishes "connect failed" from "connect succeeded" by whether it ever saw `state=3` before the return to `state=0`. |
 
 H4.2 confirms the reserved-but-unreached note in the enum docstring is
 truthful at runtime.
