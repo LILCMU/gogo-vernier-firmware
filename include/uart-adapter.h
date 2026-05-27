@@ -63,7 +63,7 @@ public:
         T_SENS_VALUES = 5,  // per-slot. {t, dev, ts, sensors:[float, ...], seq}.
         T_ACK         = 7,  // {t, req:u32, ok:bool, msg?:str, dev?:i16}. dev echoed when slot-scoped.
         T_HELLO       = 8,  // global. {t, proto_version, firmware_id, version_*, max_slots}.
-        T_DEV_LIST    = 9,  // global. {t, slots:[{dev, name, order, connected}, ...]}.
+        T_DEV_LIST    = 9,  // global. {t, slots:[{dev, name, order, connected, state:u8}, ...]}. `state` added in 2.1.0 (G008) — VernierAdapter::ConnState numeric values (0=IDLE, 1=REQUESTED, 2=CONNECTING, 3=READY). Optional key — pre-2.1.0 hosts ignore it.
     };
 
     // Wire-protocol command codes (host → vernier). Numeric values
@@ -71,11 +71,12 @@ public:
     // in the comment so the host registry stays in sync.
     enum CmdType : uint8_t
     {
-        C_CONNECT    = 1,  // {c, seq, dev?:u8}. dev opt = host-targeted slot.
-        C_DISCONNECT = 2,  // {c, seq, dev:u8}.
-        C_SET_PERIOD = 3,  // {c, seq, dev:u8, period_ms:u32 (capped at MAX_PERIOD_MS)}.
-        C_DEV_LIST   = 4,  // {c, seq}. Triggers a T_DEV_LIST push.
-        C_FORGET     = 5,  // {c, seq, dev:u8}. Disconnect + clear NVS deviceName{dev}.
+        C_CONNECT        = 1,  // {c, seq, dev?:u8}. dev opt = host-targeted slot. Early-ACK ok=true msg="queued" on enqueue (G007). T_DEV_LIST carries outcome.
+        C_DISCONNECT     = 2,  // {c, seq, dev:u8}.
+        C_SET_PERIOD     = 3,  // {c, seq, dev:u8, period_ms:u32 (capped at MAX_PERIOD_MS)}.
+        C_DEV_LIST       = 4,  // {c, seq}. Triggers a T_DEV_LIST push.
+        C_FORGET         = 5,  // {c, seq, dev:u8}. Disconnect + clear NVS deviceName{dev}.
+        C_CANCEL_CONNECT = 6,  // {c, seq, dev:u8}. Abort a queued C_CONNECT for slot `dev`. NACK if slot isn't REQUESTED. Added in 2.1.0.
     };
 
     // T_STATUS.core_state values — peer-health enum carried by the
@@ -107,14 +108,23 @@ public:
     // T_DEV_LIST entry. One per slot — caller fills VERNIER_MAX_SLOTS
     // entries (occupied + empty) so host can render the full slot
     // table without guessing capacity. Empty slot: name="", order="",
-    // connected=false. UartAdapter doesn't depend on VernierAdapter
-    // — caller marshals from slots[] before calling.
+    // connected=false, state=ConnState::IDLE (=0).
+    //
+    // `state` carries VernierAdapter::ConnState's numeric value so
+    // the host can render CONNECTING distinctly from IDLE —
+    // `connected` alone collapses all non-READY states into false.
+    // Added in 2.1.0 (G008); kept as a plain uint8_t so this header
+    // doesn't have to include vernier-adapter.h for the enum type.
+    //
+    // UartAdapter doesn't depend on VernierAdapter — caller marshals
+    // from slots[] before calling.
     struct DevListEntry
     {
         uint8_t     dev;
         const char *name;
         const char *order;
         bool        connected;
+        uint8_t     state;   // numeric ConnState (0=IDLE, 3=READY, etc.)
     };
     void sendDevList(const DevListEntry *entries, uint8_t count);
 

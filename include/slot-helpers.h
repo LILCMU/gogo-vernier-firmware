@@ -42,13 +42,12 @@ private:
 // call sites don't have to plumb the array through every layer.
 extern VernierAdapter slots[VERNIER_MAX_SLOTS];
 
-// "Occupied" = handshake complete (isReady) OR mid-handshake
-// transition (isStreaming before isReady flips). Matches the gate
-// used everywhere in the firmware to decide whether a slot can
-// accept a new C_CONNECT.
+// "Occupied" = any non-IDLE state. REQUESTED / CONNECTING / READY
+// all block a new C_CONNECT from being routed to this slot via the
+// first-free path; IDLE is the only state firstFreeSlot() picks.
 inline bool isSlotOccupied(uint8_t slot)
 {
-    return slots[slot].isReady() || slots[slot].isStreaming();
+    return slots[slot].state() != VernierAdapter::ConnState::IDLE;
 }
 
 inline bool slotInRange(int slot)

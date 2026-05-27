@@ -1,8 +1,11 @@
 #pragma once
 
+#include <atomic>
+
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 #include "GoGoVernier.h"
 
@@ -12,6 +15,14 @@ const constexpr char *VERNIER_DEFAULT_DEVICE_NAME = "proximity";
 // 1 Hz is the slowest cadence the host UI updates at, so this is the
 // "no surprises" landing value on a fresh boot.
 constexpr uint16_t VERNIER_DEFAULT_PERIOD_MS = 1000;
+
+// Lower bound on the sampling period the host may request via
+// C_SET_PERIOD. 10 ms is well above the FreeRTOS tick floor and
+// matches the fastest period any documented GDX sensor accepts;
+// anything below this is treated as a host bug rather than passed
+// through to GoGoVernier (which would happily spin start/stop on
+// sub-ms values).
+constexpr uint16_t VERNIER_MIN_PERIOD_MS = 10;
 
 // Push-mode sample queue depth — see VernierAdapter() ctor for sizing
 // rationale.
@@ -23,6 +34,34 @@ constexpr UBaseType_t VERNIER_SAMPLE_QUEUE_DEPTH = 2;
 class VernierAdapter
 {
 public:
+    // Per-slot connection lifecycle. Drives the bleWorker state
+    // machine wired in across G004 (this enum + atomic _conn_state)
+    // → G006 (bleWorker scaffolding + CAS helpers) → G007 (cutover
+    // + ordering fix in da5e19c). Producer set:
+    //   - cmdConnect / button / autoConnect → enqueueConnect(),
+    //     which setState(REQUESTED).
+    //   - bleWorker dequeue → tryAcquireConnecting() (CAS
+    //     REQUESTED → CONNECTING). Cancel-race-safe.
+    //   - publishConnectResult tail → setState(READY) on success,
+    //     setState(IDLE) on failure. Ordering: AFTER every
+    //     uart.send*, with a compiler barrier between the last
+    //     send and the state publish so vernierHandler can't see
+    //     READY before T_FIELDS shipped.
+    //   - cmdCancelConnect → tryCancelConnect() (CAS REQUESTED →
+    //     IDLE). Loses cleanly if bleWorker already CAS'd into
+    //     CONNECTING.
+    //   - disconnect() → setState(IDLE).
+    // Numeric values are part of the wire contract (T_DEV_LIST's
+    // optional `state` field, G008). Don't renumber — append at
+    // the end.
+    enum class ConnState : uint8_t
+    {
+        IDLE       = 0,
+        REQUESTED  = 1,
+        CONNECTING = 2,
+        READY      = 3,
+    };
+
     VernierAdapter();
     ~VernierAdapter();
 
@@ -37,13 +76,93 @@ public:
     void getDeviceInfo(bool force = false);
 
     bool isConnected() const { return _gv.isConnected(); }
-    // True only after open() finished the full D2PIO handshake. Use this
-    // — not isConnected() — anywhere a caller needs to know "the device
-    // is ready to start streaming". isConnected() flips at BLE link-up,
-    // before the channel mask is populated.
-    bool isReady() const { return _gv.isReady(); }
+    // READY is published by publishConnectResult AFTER the full
+    // side-effect burst (T_HELLO/T_DEVINFO/T_FIELDS/…) has shipped,
+    // not when _gv's handshake completes. The lag is deliberate: it
+    // guarantees a reader (vernierHandler, emitDevList) never treats
+    // the slot as live before T_FIELDS reached the host. Don't
+    // "optimise" this back to _gv.isReady() — that reopens the
+    // T_SENS_VALUES-before-T_FIELDS race fixed in da5e19c.
+    bool isReady() const { return state() == ConnState::READY; }
     bool isStreaming() const { return _gv.isStreaming(); }
-    uint16_t samplingPeriod() const { return _period_ms; }
+
+    // Connection-lifecycle accessors. memory_order_relaxed because
+    // transitions are independent scalar publishes — readers don't
+    // depend on any other write happening-before this one. Producers:
+    // bleWorker (CONNECTING via tryAcquireConnecting, READY/IDLE via
+    // setState from publishConnectResult), cmdCancelConnect
+    // (REQUESTED→IDLE via tryCancelConnect), disconnect (IDLE).
+    ConnState state() const { return _conn_state.load(std::memory_order_relaxed); }
+    void setState(ConnState s) { _conn_state.store(s, std::memory_order_relaxed); }
+
+    // CAS REQUESTED → CONNECTING for the bleWorker dequeue path. Closes
+    // the race window between xQueueReceive and a concurrent
+    // cmdCancelConnect: if cancel landed first the state is IDLE, the
+    // CAS fails, and the worker skips the connect. Atomic on RV32 by
+    // construction.
+    bool tryAcquireConnecting()
+    {
+        ConnState expected = ConnState::REQUESTED;
+        return _conn_state.compare_exchange_strong(
+            expected, ConnState::CONNECTING, std::memory_order_relaxed);
+    }
+
+    // CAS REQUESTED → IDLE for cmdCancelConnect. Loses cleanly if
+    // bleWorker already moved the slot to CONNECTING (worker won the
+    // race; cancel is "too late"). Without the CAS, cmdCancelConnect's
+    // read-state-then-store-IDLE could clobber a worker-set CONNECTING
+    // and leave the worker dispatching dev.connect() on a slot the
+    // host believes is idle.
+    bool tryCancelConnect()
+    {
+        ConnState expected = ConnState::REQUESTED;
+        return _conn_state.compare_exchange_strong(
+            expected, ConnState::IDLE, std::memory_order_relaxed);
+    }
+
+    // CAS CONNECTING → READY for publishConnectResult's success tail.
+    // Fails iff a C_DISCONNECT / C_FORGET for this slot set it IDLE
+    // during the ~7 s handshake (disconnect() runs on the UART task,
+    // blocked on GoGoVernier's session_mutex behind bleWorker's
+    // open(), then stores IDLE). On failure the connect result is
+    // abandoned rather than resurrecting a slot the host tore down —
+    // without it, the unconditional READY store raced disconnect()'s
+    // IDLE store and could leave the slot shown-connected-but-gone or
+    // stuck-READY-never-streaming.
+    bool tryFinishConnecting()
+    {
+        ConnState expected = ConnState::CONNECTING;
+        return _conn_state.compare_exchange_strong(
+            expected, ConnState::READY, std::memory_order_relaxed);
+    }
+
+    // CAS IDLE → REQUESTED for the producer enqueue path
+    // (enqueueConnect). Fails if the slot is already
+    // REQUESTED / CONNECTING / READY, so a duplicate enqueue — e.g. a
+    // second autoConnectDevice pass after the host re-arms
+    // startAutoConnect with another C_SET_PERIOD — becomes a no-op
+    // instead of clobbering the in-flight state or double-queueing
+    // the slot. The atomic claim is what lets enqueueConnect avoid a
+    // rollback-to-IDLE that would corrupt a slot already queued.
+    bool tryRequestConnect()
+    {
+        ConnState expected = ConnState::IDLE;
+        return _conn_state.compare_exchange_strong(
+            expected, ConnState::REQUESTED, std::memory_order_relaxed);
+    }
+
+    // H6: per-slot mutex protecting the cached status struct (battery,
+    // charge, rssi, RSSI etc. served by the *Percent / *State / rssi()
+    // accessors) against torn multi-field reads. getDeviceInfo() —
+    // which calls _gv.refreshStatus() and writes those fields —
+    // takes the mutex internally. Callers that need an atomic snapshot
+    // across the three status fields (publishConnectResult's
+    // sendDeviceStats, vernierHandler's 10 s refresh push) wrap their
+    // read block in lockStatus()/unlockStatus(). timeout_ms == 0 means
+    // try-lock (non-blocking). Returns false on contention.
+    bool lockStatus(uint32_t timeout_ms = portMAX_DELAY);
+    void unlockStatus();
+    uint16_t samplingPeriod() const { return _period_ms.load(std::memory_order_relaxed); }
 
     // Total dropped sample count: GoGoVernier's internal "previous
     // sample wasn't drained" + device-reported MEAS_DROPPED frames
@@ -104,7 +223,12 @@ private:
     gogo_vernier::GoGoVernier _gv;
 
     String _open_device = VERNIER_DEFAULT_DEVICE_NAME;
-    uint16_t _period_ms = VERNIER_DEFAULT_PERIOD_MS;
+    // Cross-task: written by cmdSetPeriod / startReading (UART task),
+    // read by vernierHandler (vernier task) via samplingPeriod() and
+    // again by startReading() itself. std::atomic<uint16_t> documents
+    // the contract; on RV32 the loads/stores are single-instruction
+    // and free, so memory_order_relaxed is the right ordering.
+    std::atomic<uint16_t> _period_ms{VERNIER_DEFAULT_PERIOD_MS};
 
     // Push-mode plumbing. Created in the ctor (process-lifetime),
     // drained by waitForSample(), filled by an onSample lambda
@@ -112,8 +236,25 @@ private:
     QueueHandle_t _sample_queue = nullptr;
     // queue-full drops. Written by the NimBLE notify task (push lambda
     // installed in connect()), read by vernierHandler via droppedSamples().
-    // volatile per CLAUDE.md cross-task rule — the lambda captures a
-    // `volatile uint32_t*` so the increment can't be hoisted across
-    // FreeRTOS task boundaries.
-    volatile uint32_t _push_dropped = 0;
+    // std::atomic<uint32_t> replaces the prior volatile+manual-load-store
+    // pattern that side-stepped C++20's -Wdeprecated-volatile on the
+    // compound ++. Same single-core RV32 free-load characteristics.
+    std::atomic<uint32_t> _push_dropped{0};
+
+    // Cross-task connection lifecycle. Writer set will be cmdConnect /
+    // bleWorker / disconnect() once the bleWorker cutover (G006/G007)
+    // lands. Reader set will be the host-protocol layer that emits
+    // T_DEV_LIST entries (G008) and any cancel / busy guards in
+    // cmdConnect. memory_order_relaxed because transitions don't carry
+    // ordering w.r.t. other adapter state.
+    std::atomic<ConnState> _conn_state{ConnState::IDLE};
+
+    // H6 per-slot status mutex. Created in ctor (process-lifetime),
+    // taken inside getDeviceInfo() and by external callers via
+    // lockStatus() / unlockStatus(). Guards the (refreshStatus + read)
+    // window against vernierHandler's 10 s wall-clock refresh racing
+    // bleWorker's end-of-publishConnectResult getDeviceInfo on the
+    // same slot. Per-slot rather than global so concurrent connects on
+    // different slots don't serialise on each other's status reads.
+    SemaphoreHandle_t _status_mutex = nullptr;
 };

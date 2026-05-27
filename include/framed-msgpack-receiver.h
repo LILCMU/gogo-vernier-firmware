@@ -122,8 +122,18 @@ private:
             // fails — ArduinoJson 7's contract is "clear before reuse".
             _doc.clear();
             DeserializationError err = deserializeMsgPack(_doc, _buf, _len);
-            if (!err && _cb)
+            if (err)
+            {
+                // Surface wire corruption / framing desync at log_w so it
+                // shows up in field-debug logs. Silent drops were the
+                // default; observability is cheap.
+                log_w("FramedMsgPackReceiver: deserializeMsgPack failed (%s, len=%u)",
+                      err.c_str(), (unsigned)_len);
+            }
+            else if (_cb)
+            {
                 _cb(_doc.as<JsonVariantConst>(), _user);
+            }
             reset();
             _frameComplete = true;
             return true;

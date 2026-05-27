@@ -97,10 +97,13 @@ after the placeholder slot is populated. GDXLib's
 
 ## Command opcodes
 
-From `godirect-py/godirect/device.py`:
+From `godirect-py/godirect/device.py`, plus `CMD_GET_STATUS` which
+isn't in godirect-py but is in the official Python wrapper layer
+and the GDX device firmware:
 
 | Name | Op | Purpose |
 |---|---|---|
+| `CMD_GET_STATUS` | `0x10` | battery percent + charger state + CPU versions. Not listed in godirect-py's opcode block but referenced as `CMD_ID_GET_STATUS` in the Python wrapper and accepted by every GDX device tested so far. Payload empty. See `.claude/knowledges/vernier-mcu-internals.md` for the response layout. |
 | `CMD_START_MEASUREMENTS` | `0x18` | begin streaming. Payload = u32 sensor mask. |
 | `CMD_STOP_MEASUREMENTS` | `0x19` | stop streaming. Payload empty. |
 | `CMD_INIT` | `0x1A` | initial handshake; resets rolling counter. |
@@ -171,11 +174,22 @@ Returned in the device-info / status response.
 | 2 | complete |
 | 3 | error |
 
-## Open items
+## Resolved items
 
-- Exact byte offsets within the `CMD_GET_SENSOR_INFO` response — derive
-  from `_GDX_get_sensor_info` in godirect-py. Document here once ported.
-- Exact byte layout of `CMD_GET_DEVICE_INFO` response — same.
-- MTU negotiation: godirect-py relies on the OS BLE stack to set a useful
-  MTU; ArduinoBLE / NimBLE on ESP32 default to 23, which forces multi-frame
-  reassembly on every long response. Investigate raising it to 247.
+The original "open items" in this spec are now closed; pointers to
+where the answers live in the codebase:
+
+- **`CMD_GET_SENSOR_INFO` response byte offsets** — captured in
+  `lib/GoGoVernier/src/D2PIOProtocol.h` as `SENSOR_INFO_OFF_*` and
+  `SENSOR_INFO_BODY_SIZE` (commit `ec0adeb` in `lib/GoGoVernier`
+  lifted them out of inline literals into named constants with
+  byte-layout comments).
+- **`CMD_GET_DEVICE_INFO` response byte offsets** — same file,
+  `DEV_INFO_OFF_*` and `DEV_INFO_BODY_*`.
+- **MTU negotiation** — h2zero/NimBLE-Arduino now does
+  `setMTU(247)` + `exchangeMTU=true` on connect, with a 2 s settle
+  poll and a fallback `exchangeMTU()` retry. Multi-frame reassembly
+  only happens for `CMD_GET_SENSOR_INFO` responses (148 B body)
+  on devices with a lot of channels. See
+  `.claude/knowledges/d2pio-debug-findings.md` §"MTU is mandatory
+  before CMD_INIT" for the bring-up history.

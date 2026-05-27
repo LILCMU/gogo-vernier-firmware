@@ -23,3 +23,11 @@ void autoConnectDevice();
 // Short press → connect first-free slot via proximity scan.
 // Long press (≥ BUTTON_LONG_PRESS_MS) → disconnect every active slot.
 void buttonHandler();
+
+// Create the bleWorker FreeRTOS task + ConnectRequest queue. Call
+// once from setup() after the other handler tasks are spawned. No
+// producer exists in G006 — the queue stays empty until cmdConnect
+// + buttonHandler + autoConnectDevice are cut over to enqueueConnect
+// in G007. Idempotent against repeated calls (returns immediately if
+// already started).
+void bleWorkerStart();

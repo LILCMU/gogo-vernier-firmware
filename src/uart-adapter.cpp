@@ -147,6 +147,7 @@ void UartAdapter::sendDevList(const DevListEntry *entries, uint8_t count)
         s["name"]      = entries[i].name  ? entries[i].name  : "";
         s["order"]     = entries[i].order ? entries[i].order : "";
         s["connected"] = entries[i].connected;
+        s["state"]     = entries[i].state;
     }
     send();
 }

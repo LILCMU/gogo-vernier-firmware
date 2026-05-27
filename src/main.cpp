@@ -2,6 +2,7 @@
 #include <HardwareSerial.h>
 #include <Preferences.h>
 #include <esp_log.h>
+#include <atomic>
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -27,8 +28,17 @@ int serial_log_vprintf(const char *fmt, va_list args)
     int n = vsnprintf(buf, sizeof(buf), fmt, args);
     if (n > 0)
     {
-        size_t to_write = (n < (int)sizeof(buf)) ? (size_t)n : sizeof(buf);
-        Serial.write(reinterpret_cast<const uint8_t *>(buf), to_write);
+        if (n < (int)sizeof(buf))
+        {
+            Serial.write(reinterpret_cast<const uint8_t *>(buf), (size_t)n);
+        }
+        else
+        {
+            // Truncated. Force the last byte to '\n' so a long NimBLE
+            // format string can't run into the next log line.
+            buf[sizeof(buf) - 1] = '\n';
+            Serial.write(reinterpret_cast<const uint8_t *>(buf), sizeof(buf));
+        }
     }
     return n;
 }
@@ -60,15 +70,13 @@ constexpr uint32_t USB_CDC_BAUD             = 115200;  // baud is a no-op on
                                                        // HWCDC/USBCDC; kept
                                                        // for convention only
 
-// FreeRTOS task config.
-constexpr uint16_t   UART_TASK_STACK        = 6144;    // 6 KB — call depth of
-                                                       // vernier.connect() →
-                                                       // NimBLEScan + NimBLEClient
-                                                       // discovery can hit ~4 KB
-                                                       // on its own.
+// FreeRTOS task config. HANDLER_TASK_PRIO + TASK_STACK_BLE_HEAVY
+// live in include/main.h so control-loop.cpp's bleWorker stays in
+// sync. uartHandler uses TASK_STACK_BLE_HEAVY because it still
+// dispatches dev.disconnect() (via cmdDisconnect / cmdForget / button
+// long-press), which dives through NimBLE close() at the same call
+// depth that connect() does.
 constexpr uint16_t   VERNIER_TASK_STACK     = 8192;
-constexpr UBaseType_t HANDLER_TASK_PRIO     = 1;       // both background
-                                                       // tasks at idle prio + 1
 
 // vernierHandler cadence.
 constexpr uint32_t IDLE_SLEEP_MS            =  250;    // no device open yet
@@ -107,24 +115,28 @@ UartAdapter uart(gogoSerial);
 TaskHandle_t uartProcessTask, vernierProcessTask;
 SemaphoreHandle_t nvsMutex;
 
-// Cross-task FreeRTOS hand-off flags. cmdSetPeriod writes
-// startAutoConnect (uart task); loop() reads it and dispatches
-// autoConnectDevice. foundSavedDevice / slotHasSavedDevice are
-// written by setup + connectAndReport (loop/uart contexts) and read
-// in autoConnectDevice (loop) + cmdSetPeriod (uart).
-// Per host CLAUDE.md cross-task rule: mark volatile to prevent
-// compiler hoisting. ESP32-C3 is single-core RISC-V — single-byte
-// writes are atomic, so a compiler reordering barrier
-// (`__asm__ volatile("" ::: "memory")`) at the publish point is
-// sufficient; no Xtensa `memw` is needed (and would not assemble).
-// External linkage so control-loop.cpp can extern them.
-volatile bool startAutoConnect = false;
-volatile bool foundSavedDevice = false;
+// Cross-task FreeRTOS hand-off flags — a fill-then-flag publish:
+// writers fill slotHasSavedDevice[] (the data), then flip a flag the
+// reader polls. The flags are the synchronisation variables and carry
+// release/acquire ordering so the data fills are visible before the
+// flag is observed:
+//   - setup() / publishConnectResult fill slotHasSavedDevice[]
+//     (relaxed) then store foundSavedDevice with release.
+//   - cmdSetPeriod loads foundSavedDevice with acquire; if set,
+//     stores startAutoConnect with release.
+//   - autoConnectDevice loads startAutoConnect with acquire; if set,
+//     reads slotHasSavedDevice[] (relaxed) — transitively visible.
+// std::atomic replaces the prior volatile + __asm__ compiler barrier:
+// the release/acquire edges express the ordering portably instead of
+// relying on the single-core context-switch barrier. External linkage
+// so control-loop.cpp can extern them.
+std::atomic<bool> startAutoConnect{false};
+std::atomic<bool> foundSavedDevice{false};
 // Per-slot "has a saved device name in NVS, eligible for auto-connect"
-// flag. Populated at boot from NVS keys deviceName0..N. Used by
-// autoConnectDevice to know which slots to attempt on the
-// startAutoConnect trigger from cmdSetPeriod.
-volatile bool slotHasSavedDevice[VERNIER_MAX_SLOTS] = {false};
+// flag. Populated at boot from NVS keys deviceName0..N. Read by
+// autoConnectDevice on the startAutoConnect trigger; the data half of
+// the publish above, so accessed relaxed.
+std::atomic<bool> slotHasSavedDevice[VERNIER_MAX_SLOTS] = {};
 
 // Per-slot housekeeping state used by vernierHandler. Lives static so
 // state persists across loop iterations without polluting global
@@ -201,10 +213,16 @@ void vernierHandler(void *parameter)
             // on a fixed wall-clock interval and push to the host only when
             // something actually changed (RSSI needs a small threshold since
             // it naturally jitters by 1 dBm on a quiet link).
+            //
+            // H6: refresh + read happen under lockStatus() so a concurrent
+            // bleWorker / publishConnectResult getDeviceInfo on the same
+            // slot can't tear the battery/charge/rssi triple. Recursive
+            // mutex makes the nested getDeviceInfo lock safe.
             {
                 uint32_t now = millis();
                 if (now - slotState[i].lastRefreshMs >= DEVSTATS_REFRESH_MS)
                 {
+                    dev.lockStatus();
                     dev.getDeviceInfo(true);
                     slotState[i].lastRefreshMs = now;
 
@@ -212,6 +230,8 @@ void vernierHandler(void *parameter)
                     int charge   = dev.chargeState();
                     int rssi     = dev.rssi();
                     uint32_t drop = dev.droppedSamples();
+                    dev.unlockStatus();
+
                     bool changed = (batt != slotState[i].lastPushedBatt)
                                 || (charge != slotState[i].lastPushedCharge)
                                 || (abs(rssi - slotState[i].lastPushedRssi) >= RSSI_CHANGE_THRESHOLD)
@@ -344,8 +364,10 @@ void setup()
                     log_i("Slot %u: loaded saved name from NVS: %s",
                           (unsigned)i, name.c_str());
                     slots[i].setOpenDevice(name.c_str());
-                    slotHasSavedDevice[i] = true;
-                    foundSavedDevice = true;
+                    // Data fill (relaxed) then release the gate flag so
+                    // cmdSetPeriod's acquire-load sees the populated array.
+                    slotHasSavedDevice[i].store(true, std::memory_order_relaxed);
+                    foundSavedDevice.store(true, std::memory_order_release);
                 }
             }
         }
@@ -354,12 +376,13 @@ void setup()
     xTaskCreate(
         uartHandler,
         "UartTask",
-        // UART_TASK_STACK absorbs the call depth of vernier.connect(),
-        // which dives through GoGoVernier::open → NimBLEScan +
-        // NimBLEClient discovery and can come close to 4 KB on its
-        // own. Until connect is offloaded to a worker (TODO:
-        // pendingConnect flag pattern), keep the headroom.
-        UART_TASK_STACK,
+        // Shared TASK_STACK_BLE_HEAVY (main.h) — uartHandler still
+        // dispatches dev.disconnect() through NimBLE close(), which
+        // dives the same ~4 KB call depth as dev.connect() did
+        // pre-G007. The slot now lives on bleWorker but disconnects
+        // stay on the UART task because they're cheap and don't
+        // benefit from offload.
+        TASK_STACK_BLE_HEAVY,
         NULL,
         HANDLER_TASK_PRIO,
         &uartProcessTask);
@@ -371,6 +394,13 @@ void setup()
         NULL,
         HANDLER_TASK_PRIO,
         &vernierProcessTask);
+
+    // bleWorker task (G006) — drains the ConnectRequest queue and
+    // runs dev.connect() off the uartHandler critical path. No
+    // producer in G006; cmdConnect / buttonHandler / autoConnectDevice
+    // are cut over to enqueueConnect in G007. The worker just parks
+    // on its queue until then.
+    bleWorkerStart();
 }
 
 void loop()

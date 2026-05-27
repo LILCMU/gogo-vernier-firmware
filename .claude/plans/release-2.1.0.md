@@ -11,8 +11,9 @@ backlog folds into 2.1.0:
 - **Documentation refresh (§Docs)** — audit CLAUDE.md and the
   `.claude/knowledges/` files against the post-2.0.0 codebase.
 
-This is a planning doc, not a spec. Decisions marked **OPEN** below
-need a design pass before code starts.
+This is a planning doc, not a spec. All four design questions
+(§Decisions) were ratified before phase 3 — see that section for
+the call and the reasoning kept against each one.
 
 ## Problem
 
@@ -69,8 +70,11 @@ IDLE  →  REQUESTED  →  CONNECTING  →  READY
 - **READY**: same gate as today's `isReady()` — D2PIO handshake done.
 - **FAILED**: transient, single TX of NACK, then drop back to IDLE.
 
-State variable is `std::atomic<ConnState>` (paired with the rest of
-the 2.0.1 atomicity sweep — see `release-2.0.1.md` once written).
+State variable is `std::atomic<ConnState>` on `VernierAdapter`
+(landed in G004 / commit `2fca27d`). Memory ordering: `relaxed` on
+read/write because transitions are independent scalar publishes —
+no fill-then-flag pattern, no other adapter field needs to be
+visible-before this write.
 
 ### Worker task
 
@@ -84,11 +88,13 @@ New FreeRTOS task `bleWorker`:
   req_seq}`. For each item: flip state to CONNECTING, call
   `dev.connect()`, run the existing publish-result side-effects,
   flip to READY/IDLE.
-
-**OPEN**: queue depth. Three slots × max one pending each = 3 is
-the natural bound. Decide whether enqueueing a second connect on a
-slot that's already REQUESTED returns NACK (recommended) or
-coalesces.
+- Queue shape: depth = `VERNIER_MAX_SLOTS` (3 today). A C_CONNECT
+  for a slot already in REQUESTED / CONNECTING returns NACK with
+  `msg="slot busy"` instead of coalescing (per §Decisions Q1).
+- One worker for all slots, not one-per-slot (per §Decisions Q2).
+  The BLE controller serialises connects anyway and a single task
+  with a queue is simpler to reason about than three with
+  coordination.
 
 ### `cmdConnect` becomes enqueue-only
 
@@ -133,11 +139,11 @@ them keep working:
    CONNECTING spinner on the kid-UX slot card without inferring it
    from the absence of T_DEVINFO.
 
-**OPEN**: whether to also push a standalone `T_CONN_STATE` frame on
-every transition (for hosts that don't poll `C_DEV_LIST`), or rely
-on the existing auto-pushed `T_DEV_LIST` after every connect attempt
-to carry the change. Recommendation: rely on `T_DEV_LIST`; one more
-push per transition is cheap.
+Per §Decisions Q3, transitions piggyback on the existing
+auto-pushed `T_DEV_LIST` — no standalone `T_CONN_STATE` frame is
+introduced. `T_DEV_LIST` is already emitted at the end of
+`publishConnectResult` (D4), so every state change naturally rides
+out on the next slot-table push. Keeps the wire surface narrow.
 
 ### Failure / timeout handling
 
@@ -186,9 +192,11 @@ point. **H6 ships with phase 3 of the connect refactor** because the
 locking discipline only makes sense once `bleWorker` exists.
 
 The atomic promotion in H2 obviates the `volatile`-plus-barrier
-pattern for those two fields specifically; the rest of the cross-task
-flags (`startAutoConnect`, `foundSavedDevice`, `slotHasSavedDevice[]`)
-stay `volatile` for now — see the §Out-of-scope note below.
+pattern for those two `VernierAdapter` scalars. The boot hand-off
+triple (`startAutoConnect`, `foundSavedDevice`, `slotHasSavedDevice[]`)
+was swept the same way when the 2.2.0 backlog was folded into this
+release: data array relaxed, the two gate flags carry release/acquire
+— see §Backlog folded in.
 
 ## Documentation refresh {#docs}
 
@@ -217,27 +225,74 @@ fine. Drop or archive any paragraphs that reference long-retired
 internals (e.g. `g_active_impl`, `GDXLib`, the old polling sample
 path).
 
-## Pairing add-ons (in scope if cheap, otherwise punt)
+## Pairing add-ons
 
-- **`C_CANCEL_CONNECT`** — host abort of a REQUESTED slot (e.g. kid
-  pressed the wrong card). Worker discards the queued item and
-  emits NACK with `msg="cancelled"`. Cost: small, ~30 lines.
-  Worth it.
-- **`T_DEVSTATS` carries `state`** — same enum, same idea as the
-  T_DEV_LIST addition, for hosts that subscribe to per-slot stats
-  but not the whole slot table. Cost: trivial. Optional.
+- **`C_CANCEL_CONNECT`** (in scope per §Decisions Q4) — host abort
+  of a REQUESTED slot (e.g. kid pressed the wrong card). Worker
+  discards the queued item, flips the slot back to IDLE, and emits
+  NACK with `msg="cancelled"` echoing the cancelled C_CONNECT's
+  `req`. Wire enum value: `C_CANCEL_CONNECT = 6` — appended at
+  the end of `UartAdapter::CmdType` per the wire-numbering
+  discipline. Lands inside G007's cutover commit (same TU, same
+  diff) since it's effectively the cancel path of the same state
+  machine.
+- **`T_DEVSTATS` carries `state`** (optional, not committed) —
+  same enum, same idea as the T_DEV_LIST addition, for hosts that
+  subscribe to per-slot stats but not the whole slot table. Cost:
+  trivial. Skip unless a host-side need surfaces during G009 HW
+  validation; T_DEV_LIST piggyback already covers every state
+  transition.
 
-## Out of scope for 2.1.0 (recorded for 2.2.0 backlog)
+## Backlog folded in {#backlog-folded-in}
 
-- Watchdog supervision of `bleWorker`.
-- Cooperative cancel during in-flight NimBLE scan (controller
-  constraint — needs a NimBLE upstream feature).
-- Replacing the `volatile` cross-task flags with `std::atomic` on
-  the connect-related globals (`startAutoConnect`,
-  `foundSavedDevice`, `slotHasSavedDevice[]`). H2 only handles the
-  two `VernierAdapter` scalars where the change is purely local;
-  sweeping the globals touches every publish site and earns a
-  separate design pass.
+The 2.2.0 backlog (the critic's deferred findings + the original
+out-of-scope list) was pulled into this release. Landed:
+
+- **Round-2 deslop** — the four directly-objectionable critic
+  findings (`bleWorker` slotInRange branch, `bleWorkerStart`
+  partial-failure theatre, `VernierAdapter` ctor null-guards,
+  `BLE_WORKER_QUEUE_DEPTH` alias) removed in the first deslop
+  commit; then `ConnState::FAILED` deleted and the history-narration
+  comments trimmed in the second.
+- **Global cross-task flags → `std::atomic`** — `startAutoConnect`,
+  `foundSavedDevice`, `slotHasSavedDevice[]` promoted off
+  `volatile` + `__asm__` barrier. The array is relaxed; the two
+  gate flags carry release/acquire so the publish ordering the
+  barriers used to enforce on single-core is now expressed
+  portably. This was the "separate design pass" the earlier
+  out-of-scope note called for.
+
+## Still deferred (with rationale)
+
+- **Watchdog supervision of `bleWorker`** — intentionally NOT added.
+  `dev.connect()` has internal timeouts (~10 s) so the worker can't
+  truly hang in normal operation; adding watchdog infra would
+  defend a can't-happen scenario, the same slop pattern the deslop
+  pass removed. The host already runs its own liveness watchdog
+  (`GoGoVernier::poll`).
+- **Cooperative cancel during in-flight NimBLE scan** — blocked on
+  h2zero/NimBLE-Arduino exposing a clean mid-scan abort. `C_CANCEL_
+  CONNECT` covers the REQUESTED window via CAS; extending it into
+  CONNECTING needs upstream support. Revisit if NimBLE adds it.
+- **Stale queued ConnectRequest consumed by a re-CONNECT to the same
+  slot** (audit MEDIUM, low probability). If slot N is REQUESTED
+  (queued, not yet drained) and a C_FORGET / C_DISCONNECT flips it to
+  IDLE, the stale entry stays in bleWorkQueue. A new C_CONNECT for N
+  within the ~7–14 s drain window CASes IDLE→REQUESTED and queues a
+  second request; bleWorker dequeues the STALE entry first, its
+  tryAcquireConnecting CAS succeeds (state is REQUESTED again from the
+  new request), and it connects using the stale request's `force`
+  flag. Worst case: a just-forgotten slot reconnects with
+  `force=false`. The clean fix is a per-slot generation counter
+  (packed with `_conn_state` into one atomic word so the
+  REQUESTED→CONNECTING claim validates both): tag each ConnectRequest
+  with the slot's generation at enqueue, bump it on every
+  REQUESTED-abandoning transition, and have the worker drop a dequeued
+  request whose generation is stale. Deferred from 2.1.0 — needs the
+  packed-atomic refactor, too invasive to rush against the tag, and
+  the trigger (forget→re-connect same slot inside the drain window)
+  is rare. The CONNECTING-window disconnect race (the CRITICAL from
+  the same audit) IS fixed in 2.1.0 via tryFinishConnecting().
 
 ## Risks
 
@@ -266,19 +321,41 @@ path).
 - `version-2.1.0` builds clean in both `release` and `debug` envs.
 - HW smoke pass on real GDX gear (re-use `.claude/plans/step-5-hardware-smoke.md`).
 
-## Open questions
+## Decisions
 
-1. **Worker queue: reject-on-busy or coalesce?** Recommendation:
-   reject with `msg="busy"`. Coalescing hides a host bug.
-2. **Single bleWorker for all slots, or one worker per slot?**
-   Recommendation: single. BLE controller serialises connects
-   anyway, and one task with a queue is simpler than three with
-   coordination.
-3. **`T_CONN_STATE` standalone frame or piggyback on `T_DEV_LIST`?**
-   Recommendation: piggyback. We already auto-push `T_DEV_LIST` on
-   every transition.
-4. **Should `C_CANCEL_CONNECT` make 2.1.0 or wait for 2.2.0?**
-   Lean toward 2.1.0 — adds little extra surface and closes a real
-   host-side wart.
+Resolved in G005 before phase 3 implementation began. Each entry
+keeps the question + the call + the reasoning so a future reader
+can re-litigate without re-deriving the trade-off.
 
-Resolve these before phase 3 starts.
+1. **Q1 — Worker queue: reject-on-busy or coalesce?**
+   **Decision: reject** with `T_ACK ok=false, msg="slot busy",
+   dev=<slot>`. Coalescing two C_CONNECTs onto the same slot
+   would hide host bugs (e.g. spurious double-fire from the kid-UX
+   button-debounce path) instead of surfacing them. The queue
+   itself is sized at `VERNIER_MAX_SLOTS` (3) so the only way to
+   hit "busy" is a real overlap on one slot, which the host UI
+   should be debouncing anyway.
+
+2. **Q2 — Single `bleWorker` task or one per slot?**
+   **Decision: single.** The NimBLE controller serialises BLE
+   scan + GATT discovery globally — three workers would block on
+   each other anyway. One task + one queue is simpler to reason
+   about, cheaper on RAM (one TCB + one ~4 KB stack vs three),
+   and matches the existing pattern of one `vernierHandler` task
+   round-robining across slots.
+
+3. **Q3 — Standalone `T_CONN_STATE` frame or piggyback on
+   `T_DEV_LIST`?** **Decision: piggyback.** `publishConnectResult`
+   already emits `T_DEV_LIST` at the tail of every connect attempt
+   (D4); adding the new `state` field to its entries means every
+   transition naturally rides out without a second frame type to
+   maintain. Keeps `UartAdapter::MsgType` narrow and avoids
+   bumping the protocol version.
+
+4. **Q4 — `C_CANCEL_CONNECT` in 2.1.0 or 2.2.0?**
+   **Decision: in 2.1.0.** Closes the "kid pressed the wrong
+   card" UX wart that auto-detect-fallback would otherwise eat.
+   Implementation cost is small (~30 lines: enum entry, handler
+   path, worker drains the queued request, ACK). Lands inside
+   G007's cutover commit because it lives on the same state
+   machine.

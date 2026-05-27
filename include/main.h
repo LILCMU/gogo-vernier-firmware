@@ -39,3 +39,20 @@ const constexpr char *NVS_KEY_DEVICE_NAME_FMT = "deviceName%u";
 // budget so a buffer overflow is impossible at compile time.
 constexpr size_t NVS_KEY_MAX_LEN = 16;
 
+// ---- FreeRTOS task config ---------------------------------------------
+// Shared across main.cpp (uartHandler, vernierHandler) and
+// control-loop.cpp (bleWorker). UBaseType_t is just unsigned on
+// ESP-IDF; using plain `unsigned` here keeps main.h free of any
+// FreeRTOS include dependency.
+
+// uartHandler, vernierHandler and bleWorker all run at the same
+// priority — bumping bleWorker above the others buys nothing because
+// the BLE controller serialises connects anyway.
+constexpr unsigned HANDLER_TASK_PRIO = 1;
+
+// Stack budget for any task that drives a NimBLE connect/disconnect.
+// GoGoVernier::open / _gv.close dive through NimBLEScan + NimBLEClient
+// discovery, ~4 KB on their own; 6 KB leaves headroom. Shared by
+// bleWorker (connects) and uartHandler (disconnects).
+constexpr uint16_t TASK_STACK_BLE_HEAVY = 6144;
+

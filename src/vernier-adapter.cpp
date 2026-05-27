@@ -2,6 +2,22 @@
 
 #include <string.h>
 
+#include "uart-adapter.h"  // VERNIER_MAX_SLOTS
+
+// VERNIER_MAX_SLOTS sizes the slots[] array and is advertised to the
+// host via T_HELLO.max_slots. The NimBLE controller can only host as
+// many concurrent peripheral connections as CONFIG_BT_NIMBLE_MAX_CONNECTIONS
+// allows; bumping VERNIER_MAX_SLOTS past that ceiling would silently
+// fail to connect the extra slots at the BLE layer instead of failing
+// loudly at compile time. The static_assert lives in this TU (rather
+// than the slot-count header) because including <nimconfig.h> from
+// uart-adapter.h would couple the wire-protocol layer to the BLE
+// stack; vernier-adapter.cpp already pulls NimBLE in via GoGoVernier.
+static_assert(VERNIER_MAX_SLOTS <= CONFIG_BT_NIMBLE_MAX_CONNECTIONS,
+              "VERNIER_MAX_SLOTS exceeds the NimBLE controller's "
+              "max concurrent connections — bump "
+              "CONFIG_BT_NIMBLE_MAX_CONNECTIONS in nimconfig first.");
+
 VernierAdapter::VernierAdapter()
 {
     // VERNIER_SAMPLE_QUEUE_DEPTH (=2) lets the NimBLE notify task push
@@ -13,11 +29,32 @@ VernierAdapter::VernierAdapter()
     // ~300 KB free DRAM.
     _sample_queue = xQueueCreate(VERNIER_SAMPLE_QUEUE_DEPTH,
                                  sizeof(gogo_vernier::Sample));
+    configASSERT(_sample_queue);
+    // H6 per-slot status mutex. Held during refreshStatus + the
+    // multi-field status read at the call sites; see header doc.
+    // Recursive so callers can wrap (getDeviceInfo + accessor reads)
+    // in one lockStatus block — getDeviceInfo takes the mutex too.
+    _status_mutex = xSemaphoreCreateRecursiveMutex();
+    configASSERT(_status_mutex);
 }
 
 VernierAdapter::~VernierAdapter()
 {
-    if (_sample_queue) vQueueDelete(_sample_queue);
+    vQueueDelete(_sample_queue);
+    vSemaphoreDelete(_status_mutex);
+}
+
+bool VernierAdapter::lockStatus(uint32_t timeout_ms)
+{
+    const TickType_t ticks = (timeout_ms == portMAX_DELAY)
+                                 ? portMAX_DELAY
+                                 : pdMS_TO_TICKS(timeout_ms);
+    return xSemaphoreTakeRecursive(_status_mutex, ticks) == pdTRUE;
+}
+
+void VernierAdapter::unlockStatus()
+{
+    xSemaphoreGiveRecursive(_status_mutex);
 }
 
 bool VernierAdapter::connect(bool forceConnect)
@@ -67,22 +104,19 @@ bool VernierAdapter::connect(bool forceConnect)
 
         // Reset push-side drop counter and drain any stale samples
         // left in the queue from a previous session.
-        _push_dropped = 0;
-        if (_sample_queue) xQueueReset(_sample_queue);
+        _push_dropped.store(0, std::memory_order_relaxed);
+        xQueueReset(_sample_queue);
 
         // Wire the push path. Lambda runs on the NimBLE notify task —
         // must be non-blocking. xQueueSend with timeout=0 drops on
         // full and bumps the counter; the host MCU sees the count
         // via the next DEVSTATS push.
         QueueHandle_t q = _sample_queue;
-        volatile uint32_t* drop_counter = &_push_dropped;
+        std::atomic<uint32_t>* drop_counter = &_push_dropped;
         _gv.onSample([q, drop_counter](const gogo_vernier::Sample& s) {
             if (!q) return;
             if (xQueueSend(q, &s, 0) != pdTRUE) {
-                // Explicit load+store sidesteps C++20 -Wdeprecated-volatile
-                // on the compound `++`. _push_dropped is volatile by
-                // design — see vernier-adapter.h.
-                *drop_counter = static_cast<uint32_t>(*drop_counter) + 1;
+                drop_counter->fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
@@ -99,16 +133,28 @@ void VernierAdapter::disconnect()
     if (_gv.isStreaming()) _gv.stop();
     if (_gv.isConnected()) _gv.close();
     if (_sample_queue) xQueueReset(_sample_queue);
+    // Surface the slot as IDLE to vernierHandler / emitDevList /
+    // cmdConnect's busy-guard. Without this the slot would still
+    // report READY (via state()) until the next connect attempt,
+    // even though the BLE link is down.
+    setState(ConnState::IDLE);
 }
 
 void VernierAdapter::setSamplingRate(uint16_t period_ms)
 {
-    _period_ms = period_ms;
-    log_i("Set sampling period to %u ms", _period_ms);
+    // Defence-in-depth: cmdSetPeriod also NACKs sub-min requests at the
+    // wire boundary (H4), but the adapter is the single sink for
+    // _period_ms, so re-asserting the floor here keeps the invariant
+    // holding for future writers (bleWorker, hardware-button paths,
+    // direct test calls). Floor rather than reject — by the time we're
+    // here the caller has already committed to setting a rate.
+    if (period_ms < VERNIER_MIN_PERIOD_MS) period_ms = VERNIER_MIN_PERIOD_MS;
+    _period_ms.store(period_ms, std::memory_order_relaxed);
+    log_i("Set sampling period to %u ms", (unsigned)period_ms);
     if (_gv.isStreaming())
     {
         _gv.stop();
-        _gv.start(_period_ms);
+        _gv.start(period_ms);
     }
 }
 
@@ -120,9 +166,14 @@ void VernierAdapter::startReading(uint16_t period_ms)
     // session_mutex inside GoGoVernier::start() also catches it, but
     // failing fast here keeps the contract consistent with connect().
     if (!_gv.isReady()) return;
-    if (period_ms) _period_ms = period_ms;
-    log_i("Start reading at %u ms period", _period_ms);
-    _gv.start(_period_ms);
+    if (period_ms)
+    {
+        if (period_ms < VERNIER_MIN_PERIOD_MS) period_ms = VERNIER_MIN_PERIOD_MS;
+        _period_ms.store(period_ms, std::memory_order_relaxed);
+    }
+    const uint16_t p = _period_ms.load(std::memory_order_relaxed);
+    log_i("Start reading at %u ms period", (unsigned)p);
+    _gv.start(p);
 }
 
 void VernierAdapter::stopReading()
@@ -134,17 +185,19 @@ void VernierAdapter::stopReading()
 void VernierAdapter::getDeviceInfo(bool force)
 {
     if (!_gv.isConnected() && !force) return;
+    // H6: hold _status_mutex across refreshStatus so a concurrent
+    // multi-field read via lockStatus() can't tear across the write.
+    lockStatus();
     _gv.refreshStatus();
+    unlockStatus();
 }
 
-uint32_t VernierAdapter::droppedSamples() const  { return _gv.droppedSamples() + _push_dropped; }
+uint32_t VernierAdapter::droppedSamples() const  { return _gv.droppedSamples() + _push_dropped.load(std::memory_order_relaxed); }
 uint8_t  VernierAdapter::channelCount() const    { return _gv.channelCount(); }
 
 bool VernierAdapter::waitForSample(float *out, size_t &count, uint32_t timeout_ms)
 {
     count = 0;
-    if (!_sample_queue) return false;
-
     gogo_vernier::Sample s;
     if (xQueueReceive(_sample_queue, &s, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
         return false;
