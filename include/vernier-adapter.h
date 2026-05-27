@@ -120,6 +120,22 @@ public:
             expected, ConnState::IDLE, std::memory_order_relaxed);
     }
 
+    // CAS CONNECTING → READY for publishConnectResult's success tail.
+    // Fails iff a C_DISCONNECT / C_FORGET for this slot set it IDLE
+    // during the ~7 s handshake (disconnect() runs on the UART task,
+    // blocked on GoGoVernier's session_mutex behind bleWorker's
+    // open(), then stores IDLE). On failure the connect result is
+    // abandoned rather than resurrecting a slot the host tore down —
+    // without it, the unconditional READY store raced disconnect()'s
+    // IDLE store and could leave the slot shown-connected-but-gone or
+    // stuck-READY-never-streaming.
+    bool tryFinishConnecting()
+    {
+        ConnState expected = ConnState::CONNECTING;
+        return _conn_state.compare_exchange_strong(
+            expected, ConnState::READY, std::memory_order_relaxed);
+    }
+
     // CAS IDLE → REQUESTED for the producer enqueue path
     // (enqueueConnect). Fails if the slot is already
     // REQUESTED / CONNECTING / READY, so a duplicate enqueue — e.g. a

@@ -174,8 +174,20 @@ static void publishConnectResult(uint8_t slot, bool ok)
     // the state publish; same single-core RV32 reordering discipline
     // documented in CLAUDE.md §Code Quality Rules.
     __asm__ volatile("" ::: "memory");
-    slots[slot].setState(ok ? VernierAdapter::ConnState::READY
-                            : VernierAdapter::ConnState::IDLE);
+    if (ok)
+    {
+        // CAS CONNECTING→READY. Fails iff a C_DISCONNECT / C_FORGET
+        // for this slot landed during the handshake and already set
+        // it IDLE. In that case abandon the connect — tear the link
+        // back down (idempotent) and leave the slot IDLE — rather
+        // than resurrect a slot the host just tore down.
+        if (!dev.tryFinishConnecting())
+            dev.disconnect();
+    }
+    else
+    {
+        dev.setState(VernierAdapter::ConnState::IDLE);
+    }
 
     // Per design D4: T_DEV_LIST auto-pushed after every connect attempt
     // (success OR failure — the failure case still tells the host that

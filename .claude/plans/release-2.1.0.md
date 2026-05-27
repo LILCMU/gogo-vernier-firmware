@@ -274,6 +274,25 @@ out-of-scope list) was pulled into this release. Landed:
   h2zero/NimBLE-Arduino exposing a clean mid-scan abort. `C_CANCEL_
   CONNECT` covers the REQUESTED window via CAS; extending it into
   CONNECTING needs upstream support. Revisit if NimBLE adds it.
+- **Stale queued ConnectRequest consumed by a re-CONNECT to the same
+  slot** (audit MEDIUM, low probability). If slot N is REQUESTED
+  (queued, not yet drained) and a C_FORGET / C_DISCONNECT flips it to
+  IDLE, the stale entry stays in bleWorkQueue. A new C_CONNECT for N
+  within the ~7–14 s drain window CASes IDLE→REQUESTED and queues a
+  second request; bleWorker dequeues the STALE entry first, its
+  tryAcquireConnecting CAS succeeds (state is REQUESTED again from the
+  new request), and it connects using the stale request's `force`
+  flag. Worst case: a just-forgotten slot reconnects with
+  `force=false`. The clean fix is a per-slot generation counter
+  (packed with `_conn_state` into one atomic word so the
+  REQUESTED→CONNECTING claim validates both): tag each ConnectRequest
+  with the slot's generation at enqueue, bump it on every
+  REQUESTED-abandoning transition, and have the worker drop a dequeued
+  request whose generation is stale. Deferred from 2.1.0 — needs the
+  packed-atomic refactor, too invasive to rush against the tag, and
+  the trigger (forget→re-connect same slot inside the drain window)
+  is rare. The CONNECTING-window disconnect race (the CRITICAL from
+  the same audit) IS fixed in 2.1.0 via tryFinishConnecting().
 
 ## Risks
 
