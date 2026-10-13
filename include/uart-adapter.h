@@ -77,6 +77,7 @@ public:
         C_DEV_LIST       = 4,  // {c, seq}. Triggers a T_DEV_LIST push.
         C_FORGET         = 5,  // {c, seq, dev:u8}. Disconnect + clear NVS deviceName{dev}.
         C_CANCEL_CONNECT = 6,  // {c, seq, dev:u8}. Abort a queued C_CONNECT for slot `dev`. NACK if slot isn't REQUESTED. Added in 2.1.0.
+        C_HELLO          = 7,  // {c, seq}. Answered with T_HELLO only (no T_ACK). The GoGo co-MCU detector sends it when the link is silent after a GoGo-only reboot. Older firmware answers T_ACK "unknown command".
     };
 
     // T_STATUS.core_state values — peer-health enum carried by the

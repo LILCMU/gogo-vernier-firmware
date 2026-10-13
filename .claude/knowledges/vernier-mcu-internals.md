@@ -314,6 +314,26 @@ Vernier MCU side:
    of a multi-slot reconnect kept its fields. The handshake moved to
    step 2 (once) to fix this.
 
+GoGo-only reboot: the GoGo comes back with an empty slot table while
+this firmware keeps running with the step-2 flag already set, so no
+T_HELLO arrives on its own. The GoGo's co-MCU detector (gogo-firmware
+`CoProcDetector`, active probe) sends `C_HELLO=7` after 3 s of
+silence; `cmdHello` answers T_HELLO (only T_HELLO, no ACK, and not a
+second time when C_HELLO was itself the first contact). The GoGo then
+sends `C_DEV_LIST` as in the host-side note below. Before C_HELLO
+existed the GoGo got `T_ACK "unknown command"` for it, which its
+detector also treats as "Vernier present".
+
+The detector then sends an Arduino-lib request (`54 FE 20 02 DC DC`)
+and a Tasmota line (`\nStatus 10\n`) 300 ms apart, but only if no
+co-MCU answered yet. If this firmware is slow to answer and those bytes
+arrive, `FramedMsgPackReceiver` drops the half-read "frame" after
+`kFrameGapResetMs` (100 ms) of line silence instead of skipping
+`0x54FE` = 21758 bytes. Host-side check (throwaway shim harness,
+2026-10-13): before the resync, a C_DEV_LIST sent 300 ms after the
+Arduino or Tasmota probe was never dispatched; after it, it was; a
+whole frame already buffered when the task stalls 1 s still parses.
+
 Host side (post-fix):
 - The auto-detect-co-MCU path on the host **no longer** issues an
   unsolicited `C_CONNECT` (it used to). Instead it sends
