@@ -220,6 +220,51 @@ them races another task:
 allowed); `publishConnectResult`'s READY is the only success publish
 and it's gated by the CAS above.
 
+### Link loss frees the slot (READY → IDLE without a host command)
+
+Before this fix a sensor that dropped its BLE link (switched off, out
+of range, battery dead) left its slot READY until the co-MCU was
+power-cycled. `GoGoVernier::isConnected()` is the *session* flag (true
+until `close()`), and `NimBleXport`'s `onDisconnect` only cleared the
+transport's own flag, so nothing in the firmware noticed. The host's
+liveness watchdog flipped its card to idle after 5-30 s, but the next
+`C_CONNECT` for that slot was NACKed `"slot busy"` and a GoGo reboot's
+auto-connect failed the IDLE→REQUESTED CAS. Only the BOOT long-press or
+a power cycle recovered it.
+
+Now:
+- `lib/GoGoVernier` exposes `GoGoVernier::isLinkUp()`, a lock-free read
+  of the transport flag that `onDisconnect` clears
+  (`NimBleXport::Impl::connected`, now `std::atomic<bool>`).
+- `loop()` calls `releaseLostLinks()` (control-loop.cpp), which asks
+  every slot `VernierAdapter::releaseIfLinkLost()` on each pass. When the link is down it runs the same
+  teardown as `disconnect()` (clear `onSample`, `_gv.close()` to free
+  the NimBLE client, state IDLE), logs `slot N: BLE link lost, slot
+  freed`, and pushes T_DEV_LIST (`state=0`, `connected=false`).
+- `disconnect()` and `releaseIfLinkLost()` share
+  `VernierAdapter::_lifecycle_mutex`. Teardown runs on three tasks
+  (UART, loop, bleWorker), and two concurrent teardowns would reset the
+  same `std::function` at once.
+- Why `loop()` and not `vernierHandler`: `_gv.close()` waits on the
+  lib-wide `g_ble_mutex`, which `NimBleXport::connect()` holds for a
+  whole scan + connect (about 5 to 9 s). Run on vernierHandler, one
+  dropped sensor during another slot's connect would stall samples for
+  every healthy slot past the GoGo's 5 s liveness timeout, and the host
+  would reset them too. vernierHandler only skips slots that are no
+  longer READY, and `startReading()` returns at once on a slot whose
+  link is down: `_gv.start()` would otherwise block on the session
+  mutex that the teardown's `close()` holds and stall every slot. The loop task's button polling
+  waits instead, as it already does for a long-press disconnect.
+- The saved NVS name is kept. The slot is **not** retried on its own
+  (owner question Q-C4, default "free only"). It reconnects when the
+  host sends `C_CONNECT` for it, or on the next auto-connect pass (a
+  later `C_SET_PERIOD` re-arms `startAutoConnect`, or the next boot).
+- Host side (gogo-firmware `gogo-vernier.cpp`): T_DEV_LIST only
+  upgrades a slot to CONNECTED, never downgrades it, so the GoGo card
+  still waits for its liveness timeout before it shows the slot empty.
+  After that the kid's connect press works instead of hitting
+  `"slot busy"`.
+
 ### Bug #2 (since v2.0.0): T_HELLO per-connect is a host-reset storm
 
 T_HELLO is the GLOBAL boot handshake; the host's T_HELLO handler
@@ -441,7 +486,7 @@ When adding a new wire frame:
   - `.claude/knowledges/d2pio-debug-findings.md` — protocol-level
     debugging session notes (preserved as-is, captures pre-Phase-4
     findings).
-- Submodule: `lib/GoGoVernier@main` (pinned at v1.0.0) carries the GDX driver
-  including `refreshStatus()` battery support.
+- Submodule: `lib/GoGoVernier` (v1.0.0 plus the `isLinkUp()` commit)
+  carries the GDX driver including `refreshStatus()` battery support.
 - Host-side display patterns:
   `gogo-firmware/.claude/knowledges/vernier-display-patterns.md`.

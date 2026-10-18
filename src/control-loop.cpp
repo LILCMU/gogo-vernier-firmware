@@ -308,6 +308,18 @@ void autoConnectDevice()
     }
 }
 
+void releaseLostLinks()
+{
+    for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+    {
+        if (slots[i].releaseIfLinkLost())
+        {
+            log_w("slot %u: BLE link lost, slot freed", (unsigned)i);
+            emitDevList();
+        }
+    }
+}
+
 void buttonHandler()
 {
     if (digitalRead(BOOT_BUTTON_PIN) == LOW)
