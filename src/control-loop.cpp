@@ -52,6 +52,13 @@ struct ConnectRequest {
 QueueHandle_t bleWorkQueue = nullptr;
 TaskHandle_t  bleWorkerTaskHandle = nullptr;
 
+// Held across emitDevList's snapshot and send. uartHandler, loop and
+// bleWorker all emit T_DEV_LIST; without it a snapshot taken before a
+// slot changed state could be sent after the newer one, and the host
+// would act on the stale table (e.g. free a slot that is READY).
+StaticSemaphore_t devListMutexBuf;
+SemaphoreHandle_t devListMutex = xSemaphoreCreateMutexStatic(&devListMutexBuf);
+
 }  // namespace
 
 static void emitDevList();           // forward decl — defined below for grouping
@@ -259,6 +266,7 @@ void bleWorkerStart()
 // "this slot is producing samples".
 static void emitDevList()
 {
+    xSemaphoreTake(devListMutex, portMAX_DELAY);
     UartAdapter::DevListEntry entries[VERNIER_MAX_SLOTS];
     for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
     {
@@ -276,6 +284,7 @@ static void emitDevList()
         entries[i].state     = static_cast<uint8_t>(st);
     }
     uart.sendDevList(entries, VERNIER_MAX_SLOTS);
+    xSemaphoreGive(devListMutex);
 }
 
 void autoConnectDevice()

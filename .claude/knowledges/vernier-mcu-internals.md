@@ -26,7 +26,7 @@ multiple GDX sensors over one UART link. Categories:
 | T_FIELDS   | yes | Per-slot enabled-channel name+unit list. Bumps host's `fields_version`. |
 | T_SENS_VALUES | yes | Per-slot sample frame. |
 | T_ACK      | (echoes seq + dev where applicable) | Replies to host commands. |
-| T_DEV_LIST | n/a | Carries an `entries[]` array of `{dev, name, order, connected}` for the full slot table. Auto-emitted on every connect/disconnect event per design D4. |
+| T_DEV_LIST | n/a | Carries an `entries[]` array of `{dev, name, order, connected}` for the full slot table. Auto-emitted on every connect/disconnect event per design D4. Emitted from uartHandler, loop and bleWorker; `emitDevList()` holds `devListMutex` (control-loop.cpp) across the slot-state snapshot and the send, so frames leave in snapshot order and the last T_DEV_LIST always carries the newest table. Before that a snapshot taken mid-connect could be sent after bleWorker's newer READY one, and a host that frees slots on `connected=false` would drop a live slot. |
 
 **Pitfall (host-side bug we hit):** the host dispatcher computed
 `dev_field = root["dev"] | 0` for *every* frame, then the T_STATUS
