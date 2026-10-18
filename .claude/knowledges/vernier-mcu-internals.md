@@ -229,8 +229,10 @@ connect, so during a sequential 3-slot reconnect each new connect
 wiped the previously-connected slots back to "connecting" — only the
 last slot kept its fields, the earlier two recovered ~30 s later via
 the periodic T_FIELDS re-emit. **Rule: T_HELLO + T_STATUS are sent
-exactly once per session**, lazily on the first host command
-(`dispatchHostCommand`), NEVER per connect. `publishConnectResult`
+exactly once per session**, before the first per-slot frame (on the
+first host command, or by bleWorker if a connect starts while the host
+is still silent; see "Boot auto-connect choreography"), NEVER per
+connect. `publishConnectResult`
 emits only per-slot frames (T_DEVINFO / T_DEVSTATS / T_FIELDS) +
 T_DEV_LIST. If you add a frame to the connect path, do NOT add a
 global/reset-bearing one.
@@ -301,6 +303,30 @@ Vernier MCU side:
    never per connect.
 3. Host sends `C_SET_PERIOD` per slot at boot. The first one with
    `foundSavedDevice == true` flips `startAutoConnect = true`.
+   **Hostless fallback:** if nothing has started auto-connect by
+   `AUTO_CONNECT_HOSTLESS_DELAY_MS` (5 s, `main.h`) after boot and a
+   saved device exists, `autoConnectDevice` arms it itself. This
+   covers the co-MCU booting after the GoGo's `setup()` wrote its boot
+   commands, a co-MCU-only reset (sketch upload, USB replug, brownout)
+   while the GoGo keeps running, and boot `C_SET_PERIOD`s that were
+   all NACKed (the GoGo's 120 s preset exceeds the 16-bit limit). The
+   GoGo answers its own boot commands about 1.2 s after its reset
+   (bench, 2026-10-18), so the fallback does not fire in a normal
+   shared power-up.
+   **Handshake ordering (`HostLink` in `control-loop.cpp`):** `SILENT`
+   → `HEARD` on the first host command (handshake sent), or `SILENT` →
+   `ANNOUNCED` when bleWorker starts a connect while the host is still
+   silent (`announceIfSilent` sends the handshake first, so the host
+   never sees a per-slot frame before T_HELLO). `ANNOUNCED` → `HEARD`
+   on the first host command afterwards repeats the handshake and
+   re-sends T_DEVINFO / T_DEVSTATS / T_FIELDS for every READY slot plus
+   T_DEV_LIST: the host may have booted after the announce (it would
+   otherwise wait up to 50 samples for the T_FIELDS re-emit), and if it
+   was listening its T_HELLO reset is undone in the same burst.
+   The hostless path streams at `VERNIER_DEFAULT_PERIOD_MS` (1 s) per
+   slot, since the vernier does not persist periods; the GoGo's preset
+   only comes back when it sends `C_SET_PERIOD` again (menu change,
+   GoGo reboot, or a host that re-sends its boot sequence on T_HELLO).
 4. Next loop tick, `autoConnectDevice` walks slots; for each with
    `slotHasSavedDevice[i]` it `enqueueConnect(i)` (CAS IDLE→REQUESTED;
    a duplicate pass after another `C_SET_PERIOD` re-arm is a no-op).
@@ -356,7 +382,10 @@ assemble). Two patterns in use, depending on the shape of the data:
 Tasks at play:
 - `setup()` → fills NVS + per-slot saved-device flags.
 - `uartHandler` task → reads C_SET_PERIOD, flips startAutoConnect.
-- `loop()` → reads startAutoConnect, dispatches autoConnectDevice.
+- `loop()` → reads startAutoConnect, dispatches autoConnectDevice
+  (and flips startAutoConnect itself for the 5 s hostless fallback).
+- `uartHandler` + `bleWorker` → `hostLink` (`std::atomic<HostLink>`,
+  relaxed: one variable, no data published with it).
 - `vernierHandler` task → polls slots[i] state.
 
 `nvsMutex` (FreeRTOS semaphore) gates every Preferences begin/end

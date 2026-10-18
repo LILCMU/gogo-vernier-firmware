@@ -123,7 +123,8 @@ SemaphoreHandle_t nvsMutex;
 //   - setup() / publishConnectResult fill slotHasSavedDevice[]
 //     (relaxed) then store foundSavedDevice with release.
 //   - cmdSetPeriod loads foundSavedDevice with acquire; if set,
-//     stores startAutoConnect with release.
+//     stores startAutoConnect with release. autoConnectDevice's
+//     hostless fallback does the same acquire-load on the loop task.
 //   - autoConnectDevice loads startAutoConnect with acquire; if set,
 //     reads slotHasSavedDevice[] (relaxed) — transitively visible.
 // std::atomic replaces the prior volatile + __asm__ compiler barrier:
