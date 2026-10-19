@@ -241,6 +241,20 @@ Now:
   teardown as `disconnect()` (clear `onSample`, `_gv.close()` to free
   the NimBLE client, state IDLE), logs `slot N: BLE link lost, slot
   freed`, and pushes T_DEV_LIST (`state=0`, `connected=false`).
+- Detection latency is the BLE supervision timeout. The GDX-ACC asks
+  for 5.00 s (interval 6/6, latency 0) right after connect and NimBLE
+  applies it, so the C3 learned of a switch-off 5.0 s later, after the
+  GoGo's own 5 s liveness timer had reset the slot (measured
+  2026-10-20: T_DEV_LIST arrived ~150 ms late).
+  `NimBleXport` now connects with 7.5 ms / latency 0 / 2.0 s
+  (`SUPERVISION_TIMEOUT_MAX_UNITS = 200`, 10 ms units) and rejects any
+  peer request above that cap. The supervision timer starts at the last
+  link-layer packet, i.e. when the sensor goes silent, so the loss is
+  expected about 2 s after that: up to period + 2 s after the last
+  sample, and only when no other slot is connecting (a connect holds
+  `g_ble_mutex` for 5-9 s). Expected value, not yet measured with the
+  cap on a real switch-off. Fallback if a peer drops the link on
+  rejection: accept, then `updateConnParams()` after the handshake.
 - `disconnect()` and `releaseIfLinkLost()` share
   `VernierAdapter::_lifecycle_mutex`. Teardown runs on three tasks
   (UART, loop, bleWorker), and two concurrent teardowns would reset the
@@ -486,7 +500,7 @@ When adding a new wire frame:
   - `.claude/knowledges/d2pio-debug-findings.md` — protocol-level
     debugging session notes (preserved as-is, captures pre-Phase-4
     findings).
-- Submodule: `lib/GoGoVernier` (v1.0.0 plus the `isLinkUp()` commit)
+- Submodule: `lib/GoGoVernier` (v1.0.0 plus the `isLinkUp()` and supervision-timeout-cap commits)
   carries the GDX driver including `refreshStatus()` battery support.
 - Host-side display patterns:
   `gogo-firmware/.claude/knowledges/vernier-display-patterns.md`.
