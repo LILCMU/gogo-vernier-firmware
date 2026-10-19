@@ -614,8 +614,9 @@ void dispatchHostCommand(JsonVariantConst root)
     // The flag is function-local static; dispatchHostCommand only ever
     // runs on the uartHandler task, so no synchronisation is needed.
     // On a co-MCU reboot the flag resets and the next host command
-    // re-announces. A GoGo-only reboot leaves the flag set, so the
-    // rebooted host asks again with C_HELLO.
+    // re-announces. A GoGo-only reboot leaves the flag set; the GoGo
+    // locks on the answers to its boot commands, and sends C_HELLO
+    // only when those get no answer.
     static bool helloSent = false;
     const bool firstContact = !helloSent;
     if (firstContact)

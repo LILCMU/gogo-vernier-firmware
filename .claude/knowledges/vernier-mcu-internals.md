@@ -316,10 +316,16 @@ Vernier MCU side:
 
 GoGo-only reboot: the GoGo comes back with an empty slot table while
 this firmware keeps running with the step-2 flag already set, so no
-T_HELLO arrives on its own. The GoGo's co-MCU detector (gogo-firmware
-`CoProcDetector`, active probe) sends `C_HELLO=7` after 3 s of
-silence; `cmdHello` answers T_HELLO (only T_HELLO, no ACK, and not a
-second time when C_HELLO was itself the first contact). The GoGo then
+T_HELLO arrives on its own. This does NOT trigger `C_HELLO`: the GoGo's
+co-MCU detector (gogo-firmware `CoProcDetector`) locks passively, at
+about 1159 ms on the board, on the T_ACK / T_DEV_LIST answers to
+setup()'s `C_SET_PERIOD` / `C_DEV_LIST`.
+
+`C_HELLO=7` goes out only when the GoGo's boot commands get no answer:
+the co-MCU booted late, was held in download mode, or its receiver lost
+frame sync. On the board it was sent at 4166 ms with the C3 held in
+download mode. `cmdHello` answers T_HELLO (only T_HELLO, no ACK, and not
+a second time when C_HELLO was itself the first contact). The GoGo then
 sends `C_DEV_LIST` as in the host-side note below. Before C_HELLO
 existed the GoGo got `T_ACK "unknown command"` for it, which its
 detector also treats as "Vernier present".
@@ -333,6 +339,9 @@ arrive, `FramedMsgPackReceiver` drops the half-read "frame" after
 2026-10-13): before the resync, a C_DEV_LIST sent 300 ms after the
 Arduino or Tasmota probe was never dispatched; after it, it was; a
 whole frame already buffered when the task stalls 1 s still parses.
+Board result: the resync case confirmed on the board was a Logo
+`tasmotasendcommand` writing `Status 10\r\n`, recovered by the 300 ms
+idle gap.
 
 Host side (post-fix):
 - The auto-detect-co-MCU path on the host **no longer** issues an
