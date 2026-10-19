@@ -340,8 +340,9 @@ arrive, `FramedMsgPackReceiver` drops the half-read "frame" after
 Arduino or Tasmota probe was never dispatched; after it, it was; a
 whole frame already buffered when the task stalls 1 s still parses.
 Board result: the resync case confirmed on the board was a Logo
-`tasmotasendcommand` writing `Status 10\r\n`, recovered by the 300 ms
-idle gap.
+`tasmotasendcommand` writing `Status 10\r\n`. It recovered because the
+quiet gap before setup()'s commands (the GoGo reboot) exceeded
+`kFrameGapResetMs` (100 ms).
 
 Host side (post-fix):
 - The auto-detect-co-MCU path on the host **no longer** issues an
