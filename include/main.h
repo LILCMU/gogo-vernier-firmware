@@ -12,6 +12,14 @@ constexpr uint8_t  BOOT_BUTTON_PIN              = 9;
 // accidental-touch territory and short enough to not feel sluggish.
 constexpr uint32_t BUTTON_LONG_PRESS_MS         = 2000;
 
+// Time after boot (ms) at which autoConnectDevice() reconnects the saved
+// sensors on its own if no C_SET_PERIOD has started it. The GoGo's
+// setup() answers arrive about 1.2 s after the GoGo's own reset
+// (1159-1181 ms of GoGo uptime in the 2026-10-18 bench logs), so 5 s
+// only fires when its boot commands were lost: the co-MCU booted late
+// or reset on its own.
+constexpr uint32_t AUTO_CONNECT_HOSTLESS_DELAY_MS = 5000;
+
 enum ButtonEvent {
     BUTTON_RELEASE,
     BUTTON_PRESS,

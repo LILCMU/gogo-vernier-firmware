@@ -59,10 +59,57 @@ TaskHandle_t  bleWorkerTaskHandle = nullptr;
 StaticSemaphore_t devListMutexBuf;
 SemaphoreHandle_t devListMutex = xSemaphoreCreateMutexStatic(&devListMutexBuf);
 
+// Who has seen the boot handshake (T_HELLO + T_STATUS). The host's
+// T_HELLO handler wipes its whole slot table, so the handshake must go
+// out before any per-slot frame and never between two connects.
+//   SILENT    nothing sent yet.
+//   ANNOUNCED sent before any host command (auto-connect or button
+//             connect with a silent host); the host may not have been
+//             listening.
+//   HEARD     sent in answer to a host command.
+// Written by the UART task (dispatchHostCommand) and bleWorker
+// (announceIfSilent).
+enum class HostLink : uint8_t
+{
+    SILENT,
+    ANNOUNCED,
+    HEARD,
+};
+std::atomic<HostLink> hostLink{HostLink::SILENT};
+
 }  // namespace
 
 static void emitDevList();           // forward decl — defined below for grouping
 static void publishConnectResult(uint8_t slot, bool ok);
+
+static void sendBootHandshake()
+{
+    uart.sendHello();
+    uart.sendStatus(true, UartAdapter::CORE_STATE_READY);
+}
+
+static void announceIfSilent()
+{
+    HostLink expected = HostLink::SILENT;
+    if (hostLink.compare_exchange_strong(expected, HostLink::ANNOUNCED,
+                                         std::memory_order_relaxed))
+        sendBootHandshake();
+}
+
+// Per-slot identity, stats and field names: everything the host needs
+// to render a connected slot.
+static void sendSlotFrames(uint8_t slot)
+{
+    VernierAdapter &dev = slots[slot];
+    uart.sendDeviceInfo(dev.deviceName(), dev.orderCode(), dev.serialNumber(), slot);
+    // H6: hold the per-slot status mutex across the multi-field
+    // read so vernierHandler's 10 s refresh can't tear the
+    // battery/charge/rssi triple mid-evaluation.
+    dev.lockStatus();
+    uart.sendDeviceStats(dev.batteryPercent(), dev.chargeState(), dev.rssi(), dev.droppedSamples(), slot);
+    dev.unlockStatus();
+    sendDeviceFieldsFor(uart, dev, slot);
+}
 
 // enqueueConnect(slot, force, req_seq):
 //   Single producer-side helper used by cmdConnect, buttonHandler
@@ -135,23 +182,15 @@ static void publishConnectResult(uint8_t slot, bool ok)
             dev.startReading(dev.samplingPeriod());
 
         // T_HELLO / T_STATUS are NOT sent here. They're the global boot
-        // handshake (peer identity + peer-up), emitted once on first
-        // host contact in dispatchHostCommand. Emitting T_HELLO per
-        // connect made the host's T_HELLO handler reset its whole
-        // connection state on every slot, so during a sequential
-        // 3-slot auto-reconnect each new connect wiped the previously
-        // connected slots back to "connecting" until the next periodic
-        // T_FIELDS re-emit. The per-connect path now emits only the
-        // per-slot frames + the trailing T_DEV_LIST.
-        uart.sendDeviceInfo(dev.deviceName(), dev.orderCode(), dev.serialNumber(), slot);
-        // H6: hold the per-slot status mutex across the multi-field
-        // read so vernierHandler's 10 s refresh can't tear the
-        // battery/charge/rssi triple mid-evaluation. Recursive mutex
-        // means the getDeviceInfo() above re-entered cleanly.
-        dev.lockStatus();
-        uart.sendDeviceStats(dev.batteryPercent(), dev.chargeState(), dev.rssi(), dev.droppedSamples(), slot);
-        dev.unlockStatus();
-        sendDeviceFieldsFor(uart, dev, slot);
+        // handshake (peer identity + peer-up), emitted once per session
+        // (see HostLink). Emitting T_HELLO per connect made the host's
+        // T_HELLO handler reset its whole connection state on every
+        // slot, so during a sequential 3-slot auto-reconnect each new
+        // connect wiped the previously connected slots back to
+        // "connecting" until the next periodic T_FIELDS re-emit. The
+        // per-connect path now emits only the per-slot frames + the
+        // trailing T_DEV_LIST.
+        sendSlotFrames(slot);
 
         // Persist last connected device name to NVS under the per-slot
         // key (deviceName0..N). Read back at boot so each slot can
@@ -240,6 +279,7 @@ static void bleWorkerEntry(void *)
                   (unsigned)req.slot);
             continue;
         }
+        announceIfSilent();
         emitDevList();
         publishConnectResult(req.slot, slots[req.slot].connect(req.force));
     }
@@ -289,9 +329,24 @@ static void emitDevList()
 
 void autoConnectDevice()
 {
+    // Normally the host's boot C_SET_PERIOD arms startAutoConnect. If
+    // those commands were lost (co-MCU booted late, or reset alone while
+    // the GoGo kept running) or all NACKed, start anyway once the host
+    // has had AUTO_CONNECT_HOSTLESS_DELAY_MS to speak. loop() is the only
+    // caller, so the function-local flag needs no synchronisation.
+    static bool started = false;
+    if (!started && millis() >= AUTO_CONNECT_HOSTLESS_DELAY_MS
+        && foundSavedDevice.load(std::memory_order_acquire))
+    {
+        log_i("auto-connect: no C_SET_PERIOD after %u ms, starting without the host",
+              (unsigned)AUTO_CONNECT_HOSTLESS_DELAY_MS);
+        startAutoConnect.store(true, std::memory_order_relaxed);
+    }
+
     if (!startAutoConnect.load(std::memory_order_acquire))
         return;
     startAutoConnect.store(false, std::memory_order_relaxed);
+    started = true;
 
     // Per design D6: walk slots in order, queue a connect for each
     // slot with a saved NVS name. bleWorker drains them sequentially
@@ -652,24 +707,25 @@ static void cmdSetPeriod(JsonVariantConst root, uint32_t req)
 
 void dispatchHostCommand(JsonVariantConst root)
 {
-    // Boot handshake, sent once on first host contact: T_HELLO (peer
-    // identity + proto version) followed by T_STATUS (peer up). The
-    // host's T_HELLO handler resets its connection state, so this must
-    // fire exactly once per co-MCU session — emitting it per connect
-    // wiped already-connected slots during multi-slot auto-reconnect.
-    // The flag is function-local static; dispatchHostCommand only ever
-    // runs on the uartHandler task, so no synchronisation is needed.
-    // On a co-MCU reboot the flag resets and the next host command
-    // re-announces. A GoGo-only reboot leaves the flag set; the GoGo
-    // locks on the answers to its boot commands, and sends C_HELLO
-    // only when those get no answer.
-    static bool helloSent = false;
-    const bool firstContact = !helloSent;
+    // Boot handshake on first host contact: T_HELLO (peer identity +
+    // proto version) then T_STATUS (peer up). If it already went out
+    // unprompted, the host may have missed it and the per-slot frames
+    // that followed, so repeat it and re-send every connected slot
+    // right behind it; the host's T_HELLO reset is undone in the same
+    // burst. On a co-MCU reboot the state resets and the next host
+    // command re-announces.
+    const HostLink prev = hostLink.exchange(HostLink::HEARD, std::memory_order_relaxed);
+    const bool firstContact = prev != HostLink::HEARD;
     if (firstContact)
     {
-        uart.sendHello();
-        uart.sendStatus(true, UartAdapter::CORE_STATE_READY);
-        helloSent = true;
+        sendBootHandshake();
+        if (prev == HostLink::ANNOUNCED)
+        {
+            for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+                if (slots[i].isReady())
+                    sendSlotFrames(i);
+            emitDevList();
+        }
     }
 
     const uint8_t  c   = root["c"]   | 0;

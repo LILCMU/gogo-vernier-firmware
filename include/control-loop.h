@@ -14,8 +14,9 @@
 void dispatchHostCommand(JsonVariantConst root);
 
 // Sequentially attempt to reconnect every slot flagged with a saved
-// NVS device name. Triggered once from loop() after the host's first
-// C_SET_PERIOD; no-op on subsequent calls until startAutoConnect is
+// NVS device name. Called from loop(); runs after the host's first
+// C_SET_PERIOD, or on its own AUTO_CONNECT_HOSTLESS_DELAY_MS after boot
+// if none started it. No-op on later calls until startAutoConnect is
 // re-armed.
 void autoConnectDevice();
 
