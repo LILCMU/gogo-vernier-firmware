@@ -512,6 +512,15 @@ static void cmdDevList(JsonVariantConst /*root*/, uint32_t req)
     emitDevList();
 }
 
+static void cmdHello(bool firstContact)
+{
+    // C_HELLO: a rebooted host asking who is on the link. No T_ACK: the
+    // T_HELLO is the answer. On first contact dispatchHostCommand has
+    // already sent it, so don't send it twice.
+    if (!firstContact)
+        uart.sendHello();
+}
+
 static void cmdCancelConnect(JsonVariantConst root, uint32_t req)
 {
     // C_CANCEL_CONNECT (G007 §Decisions Q4). Aborts a queued C_CONNECT
@@ -605,10 +614,12 @@ void dispatchHostCommand(JsonVariantConst root)
     // The flag is function-local static; dispatchHostCommand only ever
     // runs on the uartHandler task, so no synchronisation is needed.
     // On a co-MCU reboot the flag resets and the next host command
-    // re-announces (host + co-MCU share board power, so they reboot
-    // together).
+    // re-announces. A GoGo-only reboot leaves the flag set; the GoGo
+    // locks on the answers to its boot commands, and sends C_HELLO
+    // only when those get no answer.
     static bool helloSent = false;
-    if (!helloSent)
+    const bool firstContact = !helloSent;
+    if (firstContact)
     {
         uart.sendHello();
         uart.sendStatus(true, UartAdapter::CORE_STATE_READY);
@@ -626,6 +637,7 @@ void dispatchHostCommand(JsonVariantConst root)
     case UartAdapter::C_DEV_LIST:       cmdDevList(root, req);        break;
     case UartAdapter::C_SET_PERIOD:     cmdSetPeriod(root, req);      break;
     case UartAdapter::C_CANCEL_CONNECT: cmdCancelConnect(root, req);  break;
+    case UartAdapter::C_HELLO:          cmdHello(firstContact);       break;
     default:                        uart.sendAck(req, false, "unknown command"); break;
     }
 }
