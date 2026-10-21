@@ -36,12 +36,15 @@ VernierAdapter::VernierAdapter()
     // in one lockStatus block — getDeviceInfo takes the mutex too.
     _status_mutex = xSemaphoreCreateRecursiveMutex();
     configASSERT(_status_mutex);
+    _lifecycle_mutex = xSemaphoreCreateMutex();
+    configASSERT(_lifecycle_mutex);
 }
 
 VernierAdapter::~VernierAdapter()
 {
     vQueueDelete(_sample_queue);
     vSemaphoreDelete(_status_mutex);
+    vSemaphoreDelete(_lifecycle_mutex);
 }
 
 bool VernierAdapter::lockStatus(uint32_t timeout_ms)
@@ -123,7 +126,30 @@ bool VernierAdapter::connect(bool forceConnect)
     return ok;
 }
 
+namespace {
+struct LifecycleLock {
+    SemaphoreHandle_t m;
+    explicit LifecycleLock(SemaphoreHandle_t mu) : m(mu) { xSemaphoreTake(m, portMAX_DELAY); }
+    ~LifecycleLock()                                     { xSemaphoreGive(m); }
+};
+}  // namespace
+
 void VernierAdapter::disconnect()
+{
+    LifecycleLock lk(_lifecycle_mutex);
+    teardown();
+}
+
+bool VernierAdapter::releaseIfLinkLost()
+{
+    LifecycleLock lk(_lifecycle_mutex);
+    if (!isReady() || _gv.isLinkUp())
+        return false;
+    teardown();
+    return true;
+}
+
+void VernierAdapter::teardown()
 {
     // Clear the push consumer FIRST so the NimBLE notify task stops
     // pushing into a queue we're about to drain. The lambda copy
@@ -165,7 +191,9 @@ void VernierAdapter::startReading(uint16_t period_ms)
     // _gv.start() with available_mask==0 and waste a wire round-trip.
     // session_mutex inside GoGoVernier::start() also catches it, but
     // failing fast here keeps the contract consistent with connect().
-    if (!_gv.isReady()) return;
+    // A dead link waits for releaseLostLinks(): _gv.start() would block on the
+    // session mutex that teardown's close() holds, stalling every slot.
+    if (!_gv.isReady() || !_gv.isLinkUp()) return;
     if (period_ms)
     {
         if (period_ms < VERNIER_MIN_PERIOD_MS) period_ms = VERNIER_MIN_PERIOD_MS;

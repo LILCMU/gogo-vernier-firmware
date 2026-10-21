@@ -19,6 +19,12 @@ void dispatchHostCommand(JsonVariantConst root);
 // re-armed.
 void autoConnectDevice();
 
+// Tear down every READY slot whose BLE link dropped and push
+// T_DEV_LIST. Runs on the loop task: teardown can wait seconds on the
+// lib-wide BLE mutex while another slot connects, and vernierHandler
+// must keep forwarding samples for the healthy slots meanwhile.
+void releaseLostLinks();
+
 // Poll the BOOT button and dispatch press / long-press semantics.
 // Short press → connect first-free slot via proximity scan.
 // Long press (≥ BUTTON_LONG_PRESS_MS) → disconnect every active slot.

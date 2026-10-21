@@ -51,6 +51,8 @@ public:
     //     IDLE). Loses cleanly if bleWorker already CAS'd into
     //     CONNECTING.
     //   - disconnect() → setState(IDLE).
+    //   - loop() → releaseLostLinks() → releaseIfLinkLost() → IDLE when a READY
+    //     slot's BLE link dropped.
     // Numeric values are part of the wire contract (T_DEV_LIST's
     // optional `state` field, G008). Don't renumber — append at
     // the end.
@@ -67,6 +69,10 @@ public:
 
     bool connect(bool forceConnect = false);
     void disconnect();
+    // A READY slot whose BLE link dropped (sensor off, out of range,
+    // battery dead) is torn down and set IDLE so the host can connect
+    // it again. Returns true when it freed the slot.
+    bool releaseIfLinkLost();
     void setOpenDevice(const char *device_name) { _open_device = device_name; }
 
     void setSamplingRate(uint16_t period_ms);
@@ -257,4 +263,12 @@ private:
     // same slot. Per-slot rather than global so concurrent connects on
     // different slots don't serialise on each other's status reads.
     SemaphoreHandle_t _status_mutex = nullptr;
+
+    // Serialises teardown: disconnect() runs on the UART task, the
+    // button's loop task and bleWorker; releaseIfLinkLost() also runs
+    // on the loop task. Without it two of them could reset the onSample
+    // std::function and close the session at the same time.
+    SemaphoreHandle_t _lifecycle_mutex = nullptr;
+
+    void teardown();
 };
