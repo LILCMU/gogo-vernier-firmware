@@ -412,6 +412,25 @@ Host side (post-fix):
   T_DEV_LIST + per-slot frames. Avoids the host-vs-vernier slot
   race that lit up the wrong slot's CONNECTING animation.
 
+**`C_DEV_LIST` also re-sends the slot frames.** After the ACK and the
+`T_DEV_LIST` push, `cmdDevList` calls `resendReadySlotFrames()`:
+`T_DEVINFO` + `T_DEVSTATS` + `T_FIELDS` for every READY slot (same
+frames and order as `publishConnectResult`). Why: a host that restarts on
+its own (the co-MCU keeps running, host link state stays HEARD, so no
+boot handshake is repeated) learns "slot connected" from `T_DEV_LIST`
+but would not get the field list until the next 50-sample `T_FIELDS`
+re-emit (about 50 s at 1 s period; at 60 s period, about 50 min).
+The host sends `C_DEV_LIST` on every boot and when it recovers a
+silent slot, so no new command is needed. Event-driven `T_DEV_LIST`
+pushes (connect, disconnect, forget, link loss) do not carry the frames.
+Compatibility: all three are ordinary per-slot frames a host already
+accepts at any time, so an older host just re-stores the same values; a
+newer host with an older co-MCU simply keeps waiting for the periodic
+re-emit as before. Cost: about 530 B per READY slot with 11 fields
+(T_FIELDS ~395 B + T_DEVINFO ~75 B + T_DEVSTATS ~55 B) plus the ACK and
+the T_DEV_LIST: about 0.7 KB (~60 ms at 115200) for one slot, ~1.8 KB
+(~160 ms) for three.
+
 ---
 
 ## Cross-task discipline (FreeRTOS task hand-off)

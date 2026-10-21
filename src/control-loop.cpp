@@ -524,6 +524,24 @@ static void cmdForget(JsonVariantConst root, uint32_t req)
     emitDevList();
 }
 
+// Re-send the per-slot frames (T_DEVINFO, T_DEVSTATS, T_FIELDS) of every
+// READY slot. Same frames and order as publishConnectResult's burst.
+static void resendReadySlotFrames()
+{
+    for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+    {
+        VernierAdapter &dev = slots[i];
+        if (!dev.isReady())
+            continue;
+        uart.sendDeviceInfo(dev.deviceName(), dev.orderCode(), dev.serialNumber(), i);
+        // H6: hold the per-slot status mutex across the multi-field read.
+        dev.lockStatus();
+        uart.sendDeviceStats(dev.batteryPercent(), dev.chargeState(), dev.rssi(), dev.droppedSamples(), i);
+        dev.unlockStatus();
+        sendDeviceFieldsFor(uart, dev, i);
+    }
+}
+
 static void cmdDevList(JsonVariantConst /*root*/, uint32_t req)
 {
     // D4: explicit host-side query for the slot table. Always ack'd
@@ -531,6 +549,13 @@ static void cmdDevList(JsonVariantConst /*root*/, uint32_t req)
     // the host's request → ack → push expectation.
     uart.sendAck(req, true, "dev list");
     emitDevList();
+    // A host asks for the list when it needs to rebuild its slot table
+    // (it just booted, or it dropped a silent slot). A host that
+    // restarted alone missed the connect burst and would otherwise wait
+    // for the next 50-sample T_FIELDS re-emit, so give it the per-slot
+    // frames behind the list. Only host-requested lists carry them; the
+    // event-driven pushes (connect, disconnect, forget) do not.
+    resendReadySlotFrames();
 }
 
 static void cmdHello(bool firstContact)
