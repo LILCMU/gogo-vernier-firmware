@@ -52,6 +52,13 @@ struct ConnectRequest {
 QueueHandle_t bleWorkQueue = nullptr;
 TaskHandle_t  bleWorkerTaskHandle = nullptr;
 
+// Held across emitDevList's snapshot and send. uartHandler, loop and
+// bleWorker all emit T_DEV_LIST; without it a snapshot taken before a
+// slot changed state could be sent after the newer one, and the host
+// would act on the stale table (e.g. free a slot that is READY).
+StaticSemaphore_t devListMutexBuf;
+SemaphoreHandle_t devListMutex = xSemaphoreCreateMutexStatic(&devListMutexBuf);
+
 // Who has seen the boot handshake (T_HELLO + T_STATUS). The host's
 // T_HELLO handler wipes its whole slot table, so the handshake must go
 // out before any per-slot frame and never between two connects.
@@ -299,6 +306,7 @@ void bleWorkerStart()
 // "this slot is producing samples".
 static void emitDevList()
 {
+    xSemaphoreTake(devListMutex, portMAX_DELAY);
     UartAdapter::DevListEntry entries[VERNIER_MAX_SLOTS];
     for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
     {
@@ -316,6 +324,7 @@ static void emitDevList()
         entries[i].state     = static_cast<uint8_t>(st);
     }
     uart.sendDevList(entries, VERNIER_MAX_SLOTS);
+    xSemaphoreGive(devListMutex);
 }
 
 void autoConnectDevice()
@@ -359,6 +368,18 @@ void autoConnectDevice()
                 log_i("auto-connect: queued slot %u (saved device)",
                       (unsigned)i);
             }
+        }
+    }
+}
+
+void releaseLostLinks()
+{
+    for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+    {
+        if (slots[i].releaseIfLinkLost())
+        {
+            log_w("slot %u: BLE link lost, slot freed", (unsigned)i);
+            emitDevList();
         }
     }
 }
@@ -558,6 +579,24 @@ static void cmdForget(JsonVariantConst root, uint32_t req)
     emitDevList();
 }
 
+// Re-send the per-slot frames (T_DEVINFO, T_DEVSTATS, T_FIELDS) of every
+// READY slot. Same frames and order as publishConnectResult's burst.
+static void resendReadySlotFrames()
+{
+    for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+    {
+        VernierAdapter &dev = slots[i];
+        if (!dev.isReady())
+            continue;
+        uart.sendDeviceInfo(dev.deviceName(), dev.orderCode(), dev.serialNumber(), i);
+        // H6: hold the per-slot status mutex across the multi-field read.
+        dev.lockStatus();
+        uart.sendDeviceStats(dev.batteryPercent(), dev.chargeState(), dev.rssi(), dev.droppedSamples(), i);
+        dev.unlockStatus();
+        sendDeviceFieldsFor(uart, dev, i);
+    }
+}
+
 static void cmdDevList(JsonVariantConst /*root*/, uint32_t req)
 {
     // D4: explicit host-side query for the slot table. Always ack'd
@@ -565,6 +604,22 @@ static void cmdDevList(JsonVariantConst /*root*/, uint32_t req)
     // the host's request → ack → push expectation.
     uart.sendAck(req, true, "dev list");
     emitDevList();
+    // A host asks for the list when it needs to rebuild its slot table
+    // (it just booted, or it dropped a silent slot). A host that
+    // restarted alone missed the connect burst and would otherwise wait
+    // for the next 50-sample T_FIELDS re-emit, so give it the per-slot
+    // frames behind the list. Only host-requested lists carry them; the
+    // event-driven pushes (connect, disconnect, forget) do not.
+    resendReadySlotFrames();
+}
+
+static void cmdHello(bool firstContact)
+{
+    // C_HELLO: a rebooted host asking who is on the link. No T_ACK: the
+    // T_HELLO is the answer. On first contact dispatchHostCommand has
+    // already sent it, so don't send it twice.
+    if (!firstContact)
+        uart.sendHello();
 }
 
 static void cmdCancelConnect(JsonVariantConst root, uint32_t req)
@@ -660,7 +715,8 @@ void dispatchHostCommand(JsonVariantConst root)
     // burst. On a co-MCU reboot the state resets and the next host
     // command re-announces.
     const HostLink prev = hostLink.exchange(HostLink::HEARD, std::memory_order_relaxed);
-    if (prev != HostLink::HEARD)
+    const bool firstContact = prev != HostLink::HEARD;
+    if (firstContact)
     {
         sendBootHandshake();
         if (prev == HostLink::ANNOUNCED)
@@ -683,6 +739,7 @@ void dispatchHostCommand(JsonVariantConst root)
     case UartAdapter::C_DEV_LIST:       cmdDevList(root, req);        break;
     case UartAdapter::C_SET_PERIOD:     cmdSetPeriod(root, req);      break;
     case UartAdapter::C_CANCEL_CONNECT: cmdCancelConnect(root, req);  break;
+    case UartAdapter::C_HELLO:          cmdHello(firstContact);       break;
     default:                        uart.sendAck(req, false, "unknown command"); break;
     }
 }

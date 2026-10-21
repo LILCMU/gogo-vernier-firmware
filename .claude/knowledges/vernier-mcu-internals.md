@@ -26,7 +26,7 @@ multiple GDX sensors over one UART link. Categories:
 | T_FIELDS   | yes | Per-slot enabled-channel name+unit list. Bumps host's `fields_version`. |
 | T_SENS_VALUES | yes | Per-slot sample frame. |
 | T_ACK      | (echoes seq + dev where applicable) | Replies to host commands. |
-| T_DEV_LIST | n/a | Carries an `entries[]` array of `{dev, name, order, connected}` for the full slot table. Auto-emitted on every connect/disconnect event per design D4. |
+| T_DEV_LIST | n/a | Carries an `entries[]` array of `{dev, name, order, connected}` for the full slot table. Auto-emitted on every connect/disconnect event per design D4. Emitted from uartHandler, loop and bleWorker; `emitDevList()` holds `devListMutex` (control-loop.cpp) across the slot-state snapshot and the send, so frames leave in snapshot order and the last T_DEV_LIST always carries the newest table. Before that a snapshot taken mid-connect could be sent after bleWorker's newer READY one, and a host that frees slots on `connected=false` would drop a live slot. |
 
 **Pitfall (host-side bug we hit):** the host dispatcher computed
 `dev_field = root["dev"] | 0` for *every* frame, then the T_STATUS
@@ -220,6 +220,65 @@ them races another task:
 allowed); `publishConnectResult`'s READY is the only success publish
 and it's gated by the CAS above.
 
+### Link loss frees the slot (READY → IDLE without a host command)
+
+Before this fix a sensor that dropped its BLE link (switched off, out
+of range, battery dead) left its slot READY until the co-MCU was
+power-cycled. `GoGoVernier::isConnected()` is the *session* flag (true
+until `close()`), and `NimBleXport`'s `onDisconnect` only cleared the
+transport's own flag, so nothing in the firmware noticed. The host's
+liveness watchdog flipped its card to idle after 5-30 s, but the next
+`C_CONNECT` for that slot was NACKed `"slot busy"` and a GoGo reboot's
+auto-connect failed the IDLE→REQUESTED CAS. Only the BOOT long-press or
+a power cycle recovered it.
+
+Now:
+- `lib/GoGoVernier` exposes `GoGoVernier::isLinkUp()`, a lock-free read
+  of the transport flag that `onDisconnect` clears
+  (`NimBleXport::Impl::connected`, now `std::atomic<bool>`).
+- `loop()` calls `releaseLostLinks()` (control-loop.cpp), which asks
+  every slot `VernierAdapter::releaseIfLinkLost()` on each pass. When the link is down it runs the same
+  teardown as `disconnect()` (clear `onSample`, `_gv.close()` to free
+  the NimBLE client, state IDLE), logs `slot N: BLE link lost, slot
+  freed`, and pushes T_DEV_LIST (`state=0`, `connected=false`).
+- Detection latency is the BLE supervision timeout. The GDX-ACC asks
+  for 5.00 s (interval 6/6, latency 0) right after connect and NimBLE
+  applies it, so the C3 learned of a switch-off 5.0 s later, after the
+  GoGo's own 5 s liveness timer had reset the slot (measured
+  2026-10-20: T_DEV_LIST arrived ~150 ms late).
+  `NimBleXport` now connects with 7.5 ms / latency 0 / 2.0 s
+  (`SUPERVISION_TIMEOUT_MAX_UNITS = 200`, 10 ms units) and rejects any
+  peer request above that cap. The supervision timer starts at the last
+  link-layer packet, i.e. when the sensor goes silent, so the loss is
+  expected about 2 s after that: up to period + 2 s after the last
+  sample, and only when no other slot is connecting (a connect holds
+  `g_ble_mutex` for 5-9 s). Expected value, not yet measured with the
+  cap on a real switch-off. Fallback if a peer drops the link on
+  rejection: accept, then `updateConnParams()` after the handshake.
+- `disconnect()` and `releaseIfLinkLost()` share
+  `VernierAdapter::_lifecycle_mutex`. Teardown runs on three tasks
+  (UART, loop, bleWorker), and two concurrent teardowns would reset the
+  same `std::function` at once.
+- Why `loop()` and not `vernierHandler`: `_gv.close()` waits on the
+  lib-wide `g_ble_mutex`, which `NimBleXport::connect()` holds for a
+  whole scan + connect (about 5 to 9 s). Run on vernierHandler, one
+  dropped sensor during another slot's connect would stall samples for
+  every healthy slot past the GoGo's 5 s liveness timeout, and the host
+  would reset them too. vernierHandler only skips slots that are no
+  longer READY, and `startReading()` returns at once on a slot whose
+  link is down: `_gv.start()` would otherwise block on the session
+  mutex that the teardown's `close()` holds and stall every slot. The loop task's button polling
+  waits instead, as it already does for a long-press disconnect.
+- The saved NVS name is kept. The slot is **not** retried on its own
+  (owner question Q-C4, default "free only"). It reconnects when the
+  host sends `C_CONNECT` for it, or on the next auto-connect pass (a
+  later `C_SET_PERIOD` re-arms `startAutoConnect`, or the next boot).
+- Host side (gogo-firmware `gogo-vernier.cpp`): T_DEV_LIST only
+  upgrades a slot to CONNECTED, never downgrades it, so the GoGo card
+  still waits for its liveness timeout before it shows the slot empty.
+  After that the kid's connect press works instead of hitting
+  `"slot busy"`.
+
 ### Bug #2 (since v2.0.0): T_HELLO per-connect is a host-reset storm
 
 T_HELLO is the GLOBAL boot handshake; the host's T_HELLO handler
@@ -340,6 +399,36 @@ Vernier MCU side:
    of a multi-slot reconnect kept its fields. The handshake moved to
    step 2 (once) to fix this.
 
+GoGo-only reboot: the GoGo comes back with an empty slot table while
+this firmware keeps running with the step-2 flag already set, so no
+T_HELLO arrives on its own. This does NOT trigger `C_HELLO`: the GoGo's
+co-MCU detector (gogo-firmware `CoProcDetector`) locks passively, at
+about 1159 ms on the board, on the T_ACK / T_DEV_LIST answers to
+setup()'s `C_SET_PERIOD` / `C_DEV_LIST`.
+
+`C_HELLO=7` goes out only when the GoGo's boot commands get no answer:
+the co-MCU booted late, was held in download mode, or its receiver lost
+frame sync. On the board it was sent at 4166 ms with the C3 held in
+download mode. `cmdHello` answers T_HELLO (only T_HELLO, no ACK, and not
+a second time when C_HELLO was itself the first contact). The GoGo then
+sends `C_DEV_LIST` as in the host-side note below. Before C_HELLO
+existed the GoGo got `T_ACK "unknown command"` for it, which its
+detector also treats as "Vernier present".
+
+The detector then sends an Arduino-lib request (`54 FE 20 02 DC DC`)
+and a Tasmota line (`\nStatus 10\n`) 300 ms apart, but only if no
+co-MCU answered yet. If this firmware is slow to answer and those bytes
+arrive, `FramedMsgPackReceiver` drops the half-read "frame" after
+`kFrameGapResetMs` (100 ms) of line silence instead of skipping
+`0x54FE` = 21758 bytes. Host-side check (throwaway shim harness,
+2026-10-13): before the resync, a C_DEV_LIST sent 300 ms after the
+Arduino or Tasmota probe was never dispatched; after it, it was; a
+whole frame already buffered when the task stalls 1 s still parses.
+Board result: the resync case confirmed on the board was a Logo
+`tasmotasendcommand` writing `Status 10\r\n`. It recovered because the
+quiet gap before setup()'s commands (the GoGo reboot) exceeded
+`kFrameGapResetMs` (100 ms).
+
 Host side (post-fix):
 - The auto-detect-co-MCU path on the host **no longer** issues an
   unsolicited `C_CONNECT` (it used to). Instead it sends
@@ -348,6 +437,25 @@ Host side (post-fix):
   pairing per-slot, and the host learns about it via the resulting
   T_DEV_LIST + per-slot frames. Avoids the host-vs-vernier slot
   race that lit up the wrong slot's CONNECTING animation.
+
+**`C_DEV_LIST` also re-sends the slot frames.** After the ACK and the
+`T_DEV_LIST` push, `cmdDevList` calls `resendReadySlotFrames()`:
+`T_DEVINFO` + `T_DEVSTATS` + `T_FIELDS` for every READY slot (same
+frames and order as `publishConnectResult`). Why: a host that restarts on
+its own (the co-MCU keeps running, host link state stays HEARD, so no
+boot handshake is repeated) learns "slot connected" from `T_DEV_LIST`
+but would not get the field list until the next 50-sample `T_FIELDS`
+re-emit (about 50 s at 1 s period; at 60 s period, about 50 min).
+The host sends `C_DEV_LIST` on every boot and when it recovers a
+silent slot, so no new command is needed. Event-driven `T_DEV_LIST`
+pushes (connect, disconnect, forget, link loss) do not carry the frames.
+Compatibility: all three are ordinary per-slot frames a host already
+accepts at any time, so an older host just re-stores the same values; a
+newer host with an older co-MCU simply keeps waiting for the periodic
+re-emit as before. Cost: about 530 B per READY slot with 11 fields
+(T_FIELDS ~395 B + T_DEVINFO ~75 B + T_DEVSTATS ~55 B) plus the ACK and
+the T_DEV_LIST: about 0.7 KB (~60 ms at 115200) for one slot, ~1.8 KB
+(~160 ms) for three.
 
 ---
 
@@ -470,7 +578,7 @@ When adding a new wire frame:
   - `.claude/knowledges/d2pio-debug-findings.md` — protocol-level
     debugging session notes (preserved as-is, captures pre-Phase-4
     findings).
-- Submodule: `lib/GoGoVernier@main` (pinned at v1.0.0) carries the GDX driver
-  including `refreshStatus()` battery support.
+- Submodule: `lib/GoGoVernier` (v1.0.0 plus the `isLinkUp()` and supervision-timeout-cap commits)
+  carries the GDX driver including `refreshStatus()` battery support.
 - Host-side display patterns:
   `gogo-firmware/.claude/knowledges/vernier-display-patterns.md`.

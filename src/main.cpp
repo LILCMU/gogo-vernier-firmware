@@ -408,6 +408,8 @@ void loop()
 {
     autoConnectDevice();
 
+    releaseLostLinks();
+
     buttonHandler();
 
 #if CHECK_LOGGING_FLAG(ENABLE_LOGGING_DEBUG)

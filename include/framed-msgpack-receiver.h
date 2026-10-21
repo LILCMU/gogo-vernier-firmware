@@ -13,6 +13,9 @@ public:
     // readBytes() without inflating the per-call stack frame — UART0
     // RX FIFO is 128 B on ESP32-C3, half that is plenty per pump tick.
     static constexpr size_t kSkipScratchSize = 64;
+    // Line quiet time that closes a half-received frame (see processStep).
+    // Must stay below the GoGo detector's COPROC_ACTIVE_PROBE_STEP_MS (300).
+    static constexpr uint32_t kFrameGapResetMs = 100;
 
     FramedMsgPackReceiver(Stream &in, uint8_t *buffer, size_t bufferSize)
         : _in(in), _buf(buffer), _bufSize(bufferSize)
@@ -75,9 +78,38 @@ private:
         _len = 0;
         _pos = 0;
         _skip = 0;
+        _midFrameIdle = false;
     }
     bool processStep()
     {
+        // The host writes each frame in one burst, so a frame still open
+        // after the line went quiet for kFrameGapResetMs was started by
+        // stray bytes: line noise, or another co-MCU firmware's probe
+        // from the GoGo detector. Without this resync a bogus length such
+        // as 0x54FE (an Arduino-lib frame header) would skip ~21 KB of
+        // real commands. The gap is measured from when this receiver
+        // first saw an empty FIFO mid-frame, so a stalled task with the
+        // rest of the frame already buffered does not trigger it.
+        if (_state != READ_LEN0)
+        {
+            if (_in.available() < 1)
+            {
+                if (!_midFrameIdle)
+                {
+                    _midFrameIdle = true;
+                    _midFrameIdleSinceMs = millis();
+                }
+                return false;
+            }
+            if (_midFrameIdle && millis() - _midFrameIdleSinceMs > kFrameGapResetMs)
+            {
+                log_w("FramedMsgPackReceiver: line quiet mid-frame (state=%u len=%u), resyncing",
+                      (unsigned)_state, (unsigned)_len);
+                reset();
+            }
+            _midFrameIdle = false;
+        }
+
         switch (_state)
         {
         case READ_LEN0:
@@ -177,6 +209,8 @@ private:
     size_t _pos = 0;
     size_t _skip = 0;
     bool _frameComplete = false;
+    bool _midFrameIdle = false;
+    uint32_t _midFrameIdleSinceMs = 0;
 
     JsonDocument _doc;
     OnMsgPackMessage _cb = nullptr;
