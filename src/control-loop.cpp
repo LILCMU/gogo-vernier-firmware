@@ -584,17 +584,8 @@ static void cmdForget(JsonVariantConst root, uint32_t req)
 static void resendReadySlotFrames()
 {
     for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
-    {
-        VernierAdapter &dev = slots[i];
-        if (!dev.isReady())
-            continue;
-        uart.sendDeviceInfo(dev.deviceName(), dev.orderCode(), dev.serialNumber(), i);
-        // H6: hold the per-slot status mutex across the multi-field read.
-        dev.lockStatus();
-        uart.sendDeviceStats(dev.batteryPercent(), dev.chargeState(), dev.rssi(), dev.droppedSamples(), i);
-        dev.unlockStatus();
-        sendDeviceFieldsFor(uart, dev, i);
-    }
+        if (slots[i].isReady())
+            sendSlotFrames(i);
 }
 
 static void cmdDevList(JsonVariantConst /*root*/, uint32_t req)
@@ -713,23 +704,23 @@ void dispatchHostCommand(JsonVariantConst root)
     // that followed, so repeat it and re-send every connected slot
     // right behind it; the host's T_HELLO reset is undone in the same
     // burst. On a co-MCU reboot the state resets and the next host
-    // command re-announces.
+    // command re-announces (host + co-MCU normally share board power, so
+    // they reboot together; a GoGo-only reboot gets no new T_HELLO).
+    const uint8_t  c   = root["c"]   | 0;
+    const uint32_t req = root["seq"] | 0;
+
     const HostLink prev = hostLink.exchange(HostLink::HEARD, std::memory_order_relaxed);
     const bool firstContact = prev != HostLink::HEARD;
     if (firstContact)
     {
         sendBootHandshake();
-        if (prev == HostLink::ANNOUNCED)
+        // C_DEV_LIST answers with the list and the slot frames itself.
+        if (prev == HostLink::ANNOUNCED && c != UartAdapter::C_DEV_LIST)
         {
-            for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
-                if (slots[i].isReady())
-                    sendSlotFrames(i);
+            resendReadySlotFrames();
             emitDevList();
         }
     }
-
-    const uint8_t  c   = root["c"]   | 0;
-    const uint32_t req = root["seq"] | 0;
 
     switch (c)
     {

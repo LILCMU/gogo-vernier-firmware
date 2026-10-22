@@ -379,7 +379,9 @@ Vernier MCU side:
    never sees a per-slot frame before T_HELLO). `ANNOUNCED` → `HEARD`
    on the first host command afterwards repeats the handshake and
    re-sends T_DEVINFO / T_DEVSTATS / T_FIELDS for every READY slot plus
-   T_DEV_LIST: the host may have booted after the announce (it would
+   T_DEV_LIST (the whole burst is skipped when that first command is
+   `C_DEV_LIST`, whose handler sends the same list and frames): the
+   host may have booted after the announce (it would
    otherwise wait up to 50 samples for the T_FIELDS re-emit), and if it
    was listening its T_HELLO reset is undone in the same burst.
    The hostless path streams at `VERNIER_DEFAULT_PERIOD_MS` (1 s) per
@@ -400,7 +402,7 @@ Vernier MCU side:
    step 2 (once) to fix this.
 
 GoGo-only reboot: the GoGo comes back with an empty slot table while
-this firmware keeps running with the step-2 flag already set, so no
+this firmware keeps running with its host link already HEARD, so no
 T_HELLO arrives on its own. This does NOT trigger `C_HELLO`: the GoGo's
 co-MCU detector (gogo-firmware `CoProcDetector`) locks passively, at
 about 1159 ms on the board, on the T_ACK / T_DEV_LIST answers to
