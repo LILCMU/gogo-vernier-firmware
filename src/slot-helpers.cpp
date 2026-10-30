@@ -16,11 +16,18 @@ NvsScope::~NvsScope()
 
 int8_t firstFreeSlot()
 {
+    // Prefer an IDLE slot that is not waiting for its lost sensor, so a
+    // new pairing does not take the slot of a sensor that may come back;
+    // fall back to a waiting one when every other slot is busy.
+    int8_t waiting = -1;
     for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
     {
-        if (!isSlotOccupied(i)) return static_cast<int8_t>(i);
+        if (isSlotOccupied(i)) continue;
+        if (slots[i].reconnectState() == VernierAdapter::ReconnectState::OFF)
+            return static_cast<int8_t>(i);
+        if (waiting < 0) waiting = static_cast<int8_t>(i);
     }
-    return -1;
+    return waiting;
 }
 
 void sendDeviceFieldsFor(UartAdapter &uart, VernierAdapter &dev, uint8_t slot)

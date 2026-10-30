@@ -54,16 +54,23 @@ first-free. Wire layout:
 {c: C_CONNECT(1), seq: u32, dev?: u8}
 ```
 
-Vernier-side handler at `src/main.cpp` C_CONNECT case:
+Vernier-side handler: `cmdConnect` in `src/control-loop.cpp`, which
+allocates the slot and hands it to `requestUserConnect()`:
 
 1. If `dev` present:
    - validate `dev < VERNIER_MAX_SLOTS` else NACK `"dev out of range"`.
-   - validate `slots[dev].isReady() == false && isStreaming() == false`
-     else NACK `"slot busy"`.
    - target_slot = dev.
 2. Else (host omitted `dev` — auto-detect path / legacy / button
-   shortcut): walk slots 0..N for first non-ready/non-streaming;
-   NACK `"all slots full"` if none free. Per design D2.
+   shortcut): `firstFreeSlot()`, the lowest IDLE slot, preferring one
+   that is not waiting for a lost sensor (v2.3.0); NACK
+   `"all slots full"` if none free. Per design D2.
+3. `requestUserConnect()`: claim the slot's background reconnect if it
+   has one (ARMED → ADOPTED), then queue a proximity connect
+   (`force=true`) → ACK `"queued"`. If the slot is busy: ACK ok
+   `"reconnecting"` when it was a background attempt for the saved
+   sensor (that attempt now answers the host, see "Background
+   reconnect after a link loss"), else NACK `"slot busy"` (READY, or
+   connecting for another producer).
 
 **Presence check.** ArduinoJson 7's `is<uint8_t>()` rejects values
 the MsgPack codec encoded as a narrower int width (e.g. positive
@@ -72,9 +79,10 @@ read as `int` with an explicit range guard. Earlier logic with
 `is<uint8_t>()` silently fell through to the first-free branch and
 paired the wrong slot.
 
-**Logging.** `log_i("C_CONNECT: target slot=%u (%s)", target_slot,
-hasDev ? "host-specified" : "first-free")` so the wire behaviour
-is visible during smoke tests.
+**Logging** (debug builds): `C_CONNECT: slot N queued (host-specified
+| first-free)`, `C_CONNECT: slot N takes over its reconnect attempt`,
+`C_CONNECT NACK: slot N busy`, so the wire behaviour is visible during
+smoke tests.
 
 ---
 
@@ -91,6 +99,12 @@ Used by the host's "Forget" action in Vernier > Settings sub-page.
 **Shortcut:** if the slot has no persistent state (already
 disconnected and no saved device), C_FORGET ACKs immediately
 without touching BLE — avoids a no-op handshake teardown.
+
+**Background reconnect (v2.3.0):** C_FORGET and C_DISCONNECT set the
+slot's `ReconnectState` to OFF before the teardown, so a sensor whose
+link had dropped is not brought back in the background. C_DISCONNECT
+keeps the NVS name (the next boot still auto-connects it); C_FORGET
+clears it.
 
 **Symmetry note:** the host clears its own companion per-slot
 NVS keys (`vernierPrFld{slot}`, `vernierPrd{slot}`) separately —
@@ -269,15 +283,99 @@ Now:
   link is down: `_gv.start()` would otherwise block on the session
   mutex that the teardown's `close()` holds and stall every slot. The loop task's button polling
   waits instead, as it already does for a long-press disconnect.
-- The saved NVS name is kept. The slot is **not** retried on its own
-  (owner question Q-C4, default "free only"). It reconnects when the
-  host sends `C_CONNECT` for it, or on the next auto-connect pass (a
-  later `C_SET_PERIOD` re-arms `startAutoConnect`, or the next boot).
-- Host side (gogo-firmware `gogo-vernier.cpp`): T_DEV_LIST only
-  upgrades a slot to CONNECTED, never downgrades it, so the GoGo card
-  still waits for its liveness timeout before it shows the slot empty.
-  After that the kid's connect press works instead of hitting
-  `"slot busy"`.
+- The saved NVS name is kept, and since v2.3.0 the slot is retried in
+  the background (next section). Up to v2.2.0 it was not (owner
+  question Q-C4, default "free only"): it came back only on a host
+  `C_CONNECT`, the next auto-connect pass, or the next boot. The owner
+  changed that decision on 2026-10-30.
+- Host side (gogo-firmware `gogo-vernier.cpp`): T_DEV_LIST
+  `connected=false` on a CONNECTED slot resets it to IDLE at once (log
+  `Vernier slot N reported disconnected by T_DEV_LIST`), 58-70 ms after
+  the C3's `slot N: BLE link lost` on board B (2026-10-30). The host
+  never downgrades a CONNECTING slot through T_DEV_LIST and ignores the
+  `state` key.
+
+### Background reconnect after a link loss (v2.3.0)
+
+A sensor the user connected, and did not disconnect or forget, comes
+back on its own after it was switched off or left range. Before v2.3.0
+it stayed free until someone pressed Connect (board B, 2026-10-30: no
+rescan for over a minute; Connect paired it in ~7 s).
+
+**Policy.** Per-slot `VernierAdapter::ReconnectState` (not on the
+wire), written from several tasks, so a relaxed `std::atomic`:
+
+| State | Host sees (T_DEV_LIST) | Entered by | Left by |
+|---|---|---|---|
+| OFF | the real `ConnState` | boot; a successful connect; C_DISCONNECT, C_FORGET, BOOT long-press | link loss of a READY slot with a saved name → ARMED |
+| ARMED | `connected=false`, `state=0`, `name=""`, even while an attempt has the slot REQUESTED / CONNECTING | `releaseLostLinks()`; a failed or cancelled ADOPTED connect | the sensor is READY → OFF; a user connect → ADOPTED; C_DISCONNECT / C_FORGET / long-press → OFF |
+| ADOPTED | the real `ConnState` | a host C_CONNECT or BOOT short-press on an ARMED slot (`tryAdoptReconnect`, CAS ARMED → ADOPTED) | success → OFF; failure or C_CANCEL_CONNECT → ARMED (`tryRearmAdoptedReconnect`); C_DISCONNECT / C_FORGET / long-press → OFF |
+
+**Retry schedule** (`reconnectLostSensors()`, loop task; per-slot
+`ReconnectSchedule` is loop-only):
+- First rescan `RECONNECT_FIRST_RETRY_MS` (1 s) after the loss, then
+  the gap after each failed rescan grows ×`RECONNECT_BACKOFF_FACTOR`
+  (2) up to `RECONNECT_BACKOFF_MAX_MS` (30 s): gaps 1, 2, 4, 8, 16, 30,
+  30 ... s, measured from the end of the previous attempt. No give-up:
+  it retries until the sensor returns, the user disconnects or forgets
+  it, or the C3 resets (then boot auto-connect tries the NVS name once).
+- An attempt is an ordinary `connect(false)` on bleWorker: one
+  `GoGoVernier::open(<saved name>)`, a scan of up to `OPEN_SCAN_MS`
+  (5 s) that stops at the first advert of the name, then the
+  handshake. The target is `VernierAdapter::_open_device`, which
+  `publishConnectResult` now sets to the device name after every
+  successful connect; before v2.3.0 it was only set from NVS at boot,
+  so after a proximity Connect a `connect(false)` would have scanned
+  for "proximity" and taken the nearest GDX.
+- One attempt at a time, queued only while no slot is REQUESTED or
+  CONNECTING. A host or boot connect therefore waits behind at most
+  the one attempt already running. Samples of the other slots keep
+  flowing: `NimBleXport::write()` takes no lock; only connect,
+  disconnect and unsubscribe take `g_ble_mutex`, so a C_DISCONNECT /
+  C_FORGET of another slot during a scan blocks the UART task for up
+  to ~5 s, as it already did during any connect.
+- Radio cost while a sensor stays away: 5 s of scanning per 35 s
+  (~14 %) once the gap is capped.
+
+**Wire.** No new command or frame; protocol 2 unchanged. While ARMED,
+the attempt pushes nothing: bleWorker skips its "connecting" T_DEV_LIST
+and `publishConnectResult` skips the push after a failed attempt, so a
+sensor that stays away costs no UART traffic. On success the normal
+connect burst goes out: T_DEVINFO, T_DEVSTATS, T_FIELDS, then
+T_DEV_LIST `connected=true`, which the host takes as CONNECTED (same
+frames as the boot auto-connect, item (d) of the 2026-10-30 bench).
+A host that renders `state` would need a new value to show
+"reconnecting"; none does, so the slot stays plain disconnected.
+
+**C_CONNECT meanwhile** (`requestUserConnect`): ARMED → ADOPTED, then
+- between two attempts (slot IDLE): a normal proximity connect, ACK
+  `"queued"`;
+- during an attempt (slot REQUESTED / CONNECTING for the saved name):
+  ACK ok `"reconnecting"` + T_DEV_LIST with the real state; the
+  attempt answers the host. If it fails, the slot goes back to ARMED
+  and the host's own 12 s connect timeout returns its card to idle.
+  The host gets the push either way; it ignores `connected=false` for a
+  CONNECTING slot.
+
+**Races closed.**
+- Disconnect/forget vs. a queued attempt: OFF is stored before the
+  teardown; bleWorker drops a `background` request whose slot is OFF
+  after its REQUESTED → CONNECTING claim. A disconnect that lands later
+  stores IDLE and the CONNECTING → READY CAS abandons the connect.
+- User connect vs. an attempt that just failed: the worker sets IDLE
+  then tries ADOPTED → ARMED; `requestUserConnect` tries ARMED →
+  ADOPTED then enqueues. Every interleaving ends either with a queued
+  proximity connect (the slot was IDLE) or with the user's ADOPTED
+  attempt resolving and pushing T_DEV_LIST.
+- `firstFreeSlot()` picks an ARMED slot only when no other slot is
+  free, so a first-free connect does not take a waiting sensor's slot.
+
+**Not covered.** A saved sensor that is off when the C3 boots is tried
+once by the boot auto-connect and not armed (only a READY slot's link
+loss arms). A later `C_SET_PERIOD` still re-arms `startAutoConnect`
+and so also reconnects a slot that was C_DISCONNECTed (existing
+behaviour; the host UI has no Disconnect, only Forget, which clears
+the NVS name).
 
 ### Bug #2 (since v2.0.0): T_HELLO per-connect is a host-reset storm
 

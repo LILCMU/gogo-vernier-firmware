@@ -20,6 +20,28 @@ constexpr uint32_t BUTTON_LONG_PRESS_MS         = 2000;
 // or reset on its own.
 constexpr uint32_t AUTO_CONNECT_HOSTLESS_DELAY_MS = 5000;
 
+// ---- Background reconnect after a BLE link loss (v2.3.0) --------------
+// reconnectLostSensors() rescans for an ARMED slot's saved name, one
+// attempt at a time and only while bleWorker has nothing else to do.
+// Each attempt is one GoGoVernier::open(): a scan of up to OPEN_SCAN_MS
+// (5 s, lib/GoGoVernier) that stops as soon as the saved name
+// advertises, then the ~2-7 s handshake.
+//
+// Delay (ms) from the link loss to the first rescan. Short, because a
+// sensor that blipped out of range is often back at once; 1 s lets
+// NimBLE finish deleting the dead client first.
+constexpr uint32_t RECONNECT_FIRST_RETRY_MS = 1000;
+// Growth factor of the gap after each failed rescan: 1, 2, 4, 8, 16 s,
+// then the cap.
+constexpr uint32_t RECONNECT_BACKOFF_FACTOR = 2;
+// Cap (ms) on the gap between two rescans. With the 5 s scan the radio
+// then scans 5 of every 35 s (~14 %) while a sensor stays away, which
+// bounds the power cost and how often a scan holds the lib-wide BLE
+// mutex that other slots' connects and disconnects wait on. A sensor
+// that returns after a long absence is found within 30 s + scan.
+// Matches the host's own silent-slot backoff cap (30 s).
+constexpr uint32_t RECONNECT_BACKOFF_MAX_MS = 30000;
+
 enum ButtonEvent {
     BUTTON_RELEASE,
     BUTTON_PRESS,

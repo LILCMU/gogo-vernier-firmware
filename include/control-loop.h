@@ -21,10 +21,17 @@ void dispatchHostCommand(JsonVariantConst root);
 void autoConnectDevice();
 
 // Tear down every READY slot whose BLE link dropped and push
-// T_DEV_LIST. Runs on the loop task: teardown can wait seconds on the
-// lib-wide BLE mutex while another slot connects, and vernierHandler
-// must keep forwarding samples for the healthy slots meanwhile.
+// T_DEV_LIST. A slot with a saved sensor is armed for the background
+// reconnect (ReconnectState ARMED) before the push. Runs on the loop
+// task: teardown can wait seconds on the lib-wide BLE mutex while
+// another slot connects, and vernierHandler must keep forwarding
+// samples for the healthy slots meanwhile.
 void releaseLostLinks();
+
+// Queue a rescan for the saved name of an ARMED slot when its backoff
+// gap (RECONNECT_* in main.h) has passed, one attempt at a time and only
+// while bleWorker is idle. Called from loop() after releaseLostLinks().
+void reconnectLostSensors();
 
 // Poll the BOOT button and dispatch press / long-press semantics.
 // Short press → connect first-free slot via proximity scan.

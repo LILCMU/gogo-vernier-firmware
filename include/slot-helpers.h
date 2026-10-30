@@ -55,8 +55,10 @@ inline bool slotInRange(int slot)
     return slot >= 0 && slot < VERNIER_MAX_SLOTS;
 }
 
-// Lowest-index free slot, or -1 if every slot is busy. Used by
-// C_CONNECT's first-free fallback and the BOOT button short-press.
+// Lowest-index free slot, or -1 if every slot is busy. A free slot
+// that waits for its lost sensor (ReconnectState ARMED) is picked only
+// when no other slot is free. Used by C_CONNECT's first-free fallback
+// and the BOOT button short-press.
 int8_t firstFreeSlot();
 
 // Build the names[]/units[] arrays from `dev`'s enabled-channel mask

@@ -38,8 +38,8 @@ public:
     // machine wired in across G004 (this enum + atomic _conn_state)
     // → G006 (bleWorker scaffolding + CAS helpers) → G007 (cutover
     // + ordering fix in da5e19c). Producer set:
-    //   - cmdConnect / button / autoConnect → enqueueConnect(),
-    //     which setState(REQUESTED).
+    //   - cmdConnect / button / autoConnect / reconnectLostSensors
+    //     → enqueueConnect(), which setState(REQUESTED).
     //   - bleWorker dequeue → tryAcquireConnecting() (CAS
     //     REQUESTED → CONNECTING). Cancel-race-safe.
     //   - publishConnectResult tail → setState(READY) on success,
@@ -64,6 +64,28 @@ public:
         READY      = 3,
     };
 
+    // Background reconnect of a slot whose sensor left (v2.3.0). Not on
+    // the wire: T_DEV_LIST shows an ARMED slot that is not READY as
+    // IDLE / connected=false, whatever its ConnState, so the host keeps
+    // the slot disconnected until the sensor is back.
+    //   OFF     no background reconnect. Boot state; set by a successful
+    //           connect and by C_DISCONNECT, C_FORGET and the BOOT
+    //           long-press, which must not bring the sensor back.
+    //   ARMED   the link of a READY slot with a saved name dropped
+    //           (releaseLostLinks); reconnectLostSensors() rescans for
+    //           the saved name with a backoff.
+    //   ADOPTED a user connect (C_CONNECT or BOOT short-press) landed
+    //           on an ARMED slot: the slot's real state shows on the
+    //           wire. Success → OFF; failure or C_CANCEL_CONNECT →
+    //           ARMED again, because the user neither disconnected nor
+    //           forgot the sensor.
+    enum class ReconnectState : uint8_t
+    {
+        OFF,
+        ARMED,
+        ADOPTED,
+    };
+
     VernierAdapter();
     ~VernierAdapter();
 
@@ -73,6 +95,9 @@ public:
     // battery dead) is torn down and set IDLE so the host can connect
     // it again. Returns true when it freed the slot.
     bool releaseIfLinkLost();
+    // Target of a connect(false). Written by setup() (the NVS name) and by
+    // publishConnectResult on the bleWorker task after every successful
+    // connect, read by connect() on the same task, so a String is safe.
     void setOpenDevice(const char *device_name) { _open_device = device_name; }
 
     void setSamplingRate(uint16_t period_ms);
@@ -140,6 +165,30 @@ public:
         ConnState expected = ConnState::CONNECTING;
         return _conn_state.compare_exchange_strong(
             expected, ConnState::READY, std::memory_order_relaxed);
+    }
+
+    // Background-reconnect accessors. Relaxed for the same reason as
+    // _conn_state: each transition is an independent scalar publish.
+    // Writers: releaseLostLinks (ARMED), the user-connect paths
+    // (ARMED → ADOPTED), publishConnectResult (OFF on success,
+    // ADOPTED → ARMED on failure), cmdCancelConnect (ADOPTED → ARMED),
+    // cmdDisconnect / cmdForget / the BOOT long-press (OFF).
+    ReconnectState reconnectState() const { return _reconnect.load(std::memory_order_relaxed); }
+    void setReconnectState(ReconnectState s) { _reconnect.store(s, std::memory_order_relaxed); }
+    // CAS ARMED → ADOPTED for a user connect. Fails on OFF / ADOPTED.
+    bool tryAdoptReconnect()
+    {
+        ReconnectState expected = ReconnectState::ARMED;
+        return _reconnect.compare_exchange_strong(
+            expected, ReconnectState::ADOPTED, std::memory_order_relaxed);
+    }
+    // CAS ADOPTED → ARMED when the user's connect failed or was
+    // cancelled. Fails if a C_DISCONNECT / C_FORGET set OFF meanwhile.
+    bool tryRearmAdoptedReconnect()
+    {
+        ReconnectState expected = ReconnectState::ADOPTED;
+        return _reconnect.compare_exchange_strong(
+            expected, ReconnectState::ARMED, std::memory_order_relaxed);
     }
 
     // CAS IDLE → REQUESTED for the producer enqueue path
@@ -247,13 +296,15 @@ private:
     // compound ++. Same single-core RV32 free-load characteristics.
     std::atomic<uint32_t> _push_dropped{0};
 
-    // Cross-task connection lifecycle. Writer set will be cmdConnect /
-    // bleWorker / disconnect() once the bleWorker cutover (G006/G007)
-    // lands. Reader set will be the host-protocol layer that emits
-    // T_DEV_LIST entries (G008) and any cancel / busy guards in
-    // cmdConnect. memory_order_relaxed because transitions don't carry
-    // ordering w.r.t. other adapter state.
+    // Cross-task connection lifecycle. Writers: enqueueConnect
+    // (REQUESTED), bleWorker (CONNECTING / READY / IDLE),
+    // cmdCancelConnect and teardown() (IDLE). Readers: emitDevList,
+    // vernierHandler, the busy guards. memory_order_relaxed because
+    // transitions don't carry ordering w.r.t. other adapter state.
     std::atomic<ConnState> _conn_state{ConnState::IDLE};
+
+    // Background reconnect after a link loss; see ReconnectState.
+    std::atomic<ReconnectState> _reconnect{ReconnectState::OFF};
 
     // H6 per-slot status mutex. Created in ctor (process-lifetime),
     // taken inside getDeviceInfo() and by external callers via
