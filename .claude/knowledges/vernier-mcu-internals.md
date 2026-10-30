@@ -370,6 +370,31 @@ A host that renders `state` would need a new value to show
 - `firstFreeSlot()` picks an ARMED slot only when no other slot is
   free, so a first-free connect does not take a waiting sensor's slot.
 
+**Measured on board B (2026-10-30)**, GDX-ACC `0H4008J2` in slot 0
+(GoGo "Slot 1"), host = ir-share-v3 debug image:
+- Debug build, sensor off: `slot 0: BLE link lost, slot freed,
+  reconnecting in the background` at C3 356572 ms; the host logged
+  `reported disconnected by T_DEV_LIST` 15 ms later and showed No
+  sensor. Rescans started at +1.0, +8.0, +17.0, +30.0 s (device ms
+  357572, 364574, 373576, 386578), each `scan complete, no match`
+  after 5.0 s, then `next in 2000 / 4000 / 8000 / 16000 ms`. No
+  T_DEV_LIST was pushed for the failed attempts (the host's only
+  traffic was its own 10 s `C_DEV_LIST` probe).
+- Sensor on: the next rescan (407580 ms, after the 16 s gap) found
+  the peer 53 ms after it started; `streaming started` 1.79 s after
+  the scan start, ~4.5 s after the coordinator relayed "on". The GoGo
+  went back from the No sensor panel to the Slot 1 page with no key
+  press (owner, by eye, ~15 s after on).
+- Forget with the sensor on: `forgotten`, then no scan in 70 s.
+- Release build: Connect pressed 12 s into the absence got
+  `ok=1 msg=reconnecting` (TOOK_OVER); the attempt failed, the host's
+  12 s connect timeout reset its card, the slot was re-armed, and when
+  the sensor came back it reconnected with no key press (host probe
+  stopped, Press opened the slot page instead of sending C_CONNECT).
+- Not exercised on hardware: C_DISCONNECT (no host UI sends it), the
+  BOOT long-press, two sensors at once, the QUEUED branch of a
+  Connect between two rescans.
+
 **Not covered.** A saved sensor that is off when the C3 boots is tried
 once by the boot auto-connect and not armed (only a READY slot's link
 loss arms). A later `C_SET_PERIOD` still re-arms `startAutoConnect`
