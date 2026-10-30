@@ -23,24 +23,43 @@ constexpr uint32_t AUTO_CONNECT_HOSTLESS_DELAY_MS = 5000;
 // ---- Background reconnect after a BLE link loss (v2.3.0) --------------
 // reconnectLostSensors() rescans for an ARMED slot's saved name, one
 // attempt at a time and only while bleWorker has nothing else to do.
-// Each attempt is one GoGoVernier::open(): a scan of up to OPEN_SCAN_MS
-// (5 s, lib/GoGoVernier) that stops as soon as the saved name
-// advertises, then the ~2-7 s handshake.
+// A slot is ARMED when the link of its connected sensor drops, or when
+// the boot auto-connect of its saved sensor fails. Each attempt is one
+// GoGoVernier::open(): a scan of up to OPEN_SCAN_MS (5 s,
+// lib/GoGoVernier) that stops as soon as the saved name advertises,
+// then the ~2-7 s handshake.
 //
-// Delay (ms) from the link loss to the first rescan. Short, because a
+// Delay (ms) from the arming to the first rescan. Short, because a
 // sensor that blipped out of range is often back at once; 1 s lets
 // NimBLE finish deleting the dead client first.
 constexpr uint32_t RECONNECT_FIRST_RETRY_MS = 1000;
 // Growth factor of the gap after each failed rescan: 1, 2, 4, 8, 16 s,
 // then the cap.
 constexpr uint32_t RECONNECT_BACKOFF_FACTOR = 2;
-// Cap (ms) on the gap between two rescans. With the 5 s scan the radio
-// then scans 5 of every 35 s (~14 %) while a sensor stays away, which
-// bounds the power cost and how often a scan holds the lib-wide BLE
-// mutex that other slots' connects and disconnects wait on. A sensor
-// that returns after a long absence is found within 30 s + scan.
-// Matches the host's own silent-slot backoff cap (30 s).
+// Cap (ms) on the gap between two rescans. With the 5 s scan, each
+// armed slot then scans 5 of every 35 s (~14 %). Attempts run one at a
+// time, so the radio cost adds up per armed slot: ~29 % with two,
+// ~43 % with three, and close to continuous in the first minute after
+// several sensors go away at once (gaps of 1-16 s). It also bounds how
+// often a scan holds the lib-wide BLE mutex that other slots' connects
+// and disconnects wait on. A sensor that returns after a long absence
+// is found within 30 s + scan. Matches the host's own silent-slot
+// backoff cap (30 s).
 constexpr uint32_t RECONNECT_BACKOFF_MAX_MS = 30000;
+// Time (ms) from the arming (the link loss, or the failed boot connect)
+// after which an ARMED slot stops looking for its sensor: ARMED → OFF,
+// logged, nothing sent to the host (it already shows the slot
+// disconnected). The NVS name stays, so a Connect press, the next boot
+// or the host's next C_SET_PERIOD pass still connect it the normal way.
+// Owner decision (2026-10-30): 10 min. That is about 20 attempts, and
+// bounds the cost of a sensor that never comes back: the radio cost
+// above (roughly +12 mA average per armed slot, an estimate from the
+// C3's receive current, not measured), the lack of any host control to
+// stop it for a slot already shown disconnected (the host's Forget is
+// on a connected slot only), and the board grabbing its old sensor
+// whenever it advertises nearby, even while another board pairs it.
+// 0 would mean never give up.
+constexpr uint32_t RECONNECT_GIVE_UP_MS = 600000;
 
 enum ButtonEvent {
     BUTTON_RELEASE,

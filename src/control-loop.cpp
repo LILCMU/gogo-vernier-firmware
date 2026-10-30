@@ -33,7 +33,8 @@ namespace {
 // this TU; the only caller is cmdSetPeriod.
 constexpr uint32_t MAX_PERIOD_MS   = 0xFFFFu;
 
-// Sentinel for connectAndReport's "no host request to ack" case.
+// Sentinel req_seq for a ConnectRequest with no host request behind it
+// (boot auto-connect, BOOT button, background reconnect).
 constexpr uint32_t NO_HOST_REQUEST = 0xFFFFFFFFu;
 
 // Button polling state. Function-local before the move; kept here so
@@ -41,20 +42,40 @@ constexpr uint32_t NO_HOST_REQUEST = 0xFFFFFFFFu;
 unsigned long startPressTime  = 0;
 ButtonEvent   prevButtonEvent = BUTTON_RELEASE;
 
+// Who queued a ConnectRequest; decides what a failure does.
+//   USER       host C_CONNECT, BOOT short-press, and auto-connect passes
+//              after the first (the host re-sending C_SET_PERIOD). A
+//              failure never arms the background reconnect.
+//   BOOT       the first auto-connect pass after the co-MCU booted. A
+//              failure on a slot with a saved name arms the background
+//              reconnect: the sensor may just be switched on later.
+//   BACKGROUND reconnectLostSensors. Dropped by bleWorker if the slot
+//              was disarmed after it was queued.
+enum class ConnectOrigin : uint8_t
+{
+    USER,
+    BOOT,
+    BACKGROUND,
+};
+
 // ConnectRequest queued by enqueueConnect, drained by bleWorkerEntry.
-// Layout on RV32: u8 slot + bool force + bool background + 1 B pad +
+// Layout on RV32: u8 slot + bool force + u8 origin + 1 B pad +
 // u32 req_seq = 8 B.
 struct ConnectRequest {
-    uint8_t  slot;
-    bool     force;
-    bool     background; // queued by reconnectLostSensors, not by a user or boot
-    uint32_t req_seq;    // NO_HOST_REQUEST when not host-driven.
+    uint8_t       slot;
+    bool          force;
+    ConnectOrigin origin;
+    uint32_t      req_seq; // NO_HOST_REQUEST when not host-driven.
 };
 
 // Loop-task-only timing of the background reconnect. The state itself
 // (VernierAdapter::ReconnectState) lives on the adapter because other
 // tasks change it; this is just when reconnectLostSensors() may try.
 struct ReconnectSchedule {
+    // ReconnectState at the previous pass. Leaving OFF (re)starts the
+    // schedule, whichever task armed the slot.
+    VernierAdapter::ReconnectState seen = VernierAdapter::ReconnectState::OFF;
+    uint32_t armedAtMs     = 0;     // millis() when the slot left OFF (give-up clock)
     uint32_t nextAttemptMs = 0;     // millis() at which the next rescan may start
     uint32_t backoffMs     = 0;     // current gap between rescans; grows after each failure
     bool     inFlight      = false; // a rescan this schedule queued has not resolved
@@ -92,7 +113,7 @@ std::atomic<HostLink> hostLink{HostLink::SILENT};
 }  // namespace
 
 static void emitDevList();           // forward decl — defined below for grouping
-static void publishConnectResult(uint8_t slot, bool ok);
+static void publishConnectResult(uint8_t slot, bool ok, ConnectOrigin origin);
 
 static void sendBootHandshake()
 {
@@ -123,10 +144,10 @@ static void sendSlotFrames(uint8_t slot)
     sendDeviceFieldsFor(uart, dev, slot);
 }
 
-// enqueueConnect(slot, force, req_seq, background):
+// enqueueConnect(slot, force, req_seq, origin):
 //   Single producer-side helper used by cmdConnect, buttonHandler,
-//   autoConnectDevice and reconnectLostSensors (background=true).
-//   Atomically claims the slot (CAS IDLE →
+//   autoConnectDevice and reconnectLostSensors. Atomically claims the
+//   slot (CAS IDLE →
 //   REQUESTED) and queues a ConnectRequest. Returns false — a no-op,
 //   leaving state untouched — if the slot is already
 //   REQUESTED / CONNECTING / READY, so callers can fire-and-forget
@@ -138,7 +159,7 @@ static void sendSlotFrames(uint8_t slot)
 //   correlation; bleWorker no longer dispatches an ACK from
 //   publishConnectResult (early-ACK happens in cmdConnect at
 //   enqueue time, host learns outcome via T_DEV_LIST piggyback).
-static bool enqueueConnect(uint8_t slot, bool force, uint32_t req_seq, bool background)
+static bool enqueueConnect(uint8_t slot, bool force, uint32_t req_seq, ConnectOrigin origin)
 {
     // Precondition: caller has validated slotInRange. configASSERT is
     // a no-op under NDEBUG so this costs nothing in release builds
@@ -162,7 +183,7 @@ static bool enqueueConnect(uint8_t slot, bool force, uint32_t req_seq, bool back
     // the claim above, the queue is guaranteed to have room. Evaluate
     // the send outside configASSERT (a no-op macro under NDEBUG must
     // not swallow the call) and assert the invariant.
-    ConnectRequest req{slot, force, background, req_seq};
+    ConnectRequest req{slot, force, origin, req_seq};
     const BaseType_t sent = xQueueSend(bleWorkQueue, &req, 0);
     configASSERT(sent == pdTRUE);
     return true;
@@ -187,20 +208,86 @@ enum class UserConnect : uint8_t
 static UserConnect requestUserConnect(uint8_t slot, uint32_t req_seq)
 {
     const bool adopted = slots[slot].tryAdoptReconnect();
-    if (enqueueConnect(slot, /*force=*/true, req_seq, /*background=*/false))
+    if (enqueueConnect(slot, /*force=*/true, req_seq, ConnectOrigin::USER))
         return UserConnect::QUEUED;
     return adopted ? UserConnect::TOOK_OVER : UserConnect::BUSY;
 }
 
-// publishConnectResult(slot, ok):
+// Persist the name of the sensor just connected to `slot` under the
+// slot's NVS key (deviceName0..N, read back at boot so each slot can
+// auto-connect its sensor), flag the slot for that boot auto-connect,
+// and make the name the slot's connect(false) target, so a background
+// reconnect rescans for this sensor, not for whatever a proximity
+// connect would pick. bleWorker only, after the CONNECTING → READY CAS.
+static void saveConnectedSensor(uint8_t slot, const char *name)
+{
+    char key[NVS_KEY_MAX_LEN];
+    snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)slot);
+    NvsScope nvs(nvsMutex, preferences, NVS_NAMESPACE_SETTING, false);
+    // C_FORGET tears the slot down (IDLE) before it takes nvsMutex to
+    // remove the key and clear the flag. Re-checked under that mutex: a
+    // Forget that already tore the slot down skips the save, and one
+    // that has not removes the key and clears the flag after this.
+    if (!slots[slot].isReady())
+    {
+        log_i("slot %u: disconnected before its name was saved", (unsigned)slot);
+        return;
+    }
+    log_d("NVS slot %u: saving %s = %s", (unsigned)slot, key, name);
+    // Preferences skips the flash write when the stored value is the
+    // same, so re-saving on every reconnect costs no wear.
+    if (nvs) preferences.putString(key, name);
+    // Fill-then-flag publish: store the per-slot data flag relaxed,
+    // then release the "any saved?" gate so a reader that acquire-loads
+    // foundSavedDevice sees this write.
+    slotHasSavedDevice[slot].store(true, std::memory_order_relaxed);
+    foundSavedDevice.store(true, std::memory_order_release);
+    slots[slot].setOpenDevice(name);
+}
+
+// One sensor, one slot. A sensor just connected to `slot` is no longer
+// looked for by another slot that lost it (it came back and was
+// connected here with a Connect on another card or the BOOT short-press,
+// which firstFreeSlot() steers away from a waiting slot). Without this
+// that slot keeps rescanning, until the give-up time, for a sensor that
+// is busy here, and takes it back the moment the user forgets it here.
+// bleWorker is the only writer
+// of _open_device, so reading it here is safe.
+static void disarmOtherSlotsWaitingFor(uint8_t slot, const char *name)
+{
+    for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+    {
+        if (i == slot
+            || slots[i].reconnectState() == VernierAdapter::ReconnectState::OFF
+            || slots[i].openDevice() != name)
+            continue;
+        slots[i].setReconnectState(VernierAdapter::ReconnectState::OFF);
+        log_i("slot %u: %s connected to slot %u, reconnect stopped",
+              (unsigned)i, name, (unsigned)slot);
+    }
+}
+
+// True when the saved sensor of `slot` is connected to another slot. A
+// boot connect that failed for that reason must not arm the slot.
+static bool savedSensorReadyElsewhere(uint8_t slot)
+{
+    for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
+        if (i != slot && slots[i].isReady()
+            && slots[i].openDevice() == slots[slot].openDevice())
+            return true;
+    return false;
+}
+
+// publishConnectResult(slot, ok, origin):
 //   Side-effect block that runs after dev.connect() resolves.
 //   - On success: refresh status, kick off streaming, emit the
-//     per-slot frames (T_DEVINFO, T_DEVSTATS, T_FIELDS), persist the
-//     slot's device name in NVS and as the adapter's connect(false)
-//     target, flag the slot for auto-connect on the next boot, and end
-//     any background reconnect.
+//     per-slot frames (T_DEVINFO, T_DEVSTATS, T_FIELDS), publish READY
+//     (which ends any background reconnect), then save the sensor's
+//     name (saveConnectedSensor) and stop other slots looking for it.
 //   - On failure of a user connect that took over a background
 //     reconnect: re-arm it (the sensor is still wanted).
+//   - On failure of the boot connect of a saved sensor: arm the
+//     background reconnect (the sensor may be switched on later).
 //   - On any outcome but a failed background attempt: push T_DEV_LIST
 //     so the host's slot table stays in sync (D4). A failed background
 //     attempt changes nothing the host sees, so it pushes nothing.
@@ -210,7 +297,7 @@ static UserConnect requestUserConnect(uint8_t slot, uint32_t req_seq)
 // Caller is responsible for the dev.connect() call itself + the
 // slot-range guard. Safe to call from any task that owns access
 // to the shared globals (uart's send mutex, nvsMutex via NvsScope).
-static void publishConnectResult(uint8_t slot, bool ok)
+static void publishConnectResult(uint8_t slot, bool ok, ConnectOrigin origin)
 {
     VernierAdapter &dev = slots[slot];
     if (ok)
@@ -233,30 +320,6 @@ static void publishConnectResult(uint8_t slot, bool ok)
         // per-connect path now emits only the per-slot frames + the
         // trailing T_DEV_LIST.
         sendSlotFrames(slot);
-
-        // Persist last connected device name to NVS under the per-slot
-        // key (deviceName0..N). Read back at boot so each slot can
-        // auto-reconnect to its previously paired device.
-        {
-            char key[NVS_KEY_MAX_LEN];
-            snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)slot);
-            log_d("NVS slot %u: saving %s = %s", (unsigned)slot, key, dev.deviceName());
-            {
-                NvsScope nvs(nvsMutex, preferences, NVS_NAMESPACE_SETTING, false);
-                if (nvs) preferences.putString(key, dev.deviceName());
-            }
-            // Mark this slot as eligible for future auto-connect on
-            // boot — even though we won't reach autoConnectDevice
-            // again until the next reboot + C_SET_PERIOD trigger.
-            // Fill-then-flag publish: store the per-slot data flag
-            // relaxed, then release the "any saved?" gate so a reader
-            // that acquire-loads foundSavedDevice sees this write.
-            slotHasSavedDevice[slot].store(true, std::memory_order_relaxed);
-            foundSavedDevice.store(true, std::memory_order_release);
-            // A later background reconnect rescans for this sensor, not
-            // for whatever a proximity connect would pick.
-            dev.setOpenDevice(dev.deviceName());
-        }
     }
 
     // Terminal state transition AFTER all uart.send* calls so a
@@ -271,20 +334,45 @@ static void publishConnectResult(uint8_t slot, bool ok)
         // for this slot landed during the handshake and already set
         // it IDLE. In that case abandon the connect — tear the link
         // back down (idempotent) and leave the slot IDLE — rather
-        // than resurrect a slot the host just tore down.
-        if (!dev.tryFinishConnecting())
-            dev.disconnect();
+        // than resurrect a slot the host just tore down. The name is
+        // saved only after the CAS, so such a Forget is not undone.
+        char name[VERNIER_DEVICE_NAME_LEN];
+        if (!dev.tryFinishConnecting(name, sizeof(name)))
+        {
+            dev.disconnect(/*disarm=*/false);
+        }
+        else if (name[0] == '\0')
+        {
+            // An empty name would turn the slot's next saved-name
+            // connect into a proximity connect.
+            log_w("slot %u: connected sensor has no name, not saved", (unsigned)slot);
+        }
         else
-            dev.setReconnectState(VernierAdapter::ReconnectState::OFF);
+        {
+            saveConnectedSensor(slot, name);
+            disarmOtherSlotsWaitingFor(slot, name);
+        }
     }
     else
     {
-        dev.setState(VernierAdapter::ConnState::IDLE);
+        // The boot connect of a saved sensor failed: it is probably
+        // just switched off, so look for it in the background. Pushes
+        // T_DEV_LIST below like any failed boot connect, because the
+        // host saw this attempt as connecting.
+        const bool armedAtBoot = origin == ConnectOrigin::BOOT
+                                 && slotHasSavedDevice[slot].load(std::memory_order_relaxed)
+                                 && !savedSensorReadyElsewhere(slot)
+                                 && dev.tryArmFailedConnect();
+        if (armedAtBoot)
+            log_i("slot %u: saved sensor not found at boot, reconnecting in the background",
+                  (unsigned)slot);
+        else
+            dev.setState(VernierAdapter::ConnState::IDLE);
         // A user connect that took over a background reconnect failed:
         // keep waiting for the saved sensor. A background attempt that
         // failed leaves the slot ARMED and the host's view unchanged
         // (emitDevList shows it IDLE either way), so skip the push.
-        if (!dev.tryRearmAdoptedReconnect()
+        if (!armedAtBoot && !dev.tryRearmAdoptedReconnect()
             && dev.reconnectState() == VernierAdapter::ReconnectState::ARMED)
             return;
     }
@@ -339,7 +427,7 @@ static void bleWorkerEntry(void *)
         // back. Checked after the claim: a C_DISCONNECT / C_FORGET that
         // lands later stores IDLE, and publishConnectResult's
         // CONNECTING → READY CAS then abandons the connect.
-        if (req.background
+        if (req.origin == ConnectOrigin::BACKGROUND
             && dev.reconnectState() == VernierAdapter::ReconnectState::OFF)
         {
             log_i("bleWorker: slot %u no longer reconnecting, skipping",
@@ -352,7 +440,7 @@ static void bleWorkerEntry(void *)
         // seeing it disconnected, so an attempt for it announces nothing.
         if (dev.reconnectState() != VernierAdapter::ReconnectState::ARMED)
             emitDevList();
-        publishConnectResult(req.slot, dev.connect(req.force));
+        publishConnectResult(req.slot, dev.connect(req.force), req.origin);
     }
 }
 
@@ -424,6 +512,11 @@ void autoConnectDevice()
     if (!startAutoConnect.load(std::memory_order_acquire))
         return;
     startAutoConnect.store(false, std::memory_order_relaxed);
+    // Only the first pass is the boot connect, whose failure arms the
+    // background reconnect. A later pass (the host re-sending
+    // C_SET_PERIOD) counts as a user connect, so it never arms a slot
+    // the user disconnected.
+    const ConnectOrigin origin = started ? ConnectOrigin::USER : ConnectOrigin::BOOT;
     started = true;
 
     // Per design D6: walk slots in order, queue a connect for each
@@ -441,7 +534,7 @@ void autoConnectDevice()
     {
         if (slotHasSavedDevice[i].load(std::memory_order_relaxed))
         {
-            if (enqueueConnect(i, /*force=*/false, NO_HOST_REQUEST, /*background=*/false))
+            if (enqueueConnect(i, /*force=*/false, NO_HOST_REQUEST, origin))
             {
                 log_i("auto-connect: queued slot %u (saved device)",
                       (unsigned)i);
@@ -454,24 +547,20 @@ void releaseLostLinks()
 {
     for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
     {
-        if (!slots[i].releaseIfLinkLost())
-            continue;
         // The user connected this sensor and neither disconnected nor
         // forgot it: keep its saved name and look for it in the
-        // background. Armed before the push so the list shows it IDLE.
-        if (slotHasSavedDevice[i].load(std::memory_order_relaxed))
-        {
-            slots[i].setReconnectState(VernierAdapter::ReconnectState::ARMED);
-            reconnectSchedule[i].backoffMs     = RECONNECT_FIRST_RETRY_MS;
-            reconnectSchedule[i].nextAttemptMs = millis() + RECONNECT_FIRST_RETRY_MS;
-            reconnectSchedule[i].inFlight      = false;
+        // background. Armed inside releaseIfLinkLost's lock, so a
+        // C_DISCONNECT / C_FORGET waiting on that lock disarms the slot
+        // after it, and before the push so the list shows it IDLE.
+        // reconnectLostSensors() starts the retry schedule.
+        const bool saved = slotHasSavedDevice[i].load(std::memory_order_relaxed);
+        if (!slots[i].releaseIfLinkLost(/*arm=*/saved))
+            continue;
+        if (saved)
             log_w("slot %u: BLE link lost, slot freed, reconnecting in the background",
                   (unsigned)i);
-        }
         else
-        {
             log_w("slot %u: BLE link lost, slot freed", (unsigned)i);
-        }
         emitDevList();
     }
 }
@@ -494,7 +583,22 @@ void reconnectLostSensors()
     for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
     {
         ReconnectSchedule &s = reconnectSchedule[i];
-        if (slots[i].reconnectState() != VernierAdapter::ReconnectState::ARMED)
+        const auto rs = slots[i].reconnectState();
+        // The slot left OFF since the previous pass: armed by a link
+        // loss (releaseLostLinks), a failed boot connect (bleWorker), or
+        // already ADOPTED by a user connect on the UART task. Start the
+        // schedule here, whoever armed it, so the first rescan waits
+        // RECONNECT_FIRST_RETRY_MS and the backoff never starts at 0.
+        if (s.seen == VernierAdapter::ReconnectState::OFF
+            && rs != VernierAdapter::ReconnectState::OFF)
+        {
+            s.armedAtMs     = now;
+            s.backoffMs     = RECONNECT_FIRST_RETRY_MS;
+            s.nextAttemptMs = now + RECONNECT_FIRST_RETRY_MS;
+            s.inFlight      = false;
+        }
+        s.seen = rs;
+        if (rs != VernierAdapter::ReconnectState::ARMED)
         {
             // OFF, or ADOPTED by a user connect. If a failed user
             // connect re-arms the slot, the next rescan waits one gap.
@@ -517,9 +621,20 @@ void reconnectLostSensors()
                   (unsigned)i, (unsigned)s.backoffMs);
             continue;
         }
+        // Give up between two attempts once the sensor has been away
+        // for RECONNECT_GIVE_UP_MS. The slot keeps its saved name; the
+        // host already shows it disconnected, so nothing is pushed.
+        if (RECONNECT_GIVE_UP_MS != 0 && now - s.armedAtMs >= RECONNECT_GIVE_UP_MS
+            && slots[i].tryGiveUpReconnect())
+        {
+            s.seen = VernierAdapter::ReconnectState::OFF;
+            log_w("slot %u: sensor not back after %u ms, background reconnect stopped",
+                  (unsigned)i, (unsigned)(now - s.armedAtMs));
+            continue;
+        }
         if (workerBusy || static_cast<int32_t>(now - s.nextAttemptMs) < 0)
             continue;
-        if (enqueueConnect(i, /*force=*/false, NO_HOST_REQUEST, /*background=*/true))
+        if (enqueueConnect(i, /*force=*/false, NO_HOST_REQUEST, ConnectOrigin::BACKGROUND))
         {
             s.inFlight = true;
             workerBusy = true;
@@ -547,13 +662,18 @@ void buttonHandler()
                 bool any = false;
                 for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
                 {
-                    // Before the teardown, so no background attempt is
-                    // queued for a slot this press just emptied.
-                    slots[i].setReconnectState(VernierAdapter::ReconnectState::OFF);
+                    // disconnect(true) disarms before the teardown, so no
+                    // background attempt is queued for a slot this press
+                    // just emptied; an empty slot waiting for its sensor
+                    // is only disarmed.
                     if (isSlotOccupied(i))
                     {
-                        slots[i].disconnect();
+                        slots[i].disconnect(/*disarm=*/true);
                         any = true;
+                    }
+                    else
+                    {
+                        slots[i].setReconnectState(VernierAdapter::ReconnectState::OFF);
                     }
                 }
                 if (any) emitDevList();
@@ -692,10 +812,11 @@ static void cmdDisconnect(JsonVariantConst root, uint32_t req)
                      static_cast<int16_t>(dev));
         return;
     }
-    // An explicit disconnect ends the background reconnect. Set before
-    // the teardown so the worker skips an attempt already queued.
-    slots[dev].setReconnectState(VernierAdapter::ReconnectState::OFF);
-    slots[dev].disconnect();
+    // An explicit disconnect ends the background reconnect. Disarmed
+    // under the lifecycle lock before the teardown, so the worker skips
+    // an attempt already queued and a concurrent link-loss release
+    // cannot re-arm the slot after this.
+    slots[dev].disconnect(/*disarm=*/true);
     uart.sendAck(req, true, "disconnected", static_cast<int16_t>(dev));
     // D4: T_DEV_LIST after disconnect so host's slot table reflects
     // the slot becoming free.
@@ -718,16 +839,19 @@ static void cmdForget(JsonVariantConst root, uint32_t req)
     {
         // No persistent state and no live link — Forget is a no-op.
         // Reply ok so the host can still bounce the kid back to the
-        // main view, but skip the NVS write entirely.
+        // main view, but skip the NVS write entirely. Still disarm, so
+        // a Forget always leaves the slot with no background reconnect.
+        slots[dev].setReconnectState(VernierAdapter::ReconnectState::OFF);
         uart.sendAck(req, true, "already empty", static_cast<int16_t>(dev));
         emitDevList();
         return;
     }
     // Disconnect first so the device's BLE link drops cleanly. Safe to
     // call when already disconnected (no-op). A forgotten sensor is not
-    // reconnected in the background either.
-    slots[dev].setReconnectState(VernierAdapter::ReconnectState::OFF);
-    slots[dev].disconnect();
+    // reconnected in the background either: disconnect(true) disarms
+    // under the lifecycle lock, after any link-loss release that holds
+    // it, so that release cannot re-arm the slot.
+    slots[dev].disconnect(/*disarm=*/true);
     // Clear NVS deviceName{dev} so autoConnectDevice on next boot skips
     // this slot.
     {

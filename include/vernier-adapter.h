@@ -28,6 +28,10 @@ constexpr uint16_t VERNIER_MIN_PERIOD_MS = 10;
 // rationale.
 constexpr UBaseType_t VERNIER_SAMPLE_QUEUE_DEPTH = 2;
 
+// Buffer size for a copy of a connected sensor's advertised name
+// (NUL included), the same size as GoGoVernier's DeviceInfo::name.
+constexpr size_t VERNIER_DEVICE_NAME_LEN = sizeof(gogo_vernier::DeviceInfo::name);
+
 // Thin facade over gogo_vernier::GoGoVernier that preserves the call-site
 // shape the firmware uses. One adapter per slot; slots[] in main.cpp
 // holds VERNIER_MAX_SLOTS of them.
@@ -53,6 +57,8 @@ public:
     //   - disconnect() → setState(IDLE).
     //   - loop() → releaseLostLinks() → releaseIfLinkLost() → IDLE when a READY
     //     slot's BLE link dropped.
+    //   - publishConnectResult failure tail of a boot connect →
+    //     tryArmFailedConnect() (CAS CONNECTING → IDLE).
     // Numeric values are part of the wire contract (T_DEV_LIST's
     // optional `state` field, G008). Don't renumber — append at
     // the end.
@@ -72,8 +78,9 @@ public:
     //           connect and by C_DISCONNECT, C_FORGET and the BOOT
     //           long-press, which must not bring the sensor back.
     //   ARMED   the link of a READY slot with a saved name dropped
-    //           (releaseLostLinks); reconnectLostSensors() rescans for
-    //           the saved name with a backoff.
+    //           (releaseLostLinks), or the boot auto-connect of a saved
+    //           name failed (tryArmFailedConnect); reconnectLostSensors()
+    //           rescans for the saved name with a backoff.
     //   ADOPTED a user connect (C_CONNECT or BOOT short-press) landed
     //           on an ARMED slot: the slot's real state shows on the
     //           wire. Success → OFF; failure or C_CANCEL_CONNECT →
@@ -90,15 +97,23 @@ public:
     ~VernierAdapter();
 
     bool connect(bool forceConnect = false);
-    void disconnect();
+    // Tear the slot down and set it IDLE. With disarm, also end its
+    // background reconnect (OFF), stored under the same lock as the
+    // teardown so it lands after any concurrent releaseIfLinkLost(arm):
+    // an explicit C_DISCONNECT / C_FORGET / long-press always wins.
+    void disconnect(bool disarm);
     // A READY slot whose BLE link dropped (sensor off, out of range,
     // battery dead) is torn down and set IDLE so the host can connect
-    // it again. Returns true when it freed the slot.
-    bool releaseIfLinkLost();
+    // it again. Returns true when it freed the slot. With arm, the slot
+    // is also set ARMED before the lock is released, so a
+    // disconnect(true) waiting on the lock disarms it afterwards.
+    bool releaseIfLinkLost(bool arm);
     // Target of a connect(false). Written by setup() (the NVS name) and by
     // publishConnectResult on the bleWorker task after every successful
-    // connect, read by connect() on the same task, so a String is safe.
+    // connect, read by connect() and publishConnectResult on the same
+    // task, so a String is safe.
     void setOpenDevice(const char *device_name) { _open_device = device_name; }
+    const String &openDevice() const { return _open_device; }
 
     void setSamplingRate(uint16_t period_ms);
     void startReading(uint16_t period_ms = 0);
@@ -160,19 +175,29 @@ public:
     // without it, the unconditional READY store raced disconnect()'s
     // IDLE store and could leave the slot shown-connected-but-gone or
     // stuck-READY-never-streaming.
-    bool tryFinishConnecting()
-    {
-        ConnState expected = ConnState::CONNECTING;
-        return _conn_state.compare_exchange_strong(
-            expected, ConnState::READY, std::memory_order_relaxed);
-    }
+    // On success it also ends any background reconnect (OFF) and copies
+    // the sensor's name into name_out (len bytes, NUL-terminated). All
+    // of it runs under the lifecycle lock, so a teardown (whose close()
+    // zeroes the name) runs either before (the CAS fails) or after the
+    // copy, never during it, and a link loss arms the slot after OFF.
+    bool tryFinishConnecting(char *name_out, size_t len);
+
+    // Failure tail of a boot auto-connect: CAS CONNECTING → IDLE, then
+    // CAS OFF → ARMED, under the lifecycle lock. Returns true when it
+    // armed the slot. A disconnect(true) either tore the slot down
+    // first (the first CAS fails: it is already IDLE) or disarms it
+    // after the lock is released.
+    bool tryArmFailedConnect();
 
     // Background-reconnect accessors. Relaxed for the same reason as
     // _conn_state: each transition is an independent scalar publish.
-    // Writers: releaseLostLinks (ARMED), the user-connect paths
-    // (ARMED → ADOPTED), publishConnectResult (OFF on success,
-    // ADOPTED → ARMED on failure), cmdCancelConnect (ADOPTED → ARMED),
-    // cmdDisconnect / cmdForget / the BOOT long-press (OFF).
+    // Writers: releaseIfLinkLost (ARMED), tryArmFailedConnect (OFF →
+    // ARMED), the user-connect paths (ARMED → ADOPTED),
+    // publishConnectResult (OFF on success, also for other slots
+    // waiting for the same sensor; ADOPTED → ARMED on failure),
+    // cmdCancelConnect (ADOPTED → ARMED), disconnect(true) and the
+    // empty-slot paths of C_FORGET / the BOOT long-press (OFF),
+    // reconnectLostSensors (tryGiveUpReconnect, if a give-up time is set).
     ReconnectState reconnectState() const { return _reconnect.load(std::memory_order_relaxed); }
     void setReconnectState(ReconnectState s) { _reconnect.store(s, std::memory_order_relaxed); }
     // CAS ARMED → ADOPTED for a user connect. Fails on OFF / ADOPTED.
@@ -189,6 +214,14 @@ public:
         ReconnectState expected = ReconnectState::ADOPTED;
         return _reconnect.compare_exchange_strong(
             expected, ReconnectState::ARMED, std::memory_order_relaxed);
+    }
+    // CAS ARMED → OFF when the give-up time ran out between two
+    // attempts. Fails if a user connect adopted the slot meanwhile.
+    bool tryGiveUpReconnect()
+    {
+        ReconnectState expected = ReconnectState::ARMED;
+        return _reconnect.compare_exchange_strong(
+            expected, ReconnectState::OFF, std::memory_order_relaxed);
     }
 
     // CAS IDLE → REQUESTED for the producer enqueue path
@@ -318,7 +351,11 @@ private:
     // Serialises teardown: disconnect() runs on the UART task, the
     // button's loop task and bleWorker; releaseIfLinkLost() also runs
     // on the loop task. Without it two of them could reset the onSample
-    // std::function and close the session at the same time.
+    // std::function and close the session at the same time. It also
+    // orders every ReconnectState change that follows a teardown or a
+    // connect outcome (ARMED in releaseIfLinkLost / tryArmFailedConnect,
+    // OFF in disconnect(true)) against the others, and keeps
+    // tryFinishConnecting's name copy clear of close().
     SemaphoreHandle_t _lifecycle_mutex = nullptr;
 
     void teardown();

@@ -5,8 +5,9 @@
 
 // Public entry points for the host-protocol control loop. The
 // implementations live in control-loop.cpp and orchestrate
-// connectAndReport, emitDevList, and the per-command handlers. main.cpp
-// just wires these into the FreeRTOS tasks and the Arduino loop().
+// enqueueConnect / bleWorker / publishConnectResult, emitDevList, and
+// the per-command handlers. main.cpp just wires these into the
+// FreeRTOS tasks and the Arduino loop().
 
 // Dispatch one host→co command frame. Called from uartHandler's
 // FramedMsgPackReceiver callback. Ack and follow-up event emission
@@ -17,7 +18,8 @@ void dispatchHostCommand(JsonVariantConst root);
 // NVS device name. Called from loop(); runs after the host's first
 // C_SET_PERIOD, or on its own AUTO_CONNECT_HOSTLESS_DELAY_MS after boot
 // if none started it. No-op on later calls until startAutoConnect is
-// re-armed.
+// re-armed. Only the first pass is the boot connect: a saved sensor it
+// does not find is armed for the background reconnect.
 void autoConnectDevice();
 
 // Tear down every READY slot whose BLE link dropped and push
@@ -30,7 +32,9 @@ void releaseLostLinks();
 
 // Queue a rescan for the saved name of an ARMED slot when its backoff
 // gap (RECONNECT_* in main.h) has passed, one attempt at a time and only
-// while bleWorker is idle. Called from loop() after releaseLostLinks().
+// while bleWorker is idle; stop after RECONNECT_GIVE_UP_MS. Starts the
+// schedule whenever a slot leaves OFF. Called from loop() after
+// releaseLostLinks().
 void reconnectLostSensors();
 
 // Poll the BOOT button and dispatch press / long-press semantics.

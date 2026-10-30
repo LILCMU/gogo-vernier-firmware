@@ -32,7 +32,7 @@ After every successful build, `platformio-scripts/combine-firmware.py` runs `esp
 The translation units are split by responsibility:
 
 - `src/main.cpp` — globals (UART, NVS, `slots[]`, cross-task atomic hand-off flags), FreeRTOS task entrypoints, `setup()`, `loop()`, and `serial_log_vprintf`.
-- `src/control-loop.cpp` — host-protocol control flow: `connectAndReport`, `emitDevList`, `autoConnectDevice`, `buttonHandler`, the five `cmd*` per-command handlers, and the `dispatchHostCommand` entry point.
+- `src/control-loop.cpp` — host-protocol control flow: `enqueueConnect` and the `bleWorker` task (`publishConnectResult` runs each connect's outcome), `emitDevList`, `autoConnectDevice`, `releaseLostLinks` / `reconnectLostSensors` (link loss and the background reconnect), `buttonHandler`, the seven `cmd*` per-command handlers (`cmdConnect`, `cmdDisconnect`, `cmdForget`, `cmdDevList`, `cmdHello`, `cmdCancelConnect`, `cmdSetPeriod`), and the `dispatchHostCommand` entry point.
 - `src/slot-helpers.cpp` — `NvsScope` RAII, `firstFreeSlot` / `isSlotOccupied` / `slotInRange` predicates, `sendDeviceFieldsFor` marshaller.
 - `src/vernier-adapter.cpp` / `src/uart-adapter.cpp` — Vernier device facade and the wire-protocol codec.
 
@@ -40,7 +40,7 @@ Two pinned-priority FreeRTOS tasks plus `loop()`:
 
 - **`uartHandler` task** — owns a `FramedMsgPackReceiver` over `gogoSerial` (HardwareSerial(0), 115200). Polls frames and forwards each parsed root to `dispatchHostCommand(root)` in control-loop.cpp. Wire commands: `C_CONNECT=1`, `C_DISCONNECT=2`, `C_SET_PERIOD=3`, `C_DEV_LIST=4`, `C_FORGET=5`, `C_CANCEL_CONNECT=6`, `C_HELLO=7` (single source of truth: `UartAdapter::CmdType`).
 - **`vernierHandler` task** — round-robins across `slots[]`. For each ready slot it drains the push-mode sample queue via `dev.waitForSample()` (depth-2 FreeRTOS queue fed from the NimBLE notify task), emits `T_SENS_VALUES`, refreshes battery/charge/RSSI on a 10 s wall-clock and pushes a change-based `T_DEVSTATS`, and every 50 samples re-emits `T_FIELDS` so the host can recover its field cache after a reboot. Sleep cadence is adaptive — see `nextSleepMs()`.
-- **`loop()`** — `autoConnectDevice()` (fires after the host sends `C_SET_PERIOD`, or 5 s after boot without one; walks `slotHasSavedDevice[]` and reconnects each marked slot), `releaseLostLinks()` (a ready slot whose BLE link dropped is torn down via `VernierAdapter::releaseIfLinkLost()`, set IDLE, armed for the background reconnect if it has a saved sensor, and a `T_DEV_LIST` is pushed), `reconnectLostSensors()` (rescans for each armed slot's saved name with a `RECONNECT_*` backoff of 1 s doubling to 30 s, one attempt at a time and only while bleWorker is idle; the host sees the slot disconnected until the sensor is READY; `C_DISCONNECT`, `C_FORGET` and the BOOT long-press stop it; see `.claude/knowledges/vernier-mcu-internals.md` "Background reconnect after a link loss") and `buttonHandler()` (GPIO9 boot button: short press → connect first-free slot via proximity scan, long press ≥2 s → disconnect every active slot).
+- **`loop()`** — `autoConnectDevice()` (fires after the host sends `C_SET_PERIOD`, or 5 s after boot without one; walks `slotHasSavedDevice[]` and reconnects each marked slot; a saved sensor the first, boot pass does not find is armed for the background reconnect), `releaseLostLinks()` (a ready slot whose BLE link dropped is torn down via `VernierAdapter::releaseIfLinkLost()`, set IDLE, armed for the background reconnect if it has a saved sensor, and a `T_DEV_LIST` is pushed), `reconnectLostSensors()` (rescans for each armed slot's saved name with a `RECONNECT_*` backoff of 1 s doubling to 30 s, one attempt at a time and only while bleWorker is idle, and stops after `RECONNECT_GIVE_UP_MS` = 10 min; the host sees the slot disconnected until the sensor is READY; `C_DISCONNECT`, `C_FORGET` and the BOOT long-press stop it; see `.claude/knowledges/vernier-mcu-internals.md` "Background reconnect") and `buttonHandler()` (GPIO9 boot button: short press → connect first-free slot via proximity scan, long press ≥2 s → disconnect every active slot).
 
 A single `nvsMutex` (`SemaphoreHandle_t`) guards all `Preferences` access. Use the `NvsScope` RAII guard in `include/slot-helpers.h` — take the mutex, open the namespace, release both on scope exit. Don't call `preferences.begin/end` directly.
 
@@ -72,7 +72,7 @@ The driver itself lives in `lib/GoGoVernier/` (BSD-3, ported from `VernierST/god
 
 ### Persistence
 
-NVS namespace `"vernierSetting"`. Keys are per-slot: `"deviceName0"`, `"deviceName1"`, ... — written by `connectAndReport` on every successful connect, cleared by `C_FORGET`. Default value `"proximity"` means "open the first nearby device" in GoGoVernier.
+NVS namespace `"vernierSetting"`. Keys are per-slot: `"deviceName0"`, `"deviceName1"`, ... — written by `publishConnectResult` (`saveConnectedSensor`) after every successful connect that is still READY, never with an empty name; cleared by `C_FORGET`. Default value `"proximity"` means "open the first nearby device" in GoGoVernier.
 
 The legacy v1 schema used a single un-suffixed `"deviceName"` key; a one-shot migration in `setup()` copies it into `"deviceName0"` on first v2 boot and leaves the legacy key in place so a v1 firmware rollback still works against the same paired device.
 

@@ -134,19 +134,49 @@ struct LifecycleLock {
 };
 }  // namespace
 
-void VernierAdapter::disconnect()
+void VernierAdapter::disconnect(bool disarm)
 {
     LifecycleLock lk(_lifecycle_mutex);
+    // Before the teardown, so bleWorker drops a background attempt that
+    // is already queued for this slot.
+    if (disarm) setReconnectState(ReconnectState::OFF);
     teardown();
 }
 
-bool VernierAdapter::releaseIfLinkLost()
+bool VernierAdapter::releaseIfLinkLost(bool arm)
 {
     LifecycleLock lk(_lifecycle_mutex);
     if (!isReady() || _gv.isLinkUp())
         return false;
     teardown();
+    if (arm) setReconnectState(ReconnectState::ARMED);
     return true;
+}
+
+bool VernierAdapter::tryFinishConnecting(char *name_out, size_t len)
+{
+    LifecycleLock lk(_lifecycle_mutex);
+    ConnState expected = ConnState::CONNECTING;
+    if (!_conn_state.compare_exchange_strong(expected, ConnState::READY,
+                                             std::memory_order_relaxed))
+        return false;
+    // Under the lock, so a link loss right after READY arms the slot
+    // after this store, not before it.
+    setReconnectState(ReconnectState::OFF);
+    strlcpy(name_out, deviceName(), len);
+    return true;
+}
+
+bool VernierAdapter::tryArmFailedConnect()
+{
+    LifecycleLock lk(_lifecycle_mutex);
+    ConnState connecting = ConnState::CONNECTING;
+    if (!_conn_state.compare_exchange_strong(connecting, ConnState::IDLE,
+                                             std::memory_order_relaxed))
+        return false;
+    ReconnectState off = ReconnectState::OFF;
+    return _reconnect.compare_exchange_strong(off, ReconnectState::ARMED,
+                                              std::memory_order_relaxed);
 }
 
 void VernierAdapter::teardown()
