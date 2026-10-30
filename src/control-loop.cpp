@@ -218,25 +218,23 @@ static UserConnect requestUserConnect(uint8_t slot, uint32_t req_seq)
 // auto-connect its sensor), flag the slot for that boot auto-connect,
 // and make the name the slot's connect(false) target, so a background
 // reconnect rescans for this sensor, not for whatever a proximity
-// connect would pick. bleWorker only, after the CONNECTING → READY CAS.
+// connect would pick. Runs on bleWorker inside tryFinishConnecting,
+// under the slot's lifecycle lock (lock order lifecycle → nvsMutex, the
+// same as cmdForget): no teardown can run between READY and the save,
+// so a Forget either tore the slot down first (READY never published,
+// nothing saved) or removes the key after it, and a link loss right at
+// READY cannot leave a new pairing unsaved.
 static void saveConnectedSensor(uint8_t slot, const char *name)
 {
     char key[NVS_KEY_MAX_LEN];
     snprintf(key, sizeof(key), NVS_KEY_DEVICE_NAME_FMT, (unsigned)slot);
-    NvsScope nvs(nvsMutex, preferences, NVS_NAMESPACE_SETTING, false);
-    // C_FORGET tears the slot down (IDLE) before it takes nvsMutex to
-    // remove the key and clear the flag. Re-checked under that mutex: a
-    // Forget that already tore the slot down skips the save, and one
-    // that has not removes the key and clears the flag after this.
-    if (!slots[slot].isReady())
-    {
-        log_i("slot %u: disconnected before its name was saved", (unsigned)slot);
-        return;
-    }
     log_d("NVS slot %u: saving %s = %s", (unsigned)slot, key, name);
-    // Preferences skips the flash write when the stored value is the
-    // same, so re-saving on every reconnect costs no wear.
-    if (nvs) preferences.putString(key, name);
+    {
+        NvsScope nvs(nvsMutex, preferences, NVS_NAMESPACE_SETTING, false);
+        // Preferences skips the flash write when the stored value is the
+        // same, so re-saving on every reconnect costs no wear.
+        if (nvs) preferences.putString(key, name);
+    }
     // Fill-then-flag publish: store the per-slot data flag relaxed,
     // then release the "any saved?" gate so a reader that acquire-loads
     // foundSavedDevice sees this write.
@@ -251,8 +249,8 @@ static void saveConnectedSensor(uint8_t slot, const char *name)
 // which firstFreeSlot() steers away from a waiting slot). Without this
 // that slot keeps rescanning, until the give-up time, for a sensor that
 // is busy here, and takes it back the moment the user forgets it here.
-// bleWorker is the only writer
-// of _open_device, so reading it here is safe.
+// bleWorker is the only writer of _open_device, so reading it here is
+// safe.
 static void disarmOtherSlotsWaitingFor(uint8_t slot, const char *name)
 {
     for (uint8_t i = 0; i < VERNIER_MAX_SLOTS; ++i)
@@ -265,6 +263,23 @@ static void disarmOtherSlotsWaitingFor(uint8_t slot, const char *name)
         log_i("slot %u: %s connected to slot %u, reconnect stopped",
               (unsigned)i, name, (unsigned)slot);
     }
+}
+
+// tryFinishConnecting's hook: the slot is READY and its lifecycle lock is
+// held, so `name` (the live DeviceInfo, which close() zeroes) is stable.
+// ctx points at the slot index.
+static void onSensorReady(const char *name, void *ctx)
+{
+    const uint8_t slot = *static_cast<const uint8_t *>(ctx);
+    if (name[0] == '\0')
+    {
+        // An empty name would turn the slot's next saved-name connect
+        // into a proximity connect.
+        log_w("slot %u: connected sensor has no name, not saved", (unsigned)slot);
+        return;
+    }
+    saveConnectedSensor(slot, name);
+    disarmOtherSlotsWaitingFor(slot, name);
 }
 
 // True when the saved sensor of `slot` is connected to another slot. A
@@ -282,8 +297,9 @@ static bool savedSensorReadyElsewhere(uint8_t slot)
 //   Side-effect block that runs after dev.connect() resolves.
 //   - On success: refresh status, kick off streaming, emit the
 //     per-slot frames (T_DEVINFO, T_DEVSTATS, T_FIELDS), publish READY
-//     (which ends any background reconnect), then save the sensor's
-//     name (saveConnectedSensor) and stop other slots looking for it.
+//     (which ends any background reconnect) and, under the same lock,
+//     save the sensor's name and stop other slots looking for it
+//     (onSensorReady).
 //   - On failure of a user connect that took over a background
 //     reconnect: re-arm it (the sensor is still wanted).
 //   - On failure of the boot connect of a saved sensor: arm the
@@ -335,23 +351,11 @@ static void publishConnectResult(uint8_t slot, bool ok, ConnectOrigin origin)
         // it IDLE. In that case abandon the connect — tear the link
         // back down (idempotent) and leave the slot IDLE — rather
         // than resurrect a slot the host just tore down. The name is
-        // saved only after the CAS, so such a Forget is not undone.
-        char name[VERNIER_DEVICE_NAME_LEN];
-        if (!dev.tryFinishConnecting(name, sizeof(name)))
-        {
+        // saved by the hook, under the lock, only after the CAS, so
+        // such a Forget is not undone.
+        uint8_t hookSlot = slot;
+        if (!dev.tryFinishConnecting(onSensorReady, &hookSlot))
             dev.disconnect(/*disarm=*/false);
-        }
-        else if (name[0] == '\0')
-        {
-            // An empty name would turn the slot's next saved-name
-            // connect into a proximity connect.
-            log_w("slot %u: connected sensor has no name, not saved", (unsigned)slot);
-        }
-        else
-        {
-            saveConnectedSensor(slot, name);
-            disarmOtherSlotsWaitingFor(slot, name);
-        }
     }
     else
     {

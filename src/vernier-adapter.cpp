@@ -153,7 +153,7 @@ bool VernierAdapter::releaseIfLinkLost(bool arm)
     return true;
 }
 
-bool VernierAdapter::tryFinishConnecting(char *name_out, size_t len)
+bool VernierAdapter::tryFinishConnecting(ReadyHook onReady, void *ctx)
 {
     LifecycleLock lk(_lifecycle_mutex);
     ConnState expected = ConnState::CONNECTING;
@@ -161,9 +161,9 @@ bool VernierAdapter::tryFinishConnecting(char *name_out, size_t len)
                                              std::memory_order_relaxed))
         return false;
     // Under the lock, so a link loss right after READY arms the slot
-    // after this store, not before it.
+    // after this store and after onReady, not before them.
     setReconnectState(ReconnectState::OFF);
-    strlcpy(name_out, deviceName(), len);
+    onReady(deviceName(), ctx);
     return true;
 }
 

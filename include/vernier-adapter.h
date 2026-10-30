@@ -28,10 +28,6 @@ constexpr uint16_t VERNIER_MIN_PERIOD_MS = 10;
 // rationale.
 constexpr UBaseType_t VERNIER_SAMPLE_QUEUE_DEPTH = 2;
 
-// Buffer size for a copy of a connected sensor's advertised name
-// (NUL included), the same size as GoGoVernier's DeviceInfo::name.
-constexpr size_t VERNIER_DEVICE_NAME_LEN = sizeof(gogo_vernier::DeviceInfo::name);
-
 // Thin facade over gogo_vernier::GoGoVernier that preserves the call-site
 // shape the firmware uses. One adapter per slot; slots[] in main.cpp
 // holds VERNIER_MAX_SLOTS of them.
@@ -175,12 +171,15 @@ public:
     // without it, the unconditional READY store raced disconnect()'s
     // IDLE store and could leave the slot shown-connected-but-gone or
     // stuck-READY-never-streaming.
-    // On success it also ends any background reconnect (OFF) and copies
-    // the sensor's name into name_out (len bytes, NUL-terminated). All
-    // of it runs under the lifecycle lock, so a teardown (whose close()
-    // zeroes the name) runs either before (the CAS fails) or after the
-    // copy, never during it, and a link loss arms the slot after OFF.
-    bool tryFinishConnecting(char *name_out, size_t len);
+    // On success it also ends any background reconnect (OFF), then
+    // calls onReady(<sensor name>, ctx). All of it runs under the
+    // lifecycle lock, so a teardown (whose close() zeroes the name)
+    // runs either before (the CAS fails, onReady is not called) or after
+    // onReady returns, and a link loss arms the slot only after both.
+    // onReady may take nvsMutex (lock order lifecycle → nvsMutex) but
+    // must not take this slot's lifecycle lock again.
+    using ReadyHook = void (*)(const char *name, void *ctx);
+    bool tryFinishConnecting(ReadyHook onReady, void *ctx);
 
     // Failure tail of a boot auto-connect: CAS CONNECTING → IDLE, then
     // CAS OFF → ARMED, under the lifecycle lock. Returns true when it
@@ -354,8 +353,8 @@ private:
     // std::function and close the session at the same time. It also
     // orders every ReconnectState change that follows a teardown or a
     // connect outcome (ARMED in releaseIfLinkLost / tryArmFailedConnect,
-    // OFF in disconnect(true)) against the others, and keeps
-    // tryFinishConnecting's name copy clear of close().
+    // OFF in disconnect(true)) against the others, and holds off every
+    // teardown while tryFinishConnecting's onReady saves the name.
     SemaphoreHandle_t _lifecycle_mutex = nullptr;
 
     void teardown();

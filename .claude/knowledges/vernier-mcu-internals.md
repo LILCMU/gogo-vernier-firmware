@@ -231,8 +231,8 @@ them races another task:
   abandons the connect (tears the link back down) if a disconnect
   won the race. Since v2.3.0 it runs under the adapter's
   `_lifecycle_mutex` together with the OFF store of the background
-  reconnect and a copy of the sensor's name, which
-  `saveConnectedSensor` writes to NVS afterwards (see "Races closed").
+  reconnect and a hook (`onReady`, `onSensorReady` in control-loop)
+  that saves the sensor's name to NVS (see "Races closed").
 - **`tryCancelConnect()` — REQUESTED→IDLE** (`cmdCancelConnect`).
   CAS so it loses cleanly if the worker already moved the slot to
   CONNECTING.
@@ -417,15 +417,20 @@ were fixed before the tag, together with the boot arming.
   needs CONNECTING, and a teardown sets IDLE, both under the lock; a
   teardown that ran first blocks the arming, one that runs after
   disarms it.
-- Forget vs. a connect that just succeeded: the name is saved only
-  after the CONNECTING → READY CAS, from a copy taken inside it under
-  the lifecycle lock (so `close()`, which zeroes `DeviceInfo`, never
-  tears the copy), and `saveConnectedSensor` re-checks READY under
-  `nvsMutex`. Forget sets the slot IDLE before it takes `nvsMutex`, so
-  either the save is skipped or Forget removes the key and clears the
-  flag after it. An empty name is never saved: it would make the
-  slot's next saved-name connect a proximity connect. (The first cut
-  saved before the CAS, so Forget during a handshake was undone.)
+- Forget or link loss vs. a connect that just succeeded: the name is
+  saved by `tryFinishConnecting`'s hook, after the CONNECTING → READY
+  CAS and while the slot's lifecycle lock is still held (lock order
+  lifecycle → `nvsMutex`, the same as `cmdForget`). No teardown can run
+  between READY and the save: a Forget either tore the slot down first
+  (the CAS fails, nothing is saved) or removes the key and clears the
+  flag after the save; a link loss right at READY is handled after the
+  save, so a new pairing is never left unsaved. `close()`, which zeroes
+  `DeviceInfo`, cannot run while the hook reads the name. An empty name
+  is never saved: it would make the slot's next saved-name connect a
+  proximity connect. (The first cut saved before the CAS, so Forget
+  during a handshake was undone; the second cut saved after the lock
+  was released, so a link loss in that gap skipped the save of a new
+  pairing and armed the slot for its previous sensor.)
 - One sensor, two slots: after a successful connect,
   `disarmOtherSlotsWaitingFor` sets OFF on every other non-OFF slot
   whose `_open_device` is the connected name (bleWorker is its only
@@ -439,9 +444,18 @@ were fixed before the tag, together with the boot arming.
   stores IDLE and the CONNECTING → READY CAS abandons the connect.
 - User connect vs. an attempt that just failed: the worker sets IDLE
   then tries ADOPTED → ARMED; `requestUserConnect` tries ARMED →
-  ADOPTED then enqueues. Every interleaving ends either with a queued
+  ADOPTED then enqueues. Usually this ends either with a queued
   proximity connect (the slot was IDLE) or with the user's ADOPTED
-  attempt resolving and pushing T_DEV_LIST.
+  attempt resolving and pushing T_DEV_LIST. Not every interleaving:
+  if the user's IDLE → REQUESTED claim lands between the worker's IDLE
+  store and its re-arm (or between the two steps of
+  `tryArmFailedConnect`), the user's proximity connect runs on a slot
+  that is ARMED. The host then sees the slot disconnected while it
+  runs (ARMED masks the state in T_DEV_LIST) and a failure pushes no
+  T_DEV_LIST; the host's own 12 s connect timeout returns its card to
+  idle, and a success pushes `connected=true` as usual (and sets OFF).
+  Harmless with today's host; a host that renders CONNECTING from the
+  list would miss the spinner for that one attempt.
 - `firstFreeSlot()` picks an ARMED slot only when no other slot is
   free, so a first-free connect does not take a waiting sensor's slot.
 
@@ -502,9 +516,27 @@ sensor and host, no owner at the desk:
 `startAutoConnect` and so also reconnects a slot that was
 C_DISCONNECTed (existing behaviour; the host UI has no Disconnect, only
 Forget, which clears the NVS name). That pass is `USER`, so a failure
-there does not arm the slot. Two slots whose NVS keys both hold the
-same sensor (possible since the first cut) keep both keys; the boot
-pass connects it to the lower slot and does not arm the other.
+there does not arm the slot.
+
+**Duplicate NVS keys (P3, accepted for v2.3.0).** When sensor A that
+slot 0 lost is connected to slot 1, `disarmOtherSlotsWaitingFor` stops
+slot 0's background search, but slot 0 keeps its NVS key
+`deviceName0 = A` and its `slotHasSavedDevice` flag. Both slots then
+"own" A. Effects:
+- After the user forgets A on slot 1, slot 0's key still names A: the
+  next `C_SET_PERIOD` pass or the next C3 boot reconnects A into slot 0,
+  and with boot arming a boot that does not find A hunts it for up to
+  `RECONNECT_GIVE_UP_MS` (10 min). The user forgot A and it comes back
+  in another slot.
+- At boot, while A is on, the lower slot wins it; the other slot's
+  attempt fails and is not armed (`savedSensorReadyElsewhere`), but it
+  costs one 5 s scan per boot.
+Forget was already per-slot before v2.3.0, so this could happen then
+too; v2.3.0 makes it more likely because the BOOT short-press now
+steers a new pairing away from an ARMED slot. Fix if it bites: when A
+is saved to one slot, remove A from the other slots' keys and clear
+their flags inside the same `NvsScope`. Workaround today: when the
+forgotten sensor shows up again in the other slot, Forget it there too.
 
 ### Bug #2 (since v2.0.0): T_HELLO per-connect is a host-reset storm
 
