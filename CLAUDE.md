@@ -91,7 +91,7 @@ Declared in `platformio.ini` `lib_deps`:
 
 The Vernier driver lives in-tree at `lib/GoGoVernier/`. Its own `library.json` pulls in `h2zero/NimBLE-Arduino@^2.0.0` transitively, so PlatformIO sees it on every build without an explicit entry. The previous external `MomePP/GDXLib` + `MomePP/ArduinoBLE` pair has been removed — `gogo_vernier::GoGoVernier` replaces both.
 
-The platform is pinned to `pioarduino/platform-espressif32#develop`, not the upstream Espressif platform.
+The platform is pinned to a fixed `pioarduino/platform-espressif32` release (see the comment above `platform =` in `platformio.ini`), not the floating `stable` and not the upstream Espressif platform.
 
 ## Code Quality Rules
 

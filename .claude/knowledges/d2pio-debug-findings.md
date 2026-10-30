@@ -240,6 +240,14 @@ to `h2zero/NimBLE-Arduino`. The lesson: when a "stable" release
 suddenly breaks BLE init, suspect a libs version drift before
 suspecting your own code.
 
+Current pin (v2.2.0 onward): `55.03.38-1` (Arduino 3.3.8, IDF 5.5.4).
+v2.0.0 to v2.1.0 were built against the floating `stable` URL; the
+v2.1.0 image's app descriptor reads Arduino 3.3.8 / IDF v5.5.4, and
+`55.03.38-1` was `stable` on its build date (2026-05-23), so v2.2.0
+pins that release to keep the toolchain (and BT blobs) identical.
+By 2026-10 `stable` had moved to `55.03.312-1` (Arduino 3.3.12,
+IDF 5.5.5), which no shipped image was benched on.
+
 ### h2zero/NimBLE-Arduino on arduino-esp32 3.3.x
 
 h2zero compiles against the bundled NimBLE host (no vendored stack on
