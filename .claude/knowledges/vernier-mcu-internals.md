@@ -508,9 +508,22 @@ sensor and host, no owner at the desk:
   origin) failed after the 5 s scan and left the slot OFF: no rescans.
 - Release build: host `Vernier proto v2, fw=2 v2.3.0`; the boot
   auto-connect reconnected slot 0 and the GoGo opened its slot page.
-- Not yet run (owner needed): the boot case (sensor off at C3 reset,
-  on ~20 s later) and the give-up (checked with the constant shortened
-  to 60 s in a scratch build only).
+- Boot arming and give-up (2026-10-31, `0f461d6` in a scratch debug
+  build only: give-up shortened to 60 s, and `setup()` forcing
+  `deviceName0 = "GDX-ACC 0X0000X0"`, a sensor that does not exist):
+  boot scan at 5257 ms, `scan complete, no match` at 10259 ms, then
+  `slot 0: saved sensor not found at boot, reconnecting in the
+  background`; attempts queued at 11261, 18263, 27265, 40267, 61269 ms
+  (`next in 2000 / 4000 / 8000 / 16000 / 30000 ms`, first retry 1 s
+  after the arming), and at 70261 ms `slot 0: sensor not back after
+  60000 ms, background reconnect stopped`, with no scan after it. The
+  host (ir-share-v3) logged no slot change from the arming to the
+  give-up, only its 10 s `C_DEV_LIST` probe answers. NVS was then
+  restored from the backup and the release build reconnected the real
+  sensor (the host's probes stopped at once).
+- Still not run: the boot case with the real sensor switched on during
+  the retries (owner needed). The switch-on half is the same path as
+  the link-loss reconnect measured above.
 
 **Not covered.** A later `C_SET_PERIOD` still re-arms
 `startAutoConnect` and so also reconnects a slot that was
